@@ -36,9 +36,11 @@ class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, Any | None]]):
         *,
         fps: float | None = None,
         max_frames: int | None = None,
+        min_frames: int | None = None,
         min_pixels: int | None = None,
         max_pixels: int | None = None,
         total_pixels: int | None = None,
+        override_max_pixels: bool = False,
         image_mode: str = "RGB",
         extract_audio: bool = False,
         audio_target_sr: int = 16000,
@@ -49,9 +51,12 @@ class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, Any | None]]):
         Args:
             fps: Target FPS for video loading.
             max_frames: Optional frame cap passed to the video reader backend.
+            min_frames: Optional minimum frame count passed to the video reader backend.
             min_pixels: Optional lower resize budget per frame.
             max_pixels: Optional upper resize budget per frame.
             total_pixels: Optional total video pixel budget.
+            override_max_pixels: If True, let ``total_pixels`` or explicit
+                ``max_pixels`` override the default Qwen video max-pixel cap.
             image_mode: Target image mode (default: "RGB").
             extract_audio: If True, extract audio from video and return as third element.
             audio_target_sr: Target sample rate for audio extraction (default: 16000).
@@ -60,9 +65,11 @@ class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, Any | None]]):
         super().__init__()
         self.fps = fps
         self.max_frames = max_frames
+        self.min_frames = min_frames
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
         self.total_pixels = total_pixels
+        self.override_max_pixels = override_max_pixels
         self.image_mode = image_mode
         self.extract_audio = extract_audio
         self.audio_target_sr = audio_target_sr
@@ -73,9 +80,11 @@ class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, Any | None]]):
             filepath,
             fps=self.fps,
             max_frames=self.max_frames,
+            min_frames=self.min_frames,
             min_pixels=self.min_pixels,
             max_pixels=self.max_pixels,
             total_pixels=self.total_pixels,
+            override_max_pixels=self.override_max_pixels,
         )
 
     def load_bytes(self, data: bytes) -> tuple[torch.Tensor, float, Any | None]:
@@ -129,12 +138,14 @@ async def ensure_video_list_async(
     *,
     fps: float | None = None,
     max_frames: int | None = None,
+    min_frames: int | None = None,
     min_pixels: int | None = None,
     max_pixels: int | None = None,
     total_pixels: int | None = None,
+    override_max_pixels: bool = False,
     image_mode: str = "RGB",
     resource_connector: Any | None = None,
-    extract_audio: bool = False,
+    extract_audio: bool | list[bool] | tuple[bool, ...] = False,
     audio_target_sr: int = 16000,
 ) -> tuple[list[Any], list[float] | None, list[Any] | None]:
     """Asynchronously normalize video inputs into a list.
@@ -143,13 +154,17 @@ async def ensure_video_list_async(
         videos: Video input(s) - can be a path, URL, torch Tensor, or list.
         fps: Target FPS for video loading.
         max_frames: Optional frame cap passed to the video reader backend.
+        min_frames: Optional minimum frame count passed to the video reader backend.
         min_pixels: Optional lower resize budget per frame.
         max_pixels: Optional upper resize budget per frame.
         total_pixels: Optional total video pixel budget.
+        override_max_pixels: If True, let ``total_pixels`` or explicit
+            ``max_pixels`` override the default Qwen video max-pixel cap.
         image_mode: Target image mode (default: "RGB").
         resource_connector: Optional MultiModalResourceConnector instance. If None, uses
                         the global connector.
         extract_audio: If True, extract audio from videos and return as third element.
+                    A bool list enables per-video extraction.
         audio_target_sr: Target sample rate for audio extraction (default: 16000).
 
     Returns:
@@ -162,9 +177,11 @@ async def ensure_video_list_async(
         items = videos
     else:
         items = [videos]
+    extract_audio_flags = _normalize_extract_audio_flags(extract_audio, len(items))
+    should_return_audio = any(extract_audio_flags)
     normalized: list[Any] = []
     sample_fps_list: list[float] = []
-    extracted_audios: list[Any] = [] if extract_audio else []
+    extracted_audios: list[Any] = [] if should_return_audio else []
     all_paths = True
 
     # Import here to avoid circular dependency
@@ -174,7 +191,10 @@ async def ensure_video_list_async(
         resource_connector = get_global_resource_connector()
 
     async def _load_video_with_audio(
-        video_item: str | Path, is_url: bool
+        video_item: str | Path,
+        *,
+        is_url: bool,
+        extract_audio_for_item: bool,
     ) -> tuple[Any, float, Any | None]:
         """Load video and optionally extract audio."""
         loop = asyncio.get_running_loop()
@@ -185,26 +205,30 @@ async def ensure_video_list_async(
                 str(video_item),
                 fps=fps,
                 max_frames=max_frames,
+                min_frames=min_frames,
                 min_pixels=min_pixels,
                 max_pixels=max_pixels,
                 total_pixels=total_pixels,
+                override_max_pixels=override_max_pixels,
                 image_mode=image_mode,
-                extract_audio=extract_audio,
+                extract_audio=extract_audio_for_item,
                 audio_target_sr=audio_target_sr,
             )
         else:
             # Local file path
             video_path = Path(video_item)
-            if extract_audio:
+            if extract_audio_for_item:
                 video_task = loop.run_in_executor(
                     global_thread_pool,
                     load_video_path,
                     video_path,
                     fps,
                     max_frames,
+                    min_frames,
                     min_pixels,
                     max_pixels,
                     total_pixels,
+                    override_max_pixels,
                 )
                 audio_task = loop.run_in_executor(
                     global_thread_pool,
@@ -223,9 +247,11 @@ async def ensure_video_list_async(
                     video_path,
                     fps,
                     max_frames,
+                    min_frames,
                     min_pixels,
                     max_pixels,
                     total_pixels,
+                    override_max_pixels,
                 )
                 return video, sample_fps, None
 
@@ -235,38 +261,47 @@ async def ensure_video_list_async(
 
     # First pass: identify items that need loading
     for idx, video_item in enumerate(items):
+        extract_audio_for_item = extract_audio_flags[idx]
         if isinstance(video_item, (str, Path)):
             if _is_url(video_item):
                 # Create coroutine for async URL fetching with optional audio extraction
-                coro = _load_video_with_audio(video_item, is_url=True)
+                coro = _load_video_with_audio(
+                    video_item,
+                    is_url=True,
+                    extract_audio_for_item=extract_audio_for_item,
+                )
                 task = asyncio.create_task(coro)
                 coroutines.append(task)
                 url_indices.append(idx)
                 normalized.append(None)  # Placeholder for video
                 sample_fps_list.append(0.0)  # Placeholder for fps
-                if extract_audio:
+                if should_return_audio:
                     extracted_audios.append(None)  # Placeholder for audio
             elif Path(video_item).exists():
                 # Load from local path with optional audio extraction
-                coro = _load_video_with_audio(video_item, is_url=False)
+                coro = _load_video_with_audio(
+                    video_item,
+                    is_url=False,
+                    extract_audio_for_item=extract_audio_for_item,
+                )
                 task = asyncio.create_task(coro)
                 coroutines.append(task)
                 url_indices.append(idx)
                 normalized.append(None)  # Placeholder for video
                 sample_fps_list.append(0.0)  # Placeholder for fps
-                if extract_audio:
+                if should_return_audio:
                     extracted_audios.append(None)  # Placeholder for audio
             else:
                 # Path doesn't exist, treat as already processed
                 normalized.append(video_item)
                 all_paths = False
-                if extract_audio:
+                if should_return_audio:
                     extracted_audios.append(None)
         else:
             # Already processed (torch Tensor, etc.)
             normalized.append(video_item)
             all_paths = False
-            if extract_audio:
+            if should_return_audio:
                 extracted_audios.append(None)
 
     # Wait for all loads to complete
@@ -276,16 +311,28 @@ async def ensure_video_list_async(
         for url_idx, (video, sample_fps, audio) in zip(url_indices, results):
             normalized[url_idx] = video
             sample_fps_list[url_idx] = sample_fps
-            if extract_audio:
+            if should_return_audio:
                 extracted_audios[url_idx] = audio
 
     if all_paths:
         return (
             normalized,
             sample_fps_list,
-            extracted_audios if extract_audio else None,
+            extracted_audios if should_return_audio else None,
         )
-    return normalized, None, extracted_audios if extract_audio else None
+    return normalized, None, extracted_audios if should_return_audio else None
+
+
+def _normalize_extract_audio_flags(
+    extract_audio: bool | list[bool] | tuple[bool, ...],
+    item_count: int,
+) -> list[bool]:
+    if isinstance(extract_audio, (list, tuple)):
+        flags = [bool(item) for item in extract_audio[:item_count]]
+        if len(flags) < item_count:
+            flags.extend([False] * (item_count - len(flags)))
+        return flags
+    return [bool(extract_audio)] * item_count
 
 
 def _extract_audio_from_path(video_path: Path, target_sr: int) -> Any | None:
@@ -304,9 +351,11 @@ def load_video_path(
     path: str | Path,
     fps: float | None = None,
     max_frames: int | None = None,
+    min_frames: int | None = None,
     min_pixels: int | None = None,
     max_pixels: int | None = None,
     total_pixels: int | None = None,
+    override_max_pixels: bool = False,
 ) -> tuple[torch.Tensor, float]:
     """Load a local video into a torch tensor (T, C, H, W) on CPU."""
     path = Path(path)
@@ -315,6 +364,8 @@ def load_video_path(
         ele["fps"] = float(fps)
     if max_frames is not None:
         ele["max_frames"] = int(max_frames)
+    if min_frames is not None:
+        ele["min_frames"] = int(min_frames)
     if min_pixels is not None:
         ele["min_pixels"] = int(min_pixels)
     if max_pixels is not None:
@@ -343,15 +394,23 @@ def load_video_path(
     nframes, _, height, width = video.shape
     min_pixels = ele.get("min_pixels", qwen_vision.VIDEO_MIN_PIXELS)
     total_pixels = ele.get("total_pixels", qwen_vision.VIDEO_TOTAL_PIXELS)
-    max_pixels = max(
-        min(
+    max_pixels_from_total = total_pixels / nframes * qwen_vision.FRAME_FACTOR
+    if not override_max_pixels:
+        max_pixels_from_total = min(
             qwen_vision.VIDEO_MAX_PIXELS,
-            total_pixels / nframes * qwen_vision.FRAME_FACTOR,
-        ),
+            max_pixels_from_total,
+        )
+    max_pixels = max(
+        max_pixels_from_total,
         int(min_pixels * 1.05),
     )
-    max_pixels_supposed = ele.get("max_pixels", max_pixels)
-    max_pixels = min(max_pixels_supposed, max_pixels)
+    max_pixels_supposed = ele.get("max_pixels")
+    if max_pixels_supposed is not None:
+        max_pixels = (
+            int(max_pixels_supposed)
+            if override_max_pixels
+            else min(int(max_pixels_supposed), max_pixels)
+        )
     if "resized_height" in ele and "resized_width" in ele:
         resized_height, resized_width = qwen_vision.smart_resize(
             ele["resized_height"],
@@ -388,9 +447,11 @@ def compute_video_cache_key(
     *,
     fps: float | None = None,
     max_frames: int | None = None,
+    min_frames: int | None = None,
     min_pixels: int | None = None,
     max_pixels: int | None = None,
     total_pixels: int | None = None,
+    override_max_pixels: bool = False,
 ) -> str | None:
     """Compute cache key from raw video inputs + effective decode params.
 
@@ -404,10 +465,22 @@ def compute_video_cache_key(
     if base is None:
         return None
     decode_sig = (
-        f"|fps={fps}|max_frames={max_frames}"
+        f"|fps={fps}|max_frames={max_frames}|min_frames={min_frames}"
         f"|min_px={min_pixels}|max_px={max_pixels}|total_px={total_pixels}"
+        f"|override_max_px={override_max_pixels}"
     )
     return base + decode_sig
+
+
+def derive_video_total_pixels_from_mm_len(max_mm_len: int) -> int:
+    """Convert a Qwen-style multimodal token budget to a 3-D pixel budget."""
+
+    if max_mm_len <= 0:
+        raise ValueError("max_mm_len must be positive")
+    # 中文说明：Qwen video token 数约等于 3D 像素预算 / IMAGE_FACTOR^2。
+    # vLLM Qwen3-VL 的 effective max pixels 使用同一类 unit^2 换算；
+    # Omni 的 loader 再按帧数和 FRAME_FACTOR 分摊为逐帧 max_pixels。
+    return int(max_mm_len) * int(qwen_vision.IMAGE_FACTOR) ** 2
 
 
 def _check_if_video_has_audio(video_path: str | Path) -> bool:

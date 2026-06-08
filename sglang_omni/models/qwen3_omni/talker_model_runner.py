@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 import torch
@@ -27,6 +28,7 @@ class QwenTalkerModelRunner(ModelRunner):
         self._outbox = outbox
         self._code2wav_target = code2wav_target
         self._feedback_enabled = bool(feedback_enabled)
+        self._code_predictor_accepts_requests: bool | None = None
 
     def execute(self, scheduler_output: Any):
         return super().execute(scheduler_output)
@@ -83,12 +85,37 @@ class QwenTalkerModelRunner(ModelRunner):
         talker_hidden = result.logits_output.hidden_states
         if isinstance(talker_hidden, torch.Tensor) and talker_hidden.ndim == 2:
             talker_hidden = talker_hidden.unsqueeze(1)
-        self.model.code_predictor_forward(layer0_codes, talker_hidden)
+        self._run_code_predictor_forward(layer0_codes, talker_hidden, requests)
         schedule_batch.output_ids = result.next_token_ids
         self._emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,
             requests=requests,
         )
+
+    def _run_code_predictor_forward(
+        self,
+        layer0_codes: torch.Tensor,
+        talker_hidden: torch.Tensor,
+        requests: list,
+    ) -> Any:
+        code_predictor_forward = self.model.code_predictor_forward
+        accepts_requests = self._code_predictor_accepts_requests
+        if accepts_requests is None:
+            try:
+                params = inspect.signature(code_predictor_forward).parameters
+            except (TypeError, ValueError):
+                accepts_requests = False
+            else:
+                accepts_requests = "requests" in params
+            self._code_predictor_accepts_requests = accepts_requests
+
+        if accepts_requests:
+            return code_predictor_forward(
+                layer0_codes,
+                talker_hidden,
+                requests=requests,
+            )
+        return code_predictor_forward(layer0_codes, talker_hidden)
 
     def post_decode(
         self,

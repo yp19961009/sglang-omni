@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Example single-H20 colocated Qwen3.5-Omni launcher config.
+# The Python pipeline config owns the stage topology; this file only sets the
+# runtime memory budgets needed for colocated launch.
+#
+# 中文说明：Qwen3.5 真实权重尚未落地，先沿用 Qwen3-Omni H20 colocated
+# 的保守初始 profile。AR 并发默认对齐 vLLM perf_v2 H20 profile 的
+# max_num_seqs=32。拿到模型后应根据实际显存峰值重新校准。
+
+config_cls: Qwen35OmniSpeechColocatedPipelineConfig
+name: qwen3-5-omni-colocated-h20
+model_path: Qwen/Qwen3.5-Omni
+relay_backend: shm
+
+stage_overrides:
+  preprocessing:
+    runtime:
+      image_max_pixels: 401408
+      video_fps: 2
+      video_max_frames: 128
+      video_min_frames: 4
+      video_max_pixels: 401408
+      # 中文说明：这些值对齐 Qwen3OmniNextProcessor 的 perf_v2 默认；
+      # 请求里传同名参数时会覆盖这里的服务级默认值。
+      audio_target_sr: 16000
+      audio_timestamp_interval: 60
+      audio_downsample_times: 4
+      audio_downsample_chunk_size: 100
+
+  image_encoder:
+    runtime:
+      resources:
+        total_gpu_memory_fraction: 0.025
+
+  audio_encoder:
+    runtime:
+      resources:
+        total_gpu_memory_fraction: 0.025
+
+  thinker:
+    runtime:
+      resources:
+        total_gpu_memory_fraction: 0.75
+      sglang_server_args:
+        max_running_requests: 32
+
+  talker_ar:
+    runtime:
+      resources:
+        total_gpu_memory_fraction: 0.12
+      sglang_server_args:
+        max_running_requests: 32
+
+  code2wav:
+    # 中文说明：Qwen3.5 code2wav 默认 stream_chunk_size 已对齐 vLLM
+    # perf_v2 H20 profile 的 send_chunk_size=8；真实压测时可继续用
+    # --code2wav-stream-chunk-size 做 A/B。
+    runtime:
+      send_chunk_size: 8
+      code2wav_enable_torch_compile: true
+      code2wav_odeint_method: rk4
+      code2wav_odeint_method_relaxed: true
+      code2wav_frequency: 50hz
+      code2wav_dit_quant: fp8
+      resources:
+        total_gpu_memory_fraction: 0.02

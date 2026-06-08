@@ -261,7 +261,7 @@ class ThinkerModelRunner(ModelRunner):
     # ------------------------------------------------------------------
     # Custom forward with multimodal embeddings + deepstack
     # ------------------------------------------------------------------
-
+    @torch.no_grad()
     def _forward_with_omni_embeds(
         self,
         forward_batch,
@@ -296,14 +296,14 @@ class ThinkerModelRunner(ModelRunner):
             input_ids=None,
             positions=positions,
             forward_batch=forward_batch,
-            input_embeds=input_embeds,
-            input_deepstack_embeds=ds_input,
+            inputs_embeds=input_embeds,
+            deepstack_input_embeds=ds_input,
         )
 
-        logits_output = outer.logits_processor(
+        logits_output = outer.language_model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
-            outer.lm_head,
+            outer.language_model.lm_head,
             forward_batch,
         )
 

@@ -10,7 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, TypeVar
-from urllib.parse import urlparse
+from urllib.parse import unquote_to_bytes, urlparse
 from urllib.request import url2pathname
 
 import httpx
@@ -101,13 +101,19 @@ class MultiModalResourceConnector:
             raise ValueError(f"Domain {url_spec.hostname} is not allowed.")
 
     def _load_data_url(self, url_spec: Any, media_io: MediaIO[_M]) -> _M:
-        """Load media from a data URL (base64 encoded)."""
+        """Load media from a data URL."""
         path = url_spec.path or ""
         if "," not in path:
             raise ValueError("Invalid data URL format")
         spec, data = path.split(",", 1)
-        media_type = spec.split(";")[0].lstrip("/")
-        return media_io.load_base64(media_type, data)
+        spec_parts = spec.split(";")
+        media_type = spec_parts[0].lstrip("/") or "application/octet-stream"
+        if "base64" in {part.lower() for part in spec_parts[1:]}:
+            # 中文说明：真实 OpenAI 请求里常见 data:audio/wav;base64,...
+            # data 段可能被 URL percent-encode，先还原再交给 MediaIO 解码。
+            encoded = unquote_to_bytes(data).decode("ascii")
+            return media_io.load_base64(media_type, encoded)
+        return media_io.load_bytes(unquote_to_bytes(data))
 
     def _load_file_url(self, url_spec: Any, media_io: MediaIO[_M]) -> _M:
         """Load media from a file URL."""
@@ -273,9 +279,11 @@ class MultiModalResourceConnector:
         *,
         fps: float | None = None,
         max_frames: int | None = None,
+        min_frames: int | None = None,
         min_pixels: int | None = None,
         max_pixels: int | None = None,
         total_pixels: int | None = None,
+        override_max_pixels: bool = False,
         image_mode: str = "RGB",
         timeout: float = 30.0,
         extract_audio: bool = False,
@@ -287,9 +295,12 @@ class MultiModalResourceConnector:
             video_url: URL to the video file.
             fps: Target FPS for video loading.
             max_frames: Optional frame cap passed to the video reader backend.
+            min_frames: Optional minimum frame count passed to the video reader backend.
             min_pixels: Optional lower resize budget per frame.
             max_pixels: Optional upper resize budget per frame.
             total_pixels: Optional total video pixel budget.
+            override_max_pixels: If True, let ``total_pixels`` or explicit
+                ``max_pixels`` override the default Qwen video max-pixel cap.
             image_mode: Target image mode (default: "RGB").
             timeout: Timeout for HTTP requests in seconds.
             extract_audio: If True, extract audio from video and return as third element.
@@ -303,9 +314,11 @@ class MultiModalResourceConnector:
         video_io = VideoMediaIO(
             fps=fps,
             max_frames=max_frames,
+            min_frames=min_frames,
             min_pixels=min_pixels,
             max_pixels=max_pixels,
             total_pixels=total_pixels,
+            override_max_pixels=override_max_pixels,
             image_mode=image_mode,
             extract_audio=extract_audio,
             audio_target_sr=audio_target_sr,

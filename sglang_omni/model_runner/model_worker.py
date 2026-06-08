@@ -25,10 +25,57 @@ _ARCH_CONFIG_MAP: dict[str, tuple[str, str | None]] = {
     "BailingMoeV2ForCausalLM": ("llm_config", None),
     "Qwen3OmniTalker": ("talker_config", "text_config"),
     "Qwen3OmniThinkerForCausalLM": ("thinker_config", "text_config"),
+    "Qwen3OmniNextForConditionalGeneration": ("thinker_config", "text_config"),
+    "Qwen3OmniNextThinkerForConditionalGeneration": (
+        "thinker_config",
+        "text_config",
+    ),
+    "Qwen3OmniNextThinkerMTP": ("thinker_config", "text_config"),
+    "Qwen3OmniNextTalkerModel": ("talker_config", "text_config"),
+    "Qwen3OmniNextTalkerForConditionalGeneration": (
+        "talker_config",
+        "text_config",
+    ),
+    "Qwen3OmniNextMoeTalkerForConditionalGeneration": (
+        "talker_config",
+        "text_config",
+    ),
     "Qwen3ASRForConditionalGeneration": ("thinker_config", "text_config"),
     "Qwen3TTSTalker": ("talker_config", None),
     "MossTTSDelaySGLangModel": ("language_config", None),
 }
+
+_QWEN_OMNI_ARCHES = {
+    "Qwen3OmniTalker",
+    "Qwen3OmniThinkerForCausalLM",
+    "Qwen3OmniNextForConditionalGeneration",
+    "Qwen3OmniNextThinkerForConditionalGeneration",
+    "Qwen3OmniNextThinkerMTP",
+    "Qwen3OmniNextTalkerModel",
+    "Qwen3OmniNextTalkerForConditionalGeneration",
+    "Qwen3OmniNextMoeTalkerForConditionalGeneration",
+}
+
+_QWEN_OMNI_TALKER_ARCHES = {
+    "Qwen3OmniTalker",
+    "Qwen3OmniNextTalkerModel",
+    "Qwen3OmniNextTalkerForConditionalGeneration",
+    "Qwen3OmniNextMoeTalkerForConditionalGeneration",
+}
+
+_QWEN35_OMNI_ARCHES = {
+    "Qwen3OmniNextForConditionalGeneration",
+    "Qwen3OmniNextThinkerForConditionalGeneration",
+    "Qwen3OmniNextThinkerMTP",
+    "Qwen3OmniNextTalkerModel",
+    "Qwen3OmniNextTalkerForConditionalGeneration",
+    "Qwen3OmniNextMoeTalkerForConditionalGeneration",
+}
+
+
+def _optional_int_attr(config: object, name: str) -> int | None:
+    value = getattr(config, name, None)
+    return int(value) if value is not None else None
 
 
 class ModelWorker:
@@ -69,6 +116,15 @@ class ModelWorker:
             )
 
             register_ming_hf_config()
+        if self.model_arch_override in _QWEN35_OMNI_ARCHES:
+            from sglang_omni.models.qwen3_5_omni.hf_config import (
+                register_qwen35_hf_config,
+            )
+
+            # 中文说明：当前 transformers 可能还没有 qwen3_omni_next。
+            # SGLang ModelConfig 会在模型类注册前先 AutoConfig.from_pretrained，
+            # 因此这里必须提前注册一个本地 HF config shim。
+            register_qwen35_hf_config()
 
         from sglang.srt.configs.model_config import ModelConfig
 
@@ -104,14 +160,54 @@ class ModelWorker:
             return
         sub_config_attr, text_config_attr = entry
         sub_cfg = getattr(model_config.hf_config, sub_config_attr, None)
+        if (
+            sub_cfg is None
+            and text_config_attr is not None
+            and hasattr(model_config.hf_config, text_config_attr)
+        ):
+            # 中文说明：split checkpoint 的 thinker/talker 子目录可能直接保存
+            # sub-config，而不是 root 下的 thinker_config/talker_config 外壳。
+            sub_cfg = model_config.hf_config
         if sub_cfg is None:
             return
-        text_cfg = getattr(sub_cfg, text_config_attr) if text_config_attr else sub_cfg
+        text_cfg = (
+            getattr(sub_cfg, text_config_attr, None)
+            if text_config_attr
+            else sub_cfg
+        )
+        if text_cfg is None:
+            return
         model_config.hf_text_config = text_cfg
-        model_config.num_attention_heads = text_cfg.num_attention_heads
-        model_config.num_key_value_heads = text_cfg.num_key_value_heads
-        model_config.hidden_size = text_cfg.hidden_size
-        model_config.num_hidden_layers = text_cfg.num_hidden_layers
+        num_attention_heads = int(text_cfg.num_attention_heads)
+        num_key_value_heads = _optional_int_attr(
+            text_cfg,
+            "num_key_value_heads",
+        ) or num_attention_heads
+        hidden_size = int(text_cfg.hidden_size)
+        num_hidden_layers = int(text_cfg.num_hidden_layers)
+        model_config.num_attention_heads = num_attention_heads
+        model_config.num_key_value_heads = num_key_value_heads
+        model_config.hidden_size = hidden_size
+        model_config.num_hidden_layers = num_hidden_layers
+
+        vocab_size = _optional_int_attr(text_cfg, "vocab_size")
+        if vocab_size is not None:
+            model_config.vocab_size = vocab_size
+        model_config.num_attention_layers = (
+            _optional_int_attr(text_cfg, "num_attention_layers") or num_hidden_layers
+        )
+        head_dim = _optional_int_attr(text_cfg, "head_dim")
+        if head_dim is None and num_attention_heads > 0:
+            head_dim = hidden_size // num_attention_heads
+        if head_dim is not None:
+            # 中文说明：Qwen3.5 root config 和 thinker/talker text_config 的
+            # vocab/head 维度可能不同；切 sub-model 后这些 ModelConfig 派生
+            # 字段也要同步，否则 SGLang cache/采样侧可能仍沿用 root 元数据。
+            model_config.head_dim = head_dim
+            model_config.v_head_dim = _optional_int_attr(
+                text_cfg,
+                "v_head_dim",
+            ) or head_dim
 
     def _configure_backend_policy(self) -> None:
         effective_quantization = _apply_model_worker_backend_policy(
@@ -256,10 +352,7 @@ def _apply_model_worker_backend_policy(
         effective_quantization = server_quantization
 
     moe_runner_backend = getattr(server_args, "moe_runner_backend", "auto")
-    is_qwen3_omni_arch = model_arch_override in (
-        "Qwen3OmniTalker",
-        "Qwen3OmniThinkerForCausalLM",
-    )
+    is_qwen3_omni_arch = model_arch_override in _QWEN_OMNI_ARCHES
     if is_qwen3_omni_arch and getattr(server_args, "ep_size", 1) != 1:
         raise ValueError(
             "Qwen3-Omni ModelWorker does not support expert parallelism; "
@@ -269,7 +362,7 @@ def _apply_model_worker_backend_policy(
     has_native_fp8_block_quant = _model_config_has_native_fp8_block_quant(model_config)
 
     if (
-        model_arch_override == "Qwen3OmniTalker"
+        model_arch_override in _QWEN_OMNI_TALKER_ARCHES
         and effective_quantization is None
         and moe_runner_backend == "auto"
     ):
@@ -312,7 +405,7 @@ def _apply_model_worker_backend_policy(
 
     fp8_gemm_backend = _normalize_quantization(server_args.fp8_gemm_runner_backend)
     if (
-        model_arch_override == "Qwen3OmniTalker"
+        model_arch_override in _QWEN_OMNI_TALKER_ARCHES
         and effective_quantization == "fp8"
         and has_native_fp8_block_quant
         and fp8_gemm_backend in (None, "auto")

@@ -48,6 +48,18 @@ def _resolve_seed(params: dict[str, Any]) -> int | None:
     return None
 
 
+def _resolve_max_new_tokens(params: dict[str, Any], default: int = 2048) -> int:
+    for key in ("max_new_tokens", "max_completion_tokens", "max_tokens"):
+        value = params.get(key)
+        if value is not None:
+            # 中文说明：OpenAI chat 新字段是 max_completion_tokens，
+            # 旧兼容字段是 max_tokens；SGLang SamplingParams 使用
+            # max_new_tokens。这里和 preprocessor 的 context length
+            # 校验保持一致。
+            return int(value)
+    return int(default)
+
+
 def output_modalities(request: OmniRequest | None) -> set[str] | None:
     metadata = getattr(request, "metadata", None)
     if not isinstance(metadata, dict):
@@ -222,7 +234,11 @@ def build_lightweight_mm_inputs(mm_inputs: dict[str, Any]) -> dict[str, Any]:
         "image": _select_present_fields(mm_image, ("image_grid_thw",)),
         "audio": _select_present_fields(
             mm_audio,
-            ("feature_attention_mask", "audio_feature_lengths"),
+            (
+                "feature_attention_mask",
+                "audio_feature_lengths",
+                "audio_is_dependent",
+            ),
         ),
         "video": _select_present_fields(
             mm_video,
@@ -505,6 +521,9 @@ def build_sglang_thinker_request(
     vocab_size: int,
     request_id: str | None = None,
     thinker_config: Any = None,
+    mrope_position_builder: Callable[
+        [torch.Tensor, dict[str, Any], Any], Any
+    ] | None = None,
 ) -> "SGLangARRequestData":
     """Build SGLangARRequestData from pipeline state.
 
@@ -557,11 +576,13 @@ def build_sglang_thinker_request(
         model_inputs.pop("attention_mask", None)
     input_ids_list = input_ids.to(dtype=torch.long).tolist()
 
-    max_new_tokens = params.get("max_new_tokens", 2048)
+    max_new_tokens = _resolve_max_new_tokens(params, 2048)
     temperature = params.get("temperature", 0.0)
     top_p = params.get("top_p", 1.0)
     top_k = params.get("top_k", -1)
     min_p = params.get("min_p", 0.0)
+    frequency_penalty = params.get("frequency_penalty", 0.0)
+    presence_penalty = params.get("presence_penalty", 0.0)
     repetition_penalty = params.get("repetition_penalty", 1.0)
     stop = params.get("stop") or []
     stop_token_ids = params.get("stop_token_ids") or []
@@ -574,6 +595,8 @@ def build_sglang_thinker_request(
         top_p=top_p,
         top_k=top_k,
         min_p=min_p,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
         repetition_penalty=repetition_penalty,
         stop=stop,
         stop_token_ids=stop_token_ids,
@@ -595,7 +618,8 @@ def build_sglang_thinker_request(
 
     # Compute M-RoPE positions and attach multimodal_inputs to Req
     if thinker_config is not None and model_inputs:
-        mrope_result = _compute_mrope_positions(
+        mrope_builder = mrope_position_builder or _compute_mrope_positions
+        mrope_result = mrope_builder(
             original_input_ids.to(dtype=torch.long), model_inputs, thinker_config
         )
         if mrope_result is not None:
@@ -634,6 +658,7 @@ def build_sglang_talker_request(
     temperature: float = 0.7,
     top_k: int = 50,
     top_p: float = 1.0,
+    min_p: float = 0.0,
     repetition_penalty: float = 1.05,
     request_id: str | None = None,
     codec_bos_id: int = 2149,
@@ -655,6 +680,9 @@ def build_sglang_talker_request(
     thinker_config: Any = None,
     talker_model_inputs: dict[str, Any] | None = None,
     seed: int | None = None,
+    mrope_position_builder: Callable[
+        [torch.Tensor, dict[str, Any], Any], Any
+    ] | None = None,
 ) -> "SGLangARRequestData":
     """Build SGLang AR request for the Talker from thinker hidden states.
 
@@ -695,6 +723,7 @@ def build_sglang_talker_request(
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
+        min_p=min_p,
         repetition_penalty=repetition_penalty,
         stop_token_ids=[int(codec_eos_id)] if codec_eos_id is not None else None,
         logit_bias=None,
@@ -726,15 +755,18 @@ def build_sglang_talker_request(
         else None
     )
     if thinker_config is not None and talker_model_inputs:
-        mrope_positions, mrope_position_delta = _compute_mrope_positions(
+        mrope_builder = mrope_position_builder or _compute_mrope_positions
+        mrope_result = mrope_builder(
             input_ids_tensor.to(dtype=torch.long),
             talker_model_inputs or {},
             thinker_config,
         )
-        mm_inputs = MultimodalInputs(mm_items=[])
-        mm_inputs.mrope_positions = mrope_positions
-        mm_inputs.mrope_position_delta = mrope_position_delta
-        req.multimodal_inputs = mm_inputs
+        if mrope_result is not None:
+            mrope_positions, mrope_position_delta = mrope_result
+            mm_inputs = MultimodalInputs(mm_items=[])
+            mm_inputs.mrope_positions = mrope_positions
+            mm_inputs.mrope_position_delta = mrope_position_delta
+            req.multimodal_inputs = mm_inputs
 
     multimodal_mask: torch.Tensor | None = None
     if thinker_token_ids is not None:
@@ -909,6 +941,9 @@ def make_thinker_scheduler_adapters(
     vocab_size: int,
     thinker_config: Any = None,
     stage_name: str = "thinker",
+    mrope_position_builder: Callable[
+        [torch.Tensor, dict[str, Any], Any], Any
+    ] | None = None,
 ):
     """Build model-specific StagePayload <-> scheduler adapters for thinker."""
 
@@ -922,6 +957,7 @@ def make_thinker_scheduler_adapters(
             vocab_size=vocab_size,
             request_id=payload.request_id,
             thinker_config=thinker_config,
+            mrope_position_builder=mrope_position_builder,
         )
         req_data.stage_payload = payload
         return req_data
@@ -965,6 +1001,9 @@ def make_talker_scheduler_adapters(
     user_token_id: int = 872,
     assistant_token_id: int = 77091,
     speaker_map: dict[str, int] | None = None,
+    mrope_position_builder: Callable[
+        [torch.Tensor, dict[str, Any], Any], Any
+    ] | None = None,
 ):
     """Build model-specific StagePayload <-> scheduler adapters for talker."""
     prefill_builder = TalkerPrefillBuilder(
@@ -1001,6 +1040,7 @@ def make_talker_scheduler_adapters(
             "temperature": float(params.get("talker_temperature", 0.9)),
             "top_k": int(params.get("talker_top_k", 50)),
             "top_p": float(params.get("talker_top_p", 1.0)),
+            "min_p": float(params.get("talker_min_p", 0.0)),
             "repetition_penalty": float(params.get("talker_repetition_penalty", 1.05)),
             "codec_eos_id": codec_eos_id if codec_eos_id >= 0 else None,
             "suppress_tokens": suppress_tokens,
@@ -1019,6 +1059,7 @@ def make_talker_scheduler_adapters(
             video_token_id=video_token_id,
             thinker_config=thinker_config,
             resolve_sampling_config=_resolve_talker_sampling_config,
+            mrope_position_builder=mrope_position_builder,
         )
 
     def result_adapter(data: SGLangARRequestData) -> StagePayload:
@@ -1049,6 +1090,9 @@ def _build_talker_request_data(
     video_token_id: int | None,
     thinker_config: Any,
     resolve_sampling_config: Callable[[dict[str, Any]], dict[str, Any]],
+    mrope_position_builder: Callable[
+        [torch.Tensor, dict[str, Any], Any], Any
+    ] | None = None,
 ) -> SGLangARRequestData:
     params = payload.request.params
     sampling_cfg = resolve_sampling_config(params)
@@ -1090,6 +1134,7 @@ def _build_talker_request_data(
         temperature=sampling_cfg["temperature"],
         top_k=sampling_cfg["top_k"],
         top_p=sampling_cfg["top_p"],
+        min_p=sampling_cfg.get("min_p", 0.0),
         repetition_penalty=sampling_cfg["repetition_penalty"],
         request_id=payload.request_id,
         codec_bos_id=codec_bos_id,
@@ -1107,6 +1152,7 @@ def _build_talker_request_data(
         thinker_config=thinker_config,
         talker_model_inputs=prompt_prefill["prompt_model_inputs"],
         seed=sampling_cfg.get("seed"),
+        mrope_position_builder=mrope_position_builder,
     )
     req_data.tts_eos_embed = prompt_prefill["tts_eos_embed"]
     req_data.stage_payload = payload

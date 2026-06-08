@@ -26,6 +26,16 @@ from transformers.utils.hub import cached_file
 _CONFIG_MODEL_TYPE_TO_ARCH = {
     "moss_tts_delay": "MossTTSDelayModel",
     "moss_tts_delay_with_codec": "MossTTSDelayWithCodec",
+    # 中文说明：Qwen3.5-Omni root config 的 model_type 对齐 vLLM perf_v2。
+    # 当 transformers 尚未认识该 config、或 config 缺少 architectures 时，
+    # raw config fallback 仍应能选到 Qwen3.5-Omni pipeline。
+    "qwen3_omni_next": "Qwen3OmniNextForConditionalGeneration",
+    # 中文说明：bring-up 阶段经常会直接指向拆分后的 thinker 目录。
+    # 这里先映射到 pipeline 可识别的 architecture；talker 子模型仍由
+    # model_worker 的 submodel 路径处理，不在 pipeline root 识别里兜底。
+    "qwen3_omni_next_thinker": "Qwen3OmniNextThinkerForConditionalGeneration",
+    "qwen3_omni_next_thinker_mtp": "Qwen3OmniNextThinkerMTP",
+    "qwen3_omni_next_talker": "Qwen3OmniNextTalkerModel",
     "qwen3_tts": "Qwen3TTSForConditionalGeneration",
     "voxtral_tts": "VoxtralTTSForConditionalGeneration",
 }

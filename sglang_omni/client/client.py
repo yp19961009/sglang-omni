@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import uuid
 from dataclasses import replace
 from typing import Any, AsyncIterator, Callable
@@ -11,7 +12,6 @@ import numpy as np
 
 from sglang_omni.client.audio import (
     FORMAT_MIME_TYPES,
-    audio_to_base64,
     encode_audio,
     to_numpy,
 )
@@ -29,6 +29,152 @@ from sglang_omni.client.types import (
 )
 from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.proto import OmniRequest, RequestState, StreamMessage
+
+_MEDIA_METADATA_KEYS = (
+    "image",
+    "images",
+    "input_image",
+    "input_images",
+    "image_url",
+    "image_urls",
+    "audio",
+    "audios",
+    "input_audio",
+    "input_audios",
+    "audio_url",
+    "audio_urls",
+    "video",
+    "videos",
+    "input_video",
+    "input_videos",
+    "video_url",
+    "video_urls",
+)
+_MULTIMODAL_METADATA_OPTION_KEYS = (
+    "audio_downsample_chunk_size",
+    "audio_downsample_times",
+    "audio_sampling_rate",
+    "audio_target_sr",
+    "audio_timestamp_interval",
+    "dependent_audio",
+    "downsample_chunk_size",
+    "downsample_times",
+    "fps",
+    "image_max_pixels",
+    "image_min_pixels",
+    "max_frames",
+    "max_pixels",
+    "min_frames",
+    "min_pixels",
+    "mm_processor_kwargs",
+    "multi_modal_data",
+    "multi_modal_uuids",
+    "return_metadata",
+    "return_video_metadata",
+    "sampling_rate",
+    "seconds_per_chunk",
+    "timestamp_interval",
+    "total_pixels",
+    "function_call",
+    "parallel_tool_calls",
+    "tool_choice",
+    "tools",
+    "use_audio_in_video",
+    "video_dependent_audio",
+    "video_fps",
+    "video_max_frames",
+    "video_max_pixels",
+    "video_metadata",
+    "video_min_frames",
+    "video_min_pixels",
+    "video_position_id_per_seconds",
+    "video_seconds_per_chunk",
+    "video_total_pixels",
+    "videos_metadata",
+)
+_OPENAI_AUDIO_OUTPUT_CONFIG_KEYS = frozenset(
+    {
+        "format",
+        "instruction",
+        "lang",
+        "language",
+        "language_id",
+        "speaker",
+        "style",
+        "target_language",
+        "voice",
+        "voice_clone",
+        "voice_clone_info",
+        "voice_clone_path",
+        "voice_style",
+        "voice_type",
+        "xvector_info",
+        "xvector_info_path",
+    }
+)
+_AUDIO_MEDIA_PAYLOAD_KEYS = frozenset(
+    {
+        "audio",
+        "audio_url",
+        "data",
+        "input_audio",
+        "path",
+        "samples",
+        "url",
+    }
+)
+
+
+def _format_from_mime_type(mime_type: str, fallback: str) -> str:
+    for ext, candidate_mime in FORMAT_MIME_TYPES.items():
+        if candidate_mime == mime_type:
+            return ext
+    return fallback
+
+
+def _encode_audio_base64_and_format(
+    audio: Any,
+    *,
+    output_format: str,
+    sample_rate: int | None = None,
+) -> tuple[str, str]:
+    encode_kwargs: dict[str, Any] = {"response_format": output_format}
+    if sample_rate is not None:
+        encode_kwargs["sample_rate"] = sample_rate
+    audio_bytes, mime_type = encode_audio(audio, **encode_kwargs)
+    actual_format = _format_from_mime_type(mime_type, output_format)
+    # 中文说明：encode_audio 可能在缺少 pydub/soundfile 或未知格式时回退到
+    # WAV。这里同时返回实际 format，避免 OpenAI chat audio 响应声明成
+    # mp3/opus 但 data 实际是 WAV。
+    return base64.b64encode(audio_bytes).decode("ascii"), actual_format
+
+
+def _metadata_value_is_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (str, bytes)):
+        return len(value) > 0
+    if isinstance(value, np.ndarray):
+        return value.size > 0
+    if hasattr(value, "numel"):
+        try:
+            return int(value.numel()) > 0
+        except Exception:
+            return True
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) > 0
+    # 中文说明：上层可能直接传 PIL Image、numpy scalar 或其它媒体对象。
+    # 不做 bool(value)，避免多元素数组/张量在进入 preprocessor 前报错。
+    return True
+
+
+def _looks_like_openai_audio_output_config(value: Any) -> bool:
+    if not isinstance(value, dict) or not value:
+        return False
+    keys = set(value)
+    if keys & _AUDIO_MEDIA_PAYLOAD_KEYS:
+        return False
+    return bool(keys & _OPENAI_AUDIO_OUTPUT_CONFIG_KEYS)
 
 
 class Client:
@@ -87,6 +233,7 @@ class Client:
         """
         text_parts: list[str] = []
         audio_chunks: list[Any] = []
+        sample_rate: int | None = None
         last_chunk: GenerateChunk | None = None
         finish_reason: str | None = None
 
@@ -96,6 +243,8 @@ class Client:
                 text_parts.append(chunk.text)
             if chunk.audio_data is not None:
                 audio_chunks.append(chunk.audio_data)
+            if chunk.sample_rate is not None:
+                sample_rate = chunk.sample_rate
             if chunk.finish_reason is not None:
                 finish_reason = chunk.finish_reason
 
@@ -110,10 +259,19 @@ class Client:
                 combined = audio_chunks[0]
             else:
                 combined = np.concatenate([to_numpy(c) for c in audio_chunks])
-            audio_b64 = audio_to_base64(combined, output_format=audio_format)
+            # 中文说明：code2wav stage 会随音频 chunk 返回真实 sample_rate。
+            # chat completion 也必须用它编码，否则非 24k profile 会出现
+            # 播放速度/时长不对；speech 路径已经做了同样传递。
+            audio_b64, actual_format = _encode_audio_base64_and_format(
+                combined,
+                output_format=audio_format,
+                sample_rate=sample_rate,
+            )
             audio = CompletionAudio(
                 id=f"audio-{request_id}",
                 data=audio_b64,
+                format=actual_format,
+                sample_rate=sample_rate,
                 transcript=full_text if full_text else None,
             )
 
@@ -143,9 +301,12 @@ class Client:
         """
         async for chunk in self.generate(request, request_id=request_id):
             audio_b64: str | None = None
+            actual_audio_format: str | None = None
             if chunk.modality == "audio" and chunk.audio_data is not None:
-                audio_b64 = audio_to_base64(
-                    chunk.audio_data, output_format=audio_format
+                audio_b64, actual_audio_format = _encode_audio_base64_and_format(
+                    chunk.audio_data,
+                    output_format=audio_format,
+                    sample_rate=chunk.sample_rate,
                 )
 
             yield CompletionStreamChunk(
@@ -153,6 +314,8 @@ class Client:
                 text=chunk.text,
                 modality=chunk.modality,
                 audio_b64=audio_b64,
+                audio_format=actual_audio_format,
+                sample_rate=chunk.sample_rate,
                 finish_reason=chunk.finish_reason,
                 usage=chunk.usage,
                 stage_name=chunk.stage_name,
@@ -290,6 +453,14 @@ class Client:
         inputs = _extract_inputs(request)
         params = _build_params(request)
         metadata = dict(request.metadata)
+        if "audio_config" not in metadata and _looks_like_openai_audio_output_config(
+            metadata.get("audio")
+        ):
+            # 中文说明：内部 Client 也可能直接收到 OpenAI-style
+            # metadata.audio={voice,format,...}。request builder 读取的是
+            # audio_config，这里复制一份，避免音色/语言配置只保存在追踪
+            # metadata 里而没有进入 talker 参数归一化。
+            metadata["audio_config"] = metadata["audio"]
         if request.model:
             metadata.setdefault("model", request.model)
         if request.output_modalities:
@@ -418,41 +589,46 @@ def _extract_inputs(request: GenerateRequest) -> Any:
             "GenerateRequest requires exactly one input: "
             "prompt, prompt_token_ids, or messages."
         )
+    media_and_options = _extract_multimodal_metadata(request)
     if request.prompt is not None:
+        if media_and_options:
+            return {"prompt": request.prompt, **media_and_options}
         return request.prompt
     if request.prompt_token_ids is not None:
-        return list(request.prompt_token_ids)
+        prompt_token_ids = list(request.prompt_token_ids)
+        if media_and_options:
+            return {"prompt_token_ids": prompt_token_ids, **media_and_options}
+        return prompt_token_ids
 
     # Build messages list
     messages = [msg.to_dict() for msg in request.messages or []]
 
-    # Check if we have audios, images, or videos in metadata
-    audios = request.metadata.get("audios")
-    images = request.metadata.get("images")
-    videos = request.metadata.get("videos")
-
-    # If we have any media, return a dict with messages and media
-    # Otherwise, return just the messages list (for backward compatibility)
-    if audios or images or videos:
-        result = {"messages": messages}
-        if images:
-            result["images"] = images
-        if audios:
-            result["audios"] = audios
-        if videos:
-            result["videos"] = videos
-        for key in (
-            "video_fps",
-            "video_max_frames",
-            "video_min_pixels",
-            "video_max_pixels",
-            "video_total_pixels",
-        ):
-            value = request.metadata.get(key)
-            if value is not None:
-                result[key] = value
-        return result
+    # If we have media/options, return a dict with messages and media.
+    # Otherwise, return just the messages list (for backward compatibility).
+    if media_and_options:
+        return {"messages": messages, **media_and_options}
     return messages
+
+
+def _extract_multimodal_metadata(request: GenerateRequest) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key in _MEDIA_METADATA_KEYS:
+        value = request.metadata.get(key)
+        if key == "audio" and _looks_like_openai_audio_output_config(value):
+            # 中文说明：OpenAI chat/completions 的 metadata.audio 是输出音频
+            # 配置（voice/format/language），不能作为 audio encoder 输入。
+            # 真正的输入音频仍然可以通过 audios/input_audio/audio_url 传入。
+            continue
+        if _metadata_value_is_present(value):
+            result[key] = value
+    for key in _MULTIMODAL_METADATA_OPTION_KEYS:
+        value = request.metadata.get(key)
+        if value is not None:
+            # 中文说明：prompt/prompt_token_ids 也可能携带多模态输入。
+            # 这些 decode/processor 参数必须跟媒体一起进入 inputs，否则
+            # preprocessor 看不到它们，真实 Qwen3.5 请求会丢帧率/音轨等信息。
+            result[key] = value
+    return result
 
 
 def _build_params(request: GenerateRequest) -> dict[str, Any]:

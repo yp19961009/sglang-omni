@@ -68,12 +68,23 @@ class SGLangServerArgsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mem_fraction_static: float | None = None
+    max_running_requests: int | None = None
 
     def model_post_init(self, __context: Any = None) -> None:
-        value = self.mem_fraction_static
-        if value is not None and not 0.0 < value < 1.0:
+        mem_fraction_static = self.mem_fraction_static
+        if (
+            mem_fraction_static is not None
+            and not 0.0 < mem_fraction_static < 1.0
+        ):
             raise ValueError(
                 "runtime.sglang_server_args.mem_fraction_static must be in (0, 1)"
+            )
+        if (
+            self.max_running_requests is not None
+            and self.max_running_requests < 1
+        ):
+            raise ValueError(
+                "runtime.sglang_server_args.max_running_requests must be positive"
             )
 
 
@@ -89,16 +100,297 @@ class StageRuntimeConfig(BaseModel):
 
     resources: StageResourceConfig = Field(default_factory=StageResourceConfig)
     max_seq_len: int | None = None
+    image_min_pixels: int | None = None
+    image_max_pixels: int | None = None
     video_fps: float | None = None
+    video_max_frames: int | None = None
+    video_min_frames: int | None = None
+    video_min_pixels: int | None = None
+    video_max_pixels: int | None = None
+    video_total_pixels: int | None = None
+    video_override_max_pixels: bool | None = None
+    video_seconds_per_chunk: float | None = None
+    video_position_id_per_seconds: float | None = None
+    audio_target_sr: int | None = None
+    audio_sampling_rate: int | None = None
+    sampling_rate: int | None = None
+    audio_timestamp_interval: int | None = None
+    timestamp_interval: int | None = None
+    audio_downsample_times: int | None = None
+    downsample_times: int | None = None
+    audio_downsample_chunk_size: int | None = None
+    downsample_chunk_size: int | None = None
+    code2wav_stream_chunk_size: int | None = None
+    send_chunk_size: int | None = None
+    code2wav_codec_eos_token_id: int | None = None
+    code2wav_sample_rate: int | None = None
+    code2wav_left_context_size: int | None = None
+    code2wav_enable_dynamic_chunk: bool | None = None
+    enable_dynamic_chunk: bool | None = None
+    code2wav_dynamic_batch: bool | None = None
+    dynamic_batch: bool | None = None
+    code2wav_dynamic_chunk_sizes: tuple[int, ...] | str | None = None
+    code2wav_dynamic_chunk_steps: tuple[int, ...] | str | None = None
+    code2wav_enable_torch_compile: bool | None = None
+    code2wav_enable_torch_compile_first_chunk: bool | None = None
+    enable_torch_compile_first_chunk: bool | None = None
+    code2wav_odeint_method: str | None = None
+    odeint_method: str | None = None
+    code2wav_odeint_method_relaxed: bool | None = None
+    odeint_method_relaxed: bool | None = None
+    code2wav_batched_chunk: int | None = None
+    batched_chunk: int | None = None
+    code2wav_frequency: str | None = None
+    frequency: str | None = None
+    code2wav_dit_quant: str | None = None
+    dit_quant: str | None = None
     sglang_server_args: SGLangServerArgsConfig = Field(
         default_factory=SGLangServerArgsConfig
     )
 
     def model_post_init(self, __context: Any = None) -> None:
+        self._normalize_audio_sampling_rate_aliases()
+        self._normalize_audio_processor_aliases()
+        self._normalize_code2wav_aliases()
         if self.max_seq_len is not None and self.max_seq_len <= 0:
             raise ValueError("runtime.max_seq_len must be positive")
         if self.video_fps is not None and self.video_fps <= 0:
             raise ValueError("runtime.video_fps must be positive")
+        if (
+            self.video_seconds_per_chunk is not None
+            and self.video_seconds_per_chunk <= 0
+        ):
+            raise ValueError("runtime.video_seconds_per_chunk must be positive")
+        if (
+            self.video_position_id_per_seconds is not None
+            and self.video_position_id_per_seconds <= 0
+        ):
+            raise ValueError(
+                "runtime.video_position_id_per_seconds must be positive"
+            )
+        for field_name in (
+            "image_min_pixels",
+            "image_max_pixels",
+            "video_max_frames",
+            "video_min_frames",
+            "video_min_pixels",
+            "video_max_pixels",
+            "video_total_pixels",
+            "audio_target_sr",
+            "audio_sampling_rate",
+            "sampling_rate",
+            "audio_timestamp_interval",
+            "timestamp_interval",
+            "audio_downsample_chunk_size",
+            "downsample_chunk_size",
+            "code2wav_stream_chunk_size",
+            "send_chunk_size",
+            "code2wav_sample_rate",
+            "code2wav_batched_chunk",
+            "batched_chunk",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and value <= 0:
+                raise ValueError(f"runtime.{field_name} must be positive")
+        for field_name in (
+            "audio_downsample_times",
+            "downsample_times",
+            "code2wav_codec_eos_token_id",
+            "code2wav_left_context_size",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and value < 0:
+                raise ValueError(f"runtime.{field_name} must be non-negative")
+
+    def _normalize_audio_sampling_rate_aliases(self) -> None:
+        self._normalize_int_aliases(
+            canonical_name="audio_target_sr",
+            alias_names=("audio_sampling_rate", "sampling_rate"),
+            label="audio sampling rate",
+        )
+
+    def _normalize_audio_processor_aliases(self) -> None:
+        self._normalize_int_aliases(
+            canonical_name="audio_timestamp_interval",
+            alias_names=("timestamp_interval",),
+            label="audio processor timestamp interval",
+        )
+        self._normalize_int_aliases(
+            canonical_name="audio_downsample_times",
+            alias_names=("downsample_times",),
+            label="audio processor downsample times",
+        )
+        self._normalize_int_aliases(
+            canonical_name="audio_downsample_chunk_size",
+            alias_names=("downsample_chunk_size",),
+            label="audio processor downsample chunk size",
+        )
+
+    def _normalize_code2wav_aliases(self) -> None:
+        self._normalize_int_aliases(
+            canonical_name="code2wav_stream_chunk_size",
+            alias_names=("send_chunk_size",),
+            label="code2wav stream chunk size",
+        )
+        self._normalize_positive_int_sequence(
+            field_name="code2wav_dynamic_chunk_sizes",
+            label="code2wav dynamic chunk sizes",
+        )
+        self._normalize_positive_int_sequence(
+            field_name="code2wav_dynamic_chunk_steps",
+            label="code2wav dynamic chunk steps",
+        )
+        self._normalize_bool_aliases(
+            canonical_name="code2wav_enable_dynamic_chunk",
+            alias_names=(
+                "enable_dynamic_chunk",
+                "code2wav_dynamic_batch",
+                "dynamic_batch",
+            ),
+            label="code2wav dynamic chunk",
+        )
+        self._normalize_bool_aliases(
+            canonical_name="code2wav_enable_torch_compile_first_chunk",
+            alias_names=("enable_torch_compile_first_chunk",),
+            label="code2wav torch compile first chunk",
+        )
+        self._normalize_text_aliases(
+            canonical_name="code2wav_odeint_method",
+            alias_names=("odeint_method",),
+            label="code2wav odeint method",
+        )
+        self._normalize_bool_aliases(
+            canonical_name="code2wav_odeint_method_relaxed",
+            alias_names=("odeint_method_relaxed",),
+            label="code2wav odeint method relaxed",
+        )
+        self._normalize_int_aliases(
+            canonical_name="code2wav_batched_chunk",
+            alias_names=("batched_chunk",),
+            label="code2wav batched chunk",
+        )
+        self._normalize_text_aliases(
+            canonical_name="code2wav_frequency",
+            alias_names=("frequency",),
+            label="code2wav frequency",
+        )
+        self._normalize_text_aliases(
+            canonical_name="code2wav_dit_quant",
+            alias_names=("dit_quant",),
+            label="code2wav dit quant",
+        )
+
+    def _normalize_int_aliases(
+        self,
+        *,
+        canonical_name: str,
+        alias_names: tuple[str, ...],
+        label: str,
+    ) -> None:
+        field_names = (canonical_name, *alias_names)
+        values = [
+            (name, getattr(self, name))
+            for name in field_names
+            if getattr(self, name) is not None
+        ]
+        if not values:
+            return
+        canonical = int(values[0][1])
+        for name, value in values[1:]:
+            if int(value) != canonical:
+                raise ValueError(
+                    f"runtime {label} aliases disagree: "
+                    f"{'/'.join(field_names)} include "
+                    f"{values[0][0]}={canonical} and {name}={value}"
+                )
+        setattr(self, canonical_name, canonical)
+
+    def _normalize_positive_int_sequence(
+        self,
+        *,
+        field_name: str,
+        label: str,
+    ) -> None:
+        value = getattr(self, field_name)
+        if value is None:
+            return
+        values = self._parse_positive_int_sequence(value, label=label)
+        setattr(self, field_name, values)
+
+    def _parse_positive_int_sequence(
+        self,
+        value: tuple[int, ...] | str,
+        *,
+        label: str,
+    ) -> tuple[int, ...]:
+        if isinstance(value, str):
+            pieces = [
+                piece.strip()
+                for piece in value.replace(",", " ").split()
+                if piece.strip()
+            ]
+            values = tuple(int(piece) for piece in pieces)
+        else:
+            values = tuple(int(item) for item in value)
+        if not values or any(item < 1 for item in values):
+            raise ValueError(f"runtime {label} must contain positive integers")
+        return values
+
+    def _normalize_bool_aliases(
+        self,
+        *,
+        canonical_name: str,
+        alias_names: tuple[str, ...],
+        label: str,
+    ) -> None:
+        field_names = (canonical_name, *alias_names)
+        values = [
+            (name, getattr(self, name))
+            for name in field_names
+            if getattr(self, name) is not None
+        ]
+        if not values:
+            return
+        canonical = bool(values[0][1])
+        for name, value in values[1:]:
+            if bool(value) != canonical:
+                raise ValueError(
+                    f"runtime {label} aliases disagree: "
+                    f"{'/'.join(field_names)} include "
+                    f"{values[0][0]}={canonical} and {name}={value}"
+                )
+        setattr(self, canonical_name, canonical)
+
+    def _normalize_text_aliases(
+        self,
+        *,
+        canonical_name: str,
+        alias_names: tuple[str, ...],
+        label: str,
+    ) -> None:
+        field_names = (canonical_name, *alias_names)
+        values = [
+            (name, getattr(self, name))
+            for name in field_names
+            if getattr(self, name) is not None
+        ]
+        if not values:
+            return
+        canonical = str(values[0][1]).strip()
+        if not canonical:
+            raise ValueError(f"runtime {label} must not be empty")
+        comparable = canonical.casefold()
+        for name, value in values[1:]:
+            candidate = str(value).strip()
+            if not candidate:
+                raise ValueError(f"runtime {label} must not be empty")
+            if candidate.casefold() != comparable:
+                raise ValueError(
+                    f"runtime {label} aliases disagree: "
+                    f"{'/'.join(field_names)} include "
+                    f"{values[0][0]}={canonical} and {name}={value}"
+                )
+        setattr(self, canonical_name, canonical)
 
 
 class PlacementConfig(BaseModel):
@@ -239,6 +531,11 @@ class PipelineConfig(BaseModel):
     @classmethod
     def mem_fraction_role_to_stage(cls) -> dict[str, str]:
         """Class-level public role map for SGLang mem_fraction_static overrides."""
+        return {}
+
+    @classmethod
+    def max_running_requests_role_to_stage(cls) -> dict[str, str]:
+        """Class-level public role map for SGLang max_running_requests overrides."""
         return {}
 
     @classmethod

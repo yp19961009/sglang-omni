@@ -124,6 +124,10 @@ class VideoEvalConfig:
     disable_tqdm: bool = False
     repo_id: str | None = None
     enable_audio: bool = False
+    audio_format: str = "wav"
+    audio_voice: str | None = None
+    audio_language: str | None = None
+    stream: bool = False
     asr_device: str = "cuda:0"
     asr_concurrency: int = DEFAULT_ASR_TRANSCRIBE_CONCURRENCY
     lang: str = "en"
@@ -172,6 +176,10 @@ async def run_video_eval(
         video_total_pixels=config.video_total_pixels,
         enable_audio_input=enable_audio_input,
         audio_output_dir=audio_output_dir,
+        audio_format=config.audio_format,
+        audio_voice=config.audio_voice,
+        audio_language=config.audio_language,
+        stream_output=config.stream,
         fixed_prompt=fixed_prompt,
     )
     runner = BenchmarkRunner(
@@ -207,6 +215,10 @@ async def run_video_eval(
             "max_concurrency": config.max_concurrency,
             "warmup": config.warmup,
             "enable_audio": config.enable_audio,
+            "audio_format": config.audio_format,
+            "audio_voice": config.audio_voice,
+            "audio_language": config.audio_language,
+            "stream": config.stream,
             "asr_device": config.asr_device,
             "asr_concurrency": config.asr_concurrency,
             "lang": config.lang,
@@ -250,6 +262,10 @@ def video_eval_config_from_args(args: argparse.Namespace) -> VideoEvalConfig:
         disable_tqdm=args.disable_tqdm,
         timeout_s=args.timeout_s,
         enable_audio=args.enable_audio,
+        audio_format=args.audio_format,
+        audio_voice=args.audio_voice,
+        audio_language=args.audio_language,
+        stream=args.stream,
         asr_device=args.asr_device,
         asr_concurrency=args.asr_concurrency,
         lang=args.lang,
@@ -285,6 +301,37 @@ def add_video_eval_args(parser: argparse.ArgumentParser, *, repo_help: str) -> N
         "--enable-audio",
         action="store_true",
         help="Request text+audio output and compute text-audio WER.",
+    )
+    parser.add_argument(
+        "--audio-format",
+        type=str,
+        choices=["wav"],
+        default="wav",
+        help=(
+            "OpenAI audio output format when --enable-audio is used. "
+            "Only wav is supported because benchmark RTF/audio metrics parse "
+            "saved WAV bytes."
+        ),
+    )
+    parser.add_argument(
+        "--audio-voice",
+        type=str,
+        default=None,
+        help="Optional OpenAI audio.voice value for talker voice selection.",
+    )
+    parser.add_argument(
+        "--audio-language",
+        type=str,
+        default=None,
+        help="Optional OpenAI audio.language value for speech output.",
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help=(
+            "Use streaming chat completions. With --enable-audio this records "
+            "time-to-first-audio-chunk (TTFC), text TTFT, and audio ITL."
+        ),
     )
     parser.add_argument(
         "--asr-device",

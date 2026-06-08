@@ -80,6 +80,8 @@ class SGLModelRunner(ModelRunner):
 
     def _register_omni_model(self):
         # Register sglang_omni model classes directly in SGLang's model registry.
+        import importlib
+
         from sglang.srt.models.registry import ModelRegistry
 
         from sglang_omni.models.fishaudio_s2_pro.sglang_model import (
@@ -105,6 +107,56 @@ class SGLModelRunner(ModelRunner):
             WhisperForConditionalGeneration,
         )
 
+        def _try_import_model(*candidates: tuple[str, tuple[str, ...]]):
+            for module_name, class_names in candidates:
+                try:
+                    module = importlib.import_module(module_name)
+                except ImportError:
+                    continue
+                for class_name in class_names:
+                    model_cls = getattr(module, class_name, None)
+                    if model_cls is not None:
+                        return model_cls
+            return None
+
+        qwen35_thinker_cls = _try_import_model(
+            (
+                "sglang.srt.models.qwen3_omni_next_thinker",
+                (
+                    "Qwen3OmniNextThinkerForConditionalGeneration",
+                    "Qwen3OmniNextThinkerMTP",
+                    "Qwen3OmniNextForConditionalGeneration",
+                ),
+            ),
+            (
+                # 中文说明：优先使用 SGLang core；core 暂缺时再走本仓库 port。
+                "sglang_omni.models.qwen3_5_omni.components.sglang_thinker",
+                (
+                    "Qwen3OmniNextThinkerForConditionalGeneration",
+                    "Qwen3OmniNextThinkerMTP",
+                    "Qwen3OmniNextForConditionalGeneration",
+                ),
+            ),
+        )
+        qwen35_talker_cls = _try_import_model(
+            (
+                "sglang.srt.models.qwen3_omni_next_talker",
+                (
+                    "Qwen3OmniNextTalkerForConditionalGeneration",
+                    "Qwen3OmniNextMoeTalkerForConditionalGeneration",
+                    "Qwen3OmniNextTalkerModel",
+                ),
+            ),
+            (
+                "sglang_omni.models.qwen3_5_omni.components.talker",
+                (
+                    "Qwen3OmniNextTalkerForConditionalGeneration",
+                    "Qwen3OmniNextMoeTalkerForConditionalGeneration",
+                    "Qwen3OmniNextTalkerModel",
+                ),
+            ),
+        )
+
         register_ming_hf_config()
         register_ming_model_registry()
 
@@ -126,6 +178,27 @@ class SGLModelRunner(ModelRunner):
         ModelRegistry.models["Qwen3ASRForConditionalGeneration"] = (
             Qwen3ASRForConditionalGeneration
         )
+        if qwen35_thinker_cls is not None:
+            ModelRegistry.models["Qwen3OmniNextForConditionalGeneration"] = (
+                qwen35_thinker_cls
+            )
+            ModelRegistry.models["Qwen3OmniNextThinkerForConditionalGeneration"] = (
+                qwen35_thinker_cls
+            )
+            # 中文说明：MTP draft path 仍未接入 speculative decoding；
+            # 这里仅把 MTP architecture 降级注册到 base thinker，避免
+            # 带 thinker_mtp config 的 checkpoint 在模型类查找阶段失败。
+            ModelRegistry.models["Qwen3OmniNextThinkerMTP"] = qwen35_thinker_cls
+        if qwen35_talker_cls is not None:
+            ModelRegistry.models["Qwen3OmniNextTalkerModel"] = qwen35_talker_cls
+            ModelRegistry.models["Qwen3OmniNextTalkerForConditionalGeneration"] = (
+                qwen35_talker_cls
+            )
+            # 中文说明：vLLM perf_v2 的判断逻辑里还保留了 MoeTalker
+            # architecture 名。当前本地 port 与 NextTalker 共用实现。
+            ModelRegistry.models["Qwen3OmniNextMoeTalkerForConditionalGeneration"] = (
+                qwen35_talker_cls
+            )
 
     def _profile_available_bytes(self, pre_model_load_memory: float) -> int:
         """Profile KV-cache headroom for colocated SGLang AR stages.

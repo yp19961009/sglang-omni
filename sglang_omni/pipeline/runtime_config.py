@@ -59,6 +59,36 @@ class PipelineRuntimePrep:
     runtime_dir_created_here: bool
 
 
+_IPC_PATH_MAX = 104  # Linux sun_path usable length, kept with a safety margin.
+
+
+def _max_socket_filename_len(stages: list[StageConfig]) -> int:
+    names = ["completion.sock", "abort.sock"]
+    names.extend(f"stage_{stage.name}.sock" for stage in stages)
+    # apply_fusion may rename stages after the IPC dir is created; pad a little
+    # so a slightly longer fused socket name still fits under the sun_path cap.
+    return max(len(name) for name in names) + 8
+
+
+def _bound_namespace_prefix(
+    prefix: str, base_root: Path, stages: list[StageConfig]
+) -> str:
+    """Trim the model-derived IPC namespace so socket paths stay bindable.
+
+    The final bind target is "{base_root}/{prefix}-XXXXXXXX/{socket}" where
+    mkdtemp appends a dash and 8 random chars. Long model paths (e.g. the
+    Qwen3.5-Omni 23B checkpoint dir) otherwise overflow the ~108 byte Unix
+    domain socket sun_path limit.
+    """
+    reserved = (
+        len(str(base_root)) + len("/-XXXXXXXX/") + _max_socket_filename_len(stages)
+    )
+    budget = _IPC_PATH_MAX - reserved
+    if budget < 1:
+        return "p"
+    return prefix[:budget].rstrip("-") or "p"
+
+
 def create_ipc_runtime_dir(config: PipelineConfig) -> IpcRuntimeDir:
     """Create a per-run IPC namespace for one pipeline instance."""
     base_root = Path(config.endpoints.base_path)
@@ -67,6 +97,9 @@ def create_ipc_runtime_dir(config: PipelineConfig) -> IpcRuntimeDir:
     namespace_prefix = re.sub(r"[^0-9a-z]+", "-", config.name.lower()).strip("-")
     if not namespace_prefix:
         namespace_prefix = "pipeline"
+    namespace_prefix = _bound_namespace_prefix(
+        namespace_prefix, base_root, config.stages
+    )
     path = Path(tempfile.mkdtemp(prefix=f"{namespace_prefix}-", dir=base_root))
     return IpcRuntimeDir(path)
 

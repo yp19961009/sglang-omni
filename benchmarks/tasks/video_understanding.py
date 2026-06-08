@@ -6,11 +6,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import io
+import json
 import logging
 import os
 import random
 import struct
+import statistics
 import time
+import wave
 from typing import Any, TypedDict
 
 import aiohttp
@@ -46,6 +50,10 @@ class VideoMMERecord(TypedDict):
     output_token_rate: float | None
     audio_duration_s: float | None
     rtf: float | None
+    audio_ttfp_s: float | None
+    text_ttft_s: float | None
+    audio_chunks: int
+    inter_chunk_mean_s: float | None
     wav_path: str
     predicted: str
     raw_response: str
@@ -53,6 +61,22 @@ class VideoMMERecord(TypedDict):
     is_success: bool
     is_mc_fallback: bool
     error: str
+
+
+def _chat_completion_audio_obj(
+    body: dict[str, Any],
+    message: dict[str, Any],
+) -> dict[str, Any] | None:
+    audio_obj = message.get("audio")
+    if isinstance(audio_obj, dict):
+        return audio_obj
+    top_level_audio = body.get("audio")
+    if isinstance(top_level_audio, dict):
+        # 中文说明：sglang-omni 使用 OpenAI-style message.audio；
+        # vLLM perf_v2 的 Qwen3.5 server 非流式响应把音频放在顶层
+        # audio。benchmark 同时兼容，方便同一套脚本横向对比。
+        return top_level_audio
+    return None
 
 
 def _apply_chat_completion_response(
@@ -67,8 +91,8 @@ def _apply_chat_completion_response(
     wav_bytes = b""
 
     if audio_output_dir:
-        audio_obj = message.get("audio")
-        if not isinstance(audio_obj, dict):
+        audio_obj = _chat_completion_audio_obj(body, message)
+        if audio_obj is None:
             result.error = "No audio in response"
             return False
         audio_b64 = audio_obj.get("data", "")
@@ -102,6 +126,194 @@ def _apply_chat_completion_response(
     return True
 
 
+def _event_text_delta(evt: dict[str, Any]) -> str | None:
+    for choice in evt.get("choices", []):
+        delta = choice.get("delta") or {}
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            return content
+    return None
+
+
+def _event_audio_obj(evt: dict[str, Any]) -> dict[str, Any] | None:
+    top_level_audio = evt.get("audio")
+    if isinstance(top_level_audio, dict) and top_level_audio.get("data"):
+        # 中文说明：vLLM perf_v2 的 Qwen3.5 streaming server 会发送
+        # object=chat.completion.audio 的顶层 audio 事件；sglang-omni
+        # 则走 choices[].delta.audio。两种都算首音频 chunk。
+        return top_level_audio
+    for choice in evt.get("choices", []):
+        delta = choice.get("delta") or {}
+        audio = delta.get("audio")
+        if isinstance(audio, dict) and audio.get("data"):
+            return audio
+    return None
+
+
+def _event_usage(evt: dict[str, Any]) -> dict[str, Any] | None:
+    usage = evt.get("usage")
+    return usage if isinstance(usage, dict) else None
+
+
+def _decode_wav_duration(audio_obj: dict[str, Any]) -> tuple[bytes, float] | None:
+    audio_b64 = audio_obj.get("data", "")
+    if not audio_b64:
+        return None
+    try:
+        wav_bytes = base64.b64decode(audio_b64, validate=True)
+        return wav_bytes, round(get_wav_duration(wav_bytes), 4)
+    except (binascii.Error, ValueError, struct.error):
+        return None
+
+
+def _wav_chunk_payload(
+    wav_bytes: bytes,
+) -> tuple[tuple[int, int, int, str, str], bytes] | None:
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
+            params = (
+                wav_file.getnchannels(),
+                wav_file.getsampwidth(),
+                wav_file.getframerate(),
+                wav_file.getcomptype(),
+                wav_file.getcompname(),
+            )
+            frames = wav_file.readframes(wav_file.getnframes())
+    except (EOFError, wave.Error):
+        return None
+    return params, frames
+
+
+def _combine_wav_chunks(
+    chunks: list[tuple[tuple[int, int, int, str, str], bytes]],
+) -> bytes | None:
+    if not chunks:
+        return None
+    params = chunks[0][0]
+    frames: list[bytes] = []
+    for chunk_params, chunk_frames in chunks:
+        if chunk_params != params:
+            logger.debug("Skipping streamed audio save: WAV chunk params changed")
+            return None
+        frames.append(chunk_frames)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        channels, sample_width, sample_rate, comp_type, comp_name = params
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(sample_width)
+        wav_file.setframerate(sample_rate)
+        wav_file.setcomptype(comp_type, comp_name)
+        wav_file.writeframes(b"".join(frames))
+    return buffer.getvalue()
+
+
+async def _iter_sse_json(response: aiohttp.ClientResponse):
+    while True:
+        raw = await response.content.readline()
+        if not raw:
+            break
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data:"):
+            continue
+        body = line[len("data:") :].strip()
+        if not body or body == "[DONE]":
+            continue
+        try:
+            yield json.loads(body)
+        except json.JSONDecodeError:
+            logger.debug("Skipping non-JSON SSE payload: %s", body[:120])
+
+
+async def _apply_chat_completion_stream_response(
+    result: RequestResult,
+    response: aiohttp.ClientResponse,
+    *,
+    audio_output_dir: str | None,
+    sample_id: str,
+    start_time: float,
+) -> bool:
+    text_parts: list[str] = []
+    usage: dict[str, Any] | None = None
+    audio_duration_s = 0.0
+    audio_chunks = 0
+    first_audio_at: float | None = None
+    last_audio_at: float | None = None
+    inter_chunk_s: list[float] = []
+    first_text_at: float | None = None
+    full_audio_wav: bytes | None = None
+    delta_audio_chunks: list[tuple[tuple[int, int, int, str, str], bytes]] = []
+
+    async for evt in _iter_sse_json(response):
+        now = time.perf_counter()
+        text_delta = _event_text_delta(evt)
+        if text_delta:
+            text_parts.append(text_delta)
+            if first_text_at is None:
+                first_text_at = now
+
+        audio_obj = _event_audio_obj(evt)
+        if audio_obj is not None:
+            if first_audio_at is None:
+                first_audio_at = now
+            if last_audio_at is not None:
+                inter_chunk_s.append(now - last_audio_at)
+            last_audio_at = now
+            audio_chunks += 1
+            decoded = _decode_wav_duration(audio_obj)
+            if decoded is not None:
+                wav_bytes, duration_s = decoded
+                audio_duration_s += duration_s
+                if evt.get("object") == "chat.completion.audio":
+                    # 中文说明：vLLM 顶层 audio 事件通常是完整 WAV，可保存
+                    # 给 WER；sglang-omni 的 delta.audio 则在下面按 PCM
+                    # 拼接，避免直接拼 WAV 文件头。
+                    full_audio_wav = wav_bytes
+                else:
+                    wav_chunk = _wav_chunk_payload(wav_bytes)
+                    if wav_chunk is not None:
+                        delta_audio_chunks.append(wav_chunk)
+
+        evt_usage = _event_usage(evt)
+        if evt_usage:
+            usage = evt_usage
+
+    result.text = "".join(text_parts)
+    if first_audio_at is not None:
+        result.audio_ttfp_s = first_audio_at - start_time
+    if first_text_at is not None:
+        result.text_ttft_s = first_text_at - start_time
+    result.inter_chunk_s = inter_chunk_s
+    if audio_duration_s > 0:
+        result.audio_duration_s = round(audio_duration_s, 4)
+    if usage:
+        result.prompt_tokens = usage.get("prompt_tokens", 0)
+        result.completion_tokens = usage.get("completion_tokens", 0)
+
+    if audio_output_dir and audio_chunks == 0:
+        result.error = "No audio chunks in streaming response"
+        return False
+    if audio_output_dir and full_audio_wav is None and delta_audio_chunks:
+        # 中文说明：sglang-omni 的 streaming chat audio 走 delta.audio，
+        # 每个 delta 是一个独立 WAV chunk。这里只在 WAV 参数一致时拼接
+        # PCM，保证 streaming benchmark 也能保存音频用于 WER/人工检查。
+        full_audio_wav = _combine_wav_chunks(delta_audio_chunks)
+    if audio_output_dir and full_audio_wav is not None:
+        try:
+            os.makedirs(audio_output_dir, exist_ok=True)
+            wav_path = os.path.join(audio_output_dir, f"{sample_id}.wav")
+            with open(wav_path, "wb") as f:
+                f.write(full_audio_wav)
+        except OSError as exc:
+            result.error = f"Failed to save audio: {exc}"
+            return False
+        result.wav_path = wav_path
+
+    # 中文说明：streaming 下如果只有 delta audio 而没有完整顶层 WAV，
+    # 仍然可以用于性能压测；WER 需要 --skip-wer 或 vLLM 顶层完整音频事件。
+    result.is_success = True
+    return True
+
+
 def make_video_send_fn(
     model_name: str,
     api_url: str,
@@ -115,8 +327,17 @@ def make_video_send_fn(
     video_total_pixels: int | None = None,
     enable_audio_input: bool = False,
     audio_output_dir: str | None = None,
+    audio_format: str = "wav",
+    audio_voice: str | None = None,
+    audio_language: str | None = None,
+    stream_output: bool = False,
     fixed_prompt: str | None = None,
 ) -> SendFn:
+    if audio_output_dir and audio_format != "wav":
+        raise ValueError(
+            "Video benchmark audio metrics currently require wav output; "
+            f"got {audio_format!r}"
+        )
     modalities = ["text", "audio"] if audio_output_dir else ["text"]
 
     async def send_fn(
@@ -128,21 +349,41 @@ def make_video_send_fn(
             request_id=sample.sample_id,
             text=prompt[:60],
         )
+        content_parts: list[dict[str, Any]] = [
+            {"type": "video", "video": sample.video_path},
+        ]
+        if enable_audio_input:
+            assert isinstance(sample, VideoAMMESample)
+            content_parts.append({"type": "audio", "audio": sample.audio_path})
+        content_parts.append({"type": "text", "text": prompt})
 
         payload: dict[str, Any] = {
             "model": model_name,
-            "messages": [{"role": "user", "content": prompt}],
-            "videos": [sample.video_path],
+            # 中文说明：用 OpenAI content parts 同时兼容 sglang-omni 和
+            # vLLM perf_v2 的 Qwen3.5 OpenAI server；后者不会读取顶层
+            # videos/audios 字段。
+            "messages": [{"role": "user", "content": content_parts}],
             "modalities": modalities,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "stream": False,
+            "stream": stream_output,
+            "metadata": {"sample_id": sample.sample_id},
         }
-        if enable_audio_input:
-            assert isinstance(sample, VideoAMMESample)
-            payload["audios"] = [sample.audio_path]
         if audio_output_dir:
-            payload["audio"] = {"format": "wav"}
+            # sglang-omni honors modalities; vLLM perf_v2 server uses
+            # enable_audio_output, while offline scripts commonly use do_wave.
+            payload["enable_audio_output"] = True
+            payload["do_wave"] = True
+            audio_config = {"format": audio_format}
+            # 中文说明：Qwen3.5-Omni talker 支持通过 OpenAI audio 字段
+            # 选择 voice/language。benchmark 只透传显式参数，默认行为仍和
+            # Qwen3-Omni 旧压测一致。
+            if audio_voice:
+                audio_config["voice"] = audio_voice
+                payload["voice_type"] = audio_voice
+            if audio_language:
+                audio_config["language"] = audio_language
+            payload["audio"] = audio_config
         if video_fps is not None:
             payload["video_fps"] = video_fps
         if video_max_frames is not None:
@@ -158,15 +399,24 @@ def make_video_send_fn(
         try:
             async with session.post(api_url, json=payload) as response:
                 response.raise_for_status()
-                body = await response.json()
-
-            if not _apply_chat_completion_response(
-                result,
-                body,
-                audio_output_dir=audio_output_dir,
-                sample_id=sample.sample_id,
-            ):
-                return result
+                if stream_output:
+                    if not await _apply_chat_completion_stream_response(
+                        result,
+                        response,
+                        audio_output_dir=audio_output_dir,
+                        sample_id=sample.sample_id,
+                        start_time=start_time,
+                    ):
+                        return result
+                else:
+                    body = await response.json()
+                    if not _apply_chat_completion_response(
+                        result,
+                        body,
+                        audio_output_dir=audio_output_dir,
+                        sample_id=sample.sample_id,
+                    ):
+                        return result
 
             elapsed = time.perf_counter() - start_time
             result.engine_time_s = elapsed
@@ -220,6 +470,26 @@ def build_videomme_result_records(
                 else None
             ),
             "rtf": (round(result.rtf, 4) if result.rtf > 0 else None),
+            "audio_ttfp_s": (
+                round(result.audio_ttfp_s, 4)
+                if getattr(result, "audio_ttfp_s", None) is not None
+                else None
+            ),
+            "text_ttft_s": (
+                round(result.text_ttft_s, 4)
+                if getattr(result, "text_ttft_s", None) is not None
+                else None
+            ),
+            "audio_chunks": (
+                1 + len(getattr(result, "inter_chunk_s", []) or [])
+                if getattr(result, "audio_ttfp_s", None) is not None
+                else 0
+            ),
+            "inter_chunk_mean_s": (
+                round(statistics.fmean(result.inter_chunk_s), 4)
+                if getattr(result, "inter_chunk_s", None)
+                else None
+            ),
             "wav_path": result.wav_path or "",
             "predicted": "",
             "raw_response": result.error,

@@ -14,9 +14,22 @@ class Message:
 
     role: str
     content: Any
+    name: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
+    function_call: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"role": self.role, "content": self.content}
+        data = {"role": self.role, "content": self.content}
+        if self.name is not None:
+            data["name"] = self.name
+        if self.tool_calls is not None:
+            data["tool_calls"] = self.tool_calls
+        if self.tool_call_id is not None:
+            data["tool_call_id"] = self.tool_call_id
+        if self.function_call is not None:
+            data["function_call"] = self.function_call
+        return data
 
 
 @dataclass
@@ -59,6 +72,8 @@ class SamplingParams:
     top_k: int = -1
     min_p: float = 0.0
     repetition_penalty: float = 1.0
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
     stop: list[str] = field(default_factory=list)
     stop_token_ids: list[int] = field(default_factory=list)
     seed: int | None = None
@@ -71,6 +86,8 @@ class SamplingParams:
             "top_k": self.top_k,
             "min_p": self.min_p,
             "repetition_penalty": self.repetition_penalty,
+            "frequency_penalty": self.frequency_penalty,
+            "presence_penalty": self.presence_penalty,
             "stop": list(self.stop),
             "stop_token_ids": list(self.stop_token_ids),
             "seed": self.seed,
@@ -182,6 +199,8 @@ class CompletionAudio:
 
     id: str
     data: str  # base64
+    format: str | None = None
+    sample_rate: int | None = None
     transcript: str | None = None
 
 
@@ -204,6 +223,8 @@ class CompletionStreamChunk:
     text: str = ""
     modality: str = "text"
     audio_b64: str | None = None  # already base64-encoded
+    audio_format: str | None = None
+    sample_rate: int | None = None
     finish_reason: str | None = None
     usage: UsageInfo | None = None
     stage_name: str | None = None

@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Streaming time-to-first-audio-chunk (TTFT) benchmark for Qwen3-Omni speech.
+"""Streaming time-to-first-audio-chunk (TTFT) benchmark for Qwen Omni speech.
 
-Measures wall-clock latency from request submission to the first audio
-delta returned by ``POST /v1/chat/completions`` with
-``modalities=["text","audio"]`` and ``stream=true``. Designed to surface
-the gain from partial-prefix talker startup (``partial_start_min_chunks``),
-which MMMU end-to-end accuracy benchmarks cannot observe because their
-total-request latency is dominated by the thinker.
+Measures wall-clock latency from request submission to the first text delta
+and first audio delta returned by ``POST /v1/chat/completions`` with
+``modalities=["text","audio"]`` and ``stream=true``. Designed to surface the
+gain from partial-prefix talker startup (``partial_start_min_chunks``), which
+MMMU end-to-end accuracy benchmarks cannot observe because their total-request
+latency is dominated by the thinker.
 
 Usage:
     # Baseline server (partial-start disabled):
@@ -64,6 +64,7 @@ class RunResult:
     prompt_id: str
     repeat: int
     ttft_seconds: float
+    text_ttft_seconds: float | None
     total_seconds: float
     audio_chunks: int
     status_code: int
@@ -86,25 +87,39 @@ async def _measure_one(
     request_id_hint: str,
     seed: int,
     timeout_s: float,
-) -> tuple[float, float, int, int]:
+    max_tokens: int = 256,
+    audio_format: str = "wav",
+    voice: str | None = None,
+) -> tuple[float, float | None, float, int, int]:
     """Stream a chat completion with modalities=[text, audio] and time the
     first audio delta. The talker_ar pipeline owns the audio output; this is
     the metric ``partial_start_min_chunks`` is designed to move.
     """
     url = f"{base_url.rstrip('/')}/v1/chat/completions"
+    audio_config = {"format": audio_format}
+    if voice:
+        audio_config["voice"] = voice
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "modalities": ["text", "audio"],
-        "audio": {"voice": "alloy", "format": "wav"},
+        # sglang-omni honors modalities; vLLM perf_v2 gates talker on
+        # enable_audio_output and offline scripts commonly use do_wave.
+        # Keep all three so one command can target either server family.
+        "enable_audio_output": True,
+        "do_wave": True,
+        "audio": audio_config,
         "stream": True,
         "seed": seed,
-        "max_tokens": 256,
+        "max_tokens": max_tokens,
         "metadata": {"client_label": request_id_hint},
     }
+    if voice:
+        payload["voice_type"] = voice
 
     start = time.perf_counter()
     ttft: float | None = None
+    text_ttft: float | None = None
     audio_chunks = 0
     status_code = 0
 
@@ -124,18 +139,41 @@ async def _measure_one(
                 evt = json.loads(body)
             except json.JSONDecodeError:
                 continue
-            for choice in evt.get("choices", []):
-                delta = choice.get("delta") or {}
-                audio = delta.get("audio")
-                if audio and audio.get("data"):
-                    if ttft is None:
-                        ttft = time.perf_counter() - start
-                    audio_chunks += 1
+            now = time.perf_counter()
+            if text_ttft is None and _event_text_delta(evt):
+                text_ttft = now - start
+            if _event_audio_data(evt):
+                if ttft is None:
+                    ttft = now - start
+                audio_chunks += 1
 
     total = time.perf_counter() - start
     if ttft is None:
         raise RuntimeError("server returned 200 but no audio delta arrived")
-    return ttft, total, audio_chunks, status_code
+    return ttft, text_ttft, total, audio_chunks, status_code
+
+
+def _event_text_delta(evt: dict) -> str | None:
+    for choice in evt.get("choices", []):
+        delta = choice.get("delta") or {}
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            return content
+    return None
+
+
+def _event_audio_data(evt: dict) -> str | None:
+    top_level_audio = evt.get("audio")
+    if isinstance(top_level_audio, dict) and top_level_audio.get("data"):
+        # 中文说明：vLLM perf_v2 的 Qwen3.5 streaming server 在最后
+        # 发送 object=chat.completion.audio 的顶层 audio 事件。
+        return top_level_audio["data"]
+    for choice in evt.get("choices", []):
+        delta = choice.get("delta") or {}
+        audio = delta.get("audio")
+        if isinstance(audio, dict) and audio.get("data"):
+            return audio["data"]
+    return None
 
 
 async def _run(args: argparse.Namespace) -> Summary:
@@ -147,7 +185,7 @@ async def _run(args: argparse.Namespace) -> Summary:
             for warm in range(args.warmup):
                 seed = 9000 + warm
                 hint = f"{args.label}-{prompt_id}-warmup{warm}"
-                ttft, total, audio_chunks, status_code = await _measure_one(
+                ttft, text_ttft, total, audio_chunks, status_code = await _measure_one(
                     client,
                     args.base_url,
                     args.model,
@@ -155,25 +193,30 @@ async def _run(args: argparse.Namespace) -> Summary:
                     request_id_hint=hint,
                     seed=seed,
                     timeout_s=args.timeout_s,
+                    max_tokens=args.max_tokens,
+                    audio_format=args.audio_format,
+                    voice=args.voice,
                 )
                 logger.info(
-                    "[%s] WARMUP prompt=%s repeat=%d ttft=%.3fs total=%.3fs "
-                    "audio_chunks=%d status_code=%d",
+                    "[%s] WARMUP prompt=%s repeat=%d ttft=%.3fs "
+                    "text_ttft=%s total=%.3fs audio_chunks=%d status_code=%d",
                     args.label,
                     prompt_id,
                     warm,
                     ttft,
+                    _format_seconds(text_ttft),
                     total,
                     audio_chunks,
                     status_code,
                 )
 
             ttfts: list[float] = []
+            text_ttfts: list[float] = []
             totals: list[float] = []
             for repeat in range(args.repeats):
                 seed = 1000 + repeat
                 hint = f"{args.label}-{prompt_id}-{repeat}"
-                ttft, total, audio_chunks, status_code = await _measure_one(
+                ttft, text_ttft, total, audio_chunks, status_code = await _measure_one(
                     client,
                     args.base_url,
                     args.model,
@@ -181,6 +224,9 @@ async def _run(args: argparse.Namespace) -> Summary:
                     request_id_hint=hint,
                     seed=seed,
                     timeout_s=args.timeout_s,
+                    max_tokens=args.max_tokens,
+                    audio_format=args.audio_format,
+                    voice=args.voice,
                 )
                 summary.per_run.append(
                     RunResult(
@@ -188,19 +234,24 @@ async def _run(args: argparse.Namespace) -> Summary:
                         prompt_id=prompt_id,
                         repeat=repeat,
                         ttft_seconds=ttft,
+                        text_ttft_seconds=text_ttft,
                         total_seconds=total,
                         audio_chunks=audio_chunks,
                         status_code=status_code,
                     )
                 )
                 ttfts.append(ttft)
+                if text_ttft is not None:
+                    text_ttfts.append(text_ttft)
                 totals.append(total)
                 logger.info(
-                    "[%s] prompt=%s repeat=%d ttft=%.3fs total=%.3fs audio_chunks=%d",
+                    "[%s] prompt=%s repeat=%d ttft=%.3fs text_ttft=%s "
+                    "total=%.3fs audio_chunks=%d",
                     args.label,
                     prompt_id,
                     repeat,
                     ttft,
+                    _format_seconds(text_ttft),
                     total,
                     audio_chunks,
                 )
@@ -212,7 +263,26 @@ async def _run(args: argparse.Namespace) -> Summary:
                 "ttft_stdev": statistics.pstdev(ttfts) if len(ttfts) > 1 else 0.0,
                 "total_mean": statistics.fmean(totals),
             }
+            if text_ttfts:
+                summary.aggregate[prompt_id].update(
+                    {
+                        "text_ttft_mean": statistics.fmean(text_ttfts),
+                        "text_ttft_min": min(text_ttfts),
+                        "text_ttft_max": max(text_ttfts),
+                        "text_ttft_stdev": (
+                            statistics.pstdev(text_ttfts)
+                            if len(text_ttfts) > 1
+                            else 0.0
+                        ),
+                    }
+                )
     return summary
+
+
+def _format_seconds(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.3f}s"
 
 
 def _print_summary(summary: Summary) -> None:
@@ -221,10 +291,17 @@ def _print_summary(summary: Summary) -> None:
     print(f"  base_url={summary.base_url}")
     print("=" * 60)
     for prompt_id, agg in summary.aggregate.items():
+        text_part = ""
+        if "text_ttft_mean" in agg:
+            text_part = (
+                f"  text_ttft_mean={agg['text_ttft_mean']:.3f}s"
+                f"  text_min={agg['text_ttft_min']:.3f}s"
+            )
         print(
             f"  prompt={prompt_id:<7} ttft_mean={agg['ttft_mean']:.3f}s  "
             f"min={agg['ttft_min']:.3f}s  max={agg['ttft_max']:.3f}s  "
-            f"stdev={agg['ttft_stdev']:.3f}s  total_mean={agg['total_mean']:.3f}s"
+            f"stdev={agg['ttft_stdev']:.3f}s{text_part}  "
+            f"total_mean={agg['total_mean']:.3f}s"
         )
     print("=" * 60)
 
@@ -234,9 +311,27 @@ def _default_output_path(label: str) -> Path:
     return Path("results") / f"ttft_{label}_{run_id}.json"
 
 
+def _summary_payload(summary: Summary, args: argparse.Namespace) -> dict:
+    return {
+        "label": summary.label,
+        "base_url": summary.base_url,
+        "config": {
+            "model": args.model,
+            "audio_format": args.audio_format,
+            "voice": args.voice,
+            "max_tokens": args.max_tokens,
+            "warmup": args.warmup,
+            "repeats": args.repeats,
+            "timeout_s": args.timeout_s,
+        },
+        "per_run": [asdict(r) for r in summary.per_run],
+        "aggregate": summary.aggregate,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Measure streaming TTFT for Qwen3-Omni speech.",
+        description="Measure streaming TTFT for Qwen Omni speech.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--base-url", default="http://localhost:8000")
@@ -255,7 +350,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--timeout-s", type=float, default=300.0)
+    parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument(
+        "--audio-format",
+        default="wav",
+        help="Requested OpenAI audio output format.",
+    )
+    parser.add_argument(
+        "--voice",
+        default=None,
+        help=(
+            "Optional voice/voice_type. Omit to use the server default, "
+            "which is useful for Qwen3.5-Omni."
+        ),
+    )
     args = parser.parse_args(argv)
+    if not args.audio_format:
+        raise ValueError("--audio-format must not be empty")
+    if args.max_tokens < 1:
+        raise ValueError("--max-tokens must be >= 1")
     if args.output is None:
         args.output = _default_output_path(args.label)
     elif args.output.exists():
@@ -265,17 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     summary = asyncio.run(_run(args))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        json.dumps(
-            {
-                "label": summary.label,
-                "base_url": summary.base_url,
-                "per_run": [asdict(r) for r in summary.per_run],
-                "aggregate": summary.aggregate,
-            },
-            indent=2,
-        )
-    )
+    args.output.write_text(json.dumps(_summary_payload(summary, args), indent=2))
     _print_summary(summary)
     logger.info("wrote %s", args.output)
     return 0

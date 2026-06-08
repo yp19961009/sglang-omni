@@ -9,7 +9,51 @@ from typing import Any
 from sglang_omni.config.schema import PipelineConfig, StageConfig
 from sglang_omni.utils.imports import import_string
 
-_MAPPED_STAGE_RUNTIME_FIELDS = ("max_seq_len", "video_fps")
+_MAPPED_STAGE_RUNTIME_FIELDS = (
+    "max_seq_len",
+    "image_min_pixels",
+    "image_max_pixels",
+    "video_fps",
+    "video_max_frames",
+    "video_min_frames",
+    "video_min_pixels",
+    "video_max_pixels",
+    "video_total_pixels",
+    "video_override_max_pixels",
+    "video_seconds_per_chunk",
+    "video_position_id_per_seconds",
+    "audio_target_sr",
+    "audio_timestamp_interval",
+    "timestamp_interval",
+    "audio_downsample_times",
+    "downsample_times",
+    "audio_downsample_chunk_size",
+    "downsample_chunk_size",
+    "code2wav_stream_chunk_size",
+    "send_chunk_size",
+    "code2wav_codec_eos_token_id",
+    "code2wav_sample_rate",
+    "code2wav_left_context_size",
+    "code2wav_enable_dynamic_chunk",
+    "enable_dynamic_chunk",
+    "code2wav_dynamic_batch",
+    "dynamic_batch",
+    "code2wav_dynamic_chunk_sizes",
+    "code2wav_dynamic_chunk_steps",
+    "code2wav_enable_torch_compile",
+    "code2wav_enable_torch_compile_first_chunk",
+    "enable_torch_compile_first_chunk",
+    "code2wav_odeint_method",
+    "odeint_method",
+    "code2wav_odeint_method_relaxed",
+    "odeint_method_relaxed",
+    "code2wav_batched_chunk",
+    "batched_chunk",
+    "code2wav_frequency",
+    "frequency",
+    "code2wav_dit_quant",
+    "dit_quant",
+)
 
 
 def resolve_stage_factory_args(
@@ -158,6 +202,11 @@ def _apply_typed_runtime_args(args: dict[str, Any], stage_cfg: StageConfig) -> N
     if mem_fraction_static is not None:
         overrides = dict(args.get("server_args_overrides") or {})
         overrides["mem_fraction_static"] = mem_fraction_static
+        args["server_args_overrides"] = overrides
+    max_running_requests = runtime.sglang_server_args.max_running_requests
+    if max_running_requests is not None:
+        overrides = dict(args.get("server_args_overrides") or {})
+        overrides["max_running_requests"] = int(max_running_requests)
         args["server_args_overrides"] = overrides
 
 
