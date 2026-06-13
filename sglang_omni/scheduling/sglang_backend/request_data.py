@@ -31,6 +31,14 @@ class SGLangARRequestData(ARRequestData):
     tts_pad_embed: Any = None
     tts_eos_embed: Any = None
     thinker_chunks_done: bool = True
+    talker_decode_input_mode: str = "sum"
+    talker_text_feedback_stride: int = 0
+    talker_text_feedback_countdown: int = 0
+    talker_text_chunk_size: int = 1
+    talker_text_chunk_remaining: int = 0
+    talker_text_outputs_to_drop: int = 0
+    last_talker_decode_input_kind: str | None = None
+    last_talker_decode_should_emit: bool = True
 
 
 @dataclass

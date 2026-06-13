@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import importlib
+import json
 import math
+import os
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -24,6 +27,50 @@ _MODELING_MODULE_CANDIDATES = (
 _AUDIO_CLASS_CANDIDATES = ("Qwen3OmniNextAudioEncoder",)
 DEFAULT_DOWNSAMPLE_TIMES = 4
 DEFAULT_DOWNSAMPLE_CHUNK_SIZE = 100
+
+
+def _append_audio_debug_record(path: str, record: dict[str, Any]) -> None:
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except OSError:
+        pass
+
+
+def _audio_tensor_stats(tensor: torch.Tensor | None, sample_size: int = 8) -> dict[str, Any] | None:
+    if not isinstance(tensor, torch.Tensor):
+        return None
+    data = tensor.detach()
+    stats_data = data.float()
+    flat = stats_data.reshape(-1, stats_data.shape[-1])
+    last = flat[-1]
+    stats: dict[str, Any] = {
+        "shape": list(data.shape),
+        "dtype": str(data.dtype),
+        "mean": float(stats_data.mean().cpu()),
+        "std": float(stats_data.std(unbiased=False).cpu()),
+        "norm": float(torch.linalg.vector_norm(stats_data).cpu()),
+        "last_mean": float(last.mean().cpu()),
+        "last_std": float(last.std(unbiased=False).cpu()),
+        "last_norm": float(torch.linalg.vector_norm(last).cpu()),
+        "last_first_values": [
+            float(x) for x in last[:sample_size].detach().cpu().tolist()
+        ],
+    }
+    if os.getenv("QWEN35_AUDIO_EMBED_DUMP_TOKEN_NORMS"):
+        stats["token_norms"] = [
+            float(x) for x in torch.linalg.vector_norm(flat, dim=-1).cpu().tolist()
+        ]
+    if os.getenv("QWEN35_AUDIO_EMBED_DUMP_LAST_VALUES"):
+        stats["last_values"] = [float(x) for x in last.detach().cpu().tolist()]
+    return stats
+
+
+def _audio_tensor_values(tensor: torch.Tensor | None, max_items: int = 512) -> Any | None:
+    if not isinstance(tensor, torch.Tensor) or tensor.numel() > max_items:
+        return None
+    return tensor.detach().cpu().tolist()
 
 
 def _resolve_next_class(class_names: tuple[str, ...]):
@@ -290,12 +337,48 @@ class Qwen35OmniAudioEncoder(nn.Module):
             downsample_times=self._downsample_times,
             chunk_size=self._downsample_chunk_size,
         )
+
+        dump_path = os.environ.get("QWEN35_AUDIO_EMBED_DUMP")
+        should_dump = False
+        if dump_path:
+            try:
+                max_dump_calls = int(os.environ.get("QWEN35_AUDIO_EMBED_DUMP_MAX_CALLS", "1"))
+            except ValueError:
+                max_dump_calls = 1
+            dump_calls = int(getattr(self, "_qwen35_audio_dump_calls", 0))
+            should_dump = dump_calls < max_dump_calls
+            if should_dump:
+                self._qwen35_audio_dump_calls = dump_calls + 1
+                _append_audio_debug_record(
+                    dump_path,
+                    {
+                        "source": "sglang-audio-encoder",
+                        "stage": "audio_input",
+                        "input_features": _audio_tensor_stats(input_features),
+                        "audio_feature_lengths": _audio_tensor_values(
+                            audio_feature_lengths
+                        ),
+                        "audio_output_lengths": _audio_tensor_values(
+                            audio_output_lengths
+                        ),
+                    },
+                )
+
         outputs: Any = self.audio_tower(
             input_features.to(device=self._device, dtype=tower_dtype),
             feature_lens=audio_feature_lengths,
             aftercnn_lens=audio_output_lengths,
         )
         audio_embeds = getattr(outputs, "last_hidden_state", outputs)
+        if should_dump and dump_path:
+            _append_audio_debug_record(
+                dump_path,
+                {
+                    "source": "sglang-audio-encoder",
+                    "stage": "audio_output",
+                    "audio_features": _audio_tensor_stats(audio_embeds),
+                },
+            )
         return {
             "audio_embeds": audio_embeds,
             "audio_feature_lengths": audio_feature_lengths,

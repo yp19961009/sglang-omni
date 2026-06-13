@@ -6,7 +6,9 @@ pass, sampling, logit post-processing, and output extraction.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -482,7 +484,128 @@ class ModelRunner:
     ) -> Any:
         self._apply_repetition_penalty(logits_output, requests)
         self._apply_codec_suppress_tokens(logits_output, requests)
-        return self.tp_worker.model_runner.sample(logits_output, forward_batch)
+        dump_record = self._build_logits_dump_record(
+            logits_output, forward_batch, schedule_batch, requests
+        )
+        next_token_ids = self.tp_worker.model_runner.sample(logits_output, forward_batch)
+        if dump_record is not None:
+            self._write_logits_dump_record(dump_record, next_token_ids)
+        return next_token_ids
+
+    def _build_logits_dump_record(
+        self,
+        logits_output: Any,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+    ) -> dict[str, Any] | None:
+        dump_path = os.getenv("SGLANG_OMNI_LOGITS_DUMP")
+        if not dump_path:
+            return None
+
+        runner_filter = os.getenv("SGLANG_OMNI_LOGITS_DUMP_RUNNERS")
+        if runner_filter:
+            allowed = {item.strip() for item in runner_filter.split(",") if item.strip()}
+            if type(self).__name__ not in allowed:
+                return None
+
+        logits = getattr(logits_output, "next_token_logits", None)
+        if logits is None or logits.ndim != 2:
+            return None
+
+        try:
+            top_k = int(os.getenv("SGLANG_OMNI_LOGITS_DUMP_TOPK", "20"))
+        except ValueError:
+            top_k = 20
+        top_k = max(1, min(top_k, int(logits.shape[-1])))
+
+        scores, token_ids = torch.topk(logits.detach().float(), k=top_k, dim=-1)
+        input_ids = getattr(forward_batch, "input_ids", None)
+        positions = getattr(forward_batch, "positions", None)
+        mrope_positions = getattr(forward_batch, "mrope_positions", None)
+        seq_lens = getattr(forward_batch, "seq_lens", None)
+        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+
+        records = []
+        for row_idx, sched_req in enumerate(requests):
+            data = getattr(sched_req, "data", None)
+            req = getattr(data, "req", None)
+            output_ids = list(getattr(req, "output_ids", []) or [])
+            records.append(
+                {
+                    "request_id": sched_req.request_id,
+                    "row": row_idx,
+                    "generation_steps": int(getattr(data, "generation_steps", 0) or 0),
+                    "existing_output_ids": [int(x) for x in output_ids],
+                    "top_token_ids": [
+                        int(x) for x in token_ids[row_idx].detach().cpu().tolist()
+                    ],
+                    "top_scores": [
+                        float(x) for x in scores[row_idx].detach().cpu().tolist()
+                    ],
+                }
+            )
+
+        record = {
+            "runner": type(self).__name__,
+            "forward_mode": str(getattr(forward_batch, "forward_mode", None)),
+            "is_prefill_only": bool(getattr(schedule_batch, "is_prefill_only", False)),
+            "input_ids_shape": (
+                list(input_ids.shape) if isinstance(input_ids, torch.Tensor) else None
+            ),
+            "positions_shape": (
+                list(positions.shape) if isinstance(positions, torch.Tensor) else None
+            ),
+            "mrope_positions_shape": (
+                list(mrope_positions.shape)
+                if isinstance(mrope_positions, torch.Tensor)
+                else None
+            ),
+            "seq_lens": (
+                [int(x) for x in seq_lens.detach().cpu().tolist()]
+                if isinstance(seq_lens, torch.Tensor)
+                else None
+            ),
+            "extend_seq_lens_cpu": (
+                [int(x) for x in extend_lens]
+                if extend_lens is not None
+                else None
+            ),
+            "records": records,
+        }
+        if os.getenv("SGLANG_OMNI_LOGITS_DUMP_VALUES"):
+            record["input_ids"] = (
+                [int(x) for x in input_ids.detach().cpu().view(-1).tolist()]
+                if isinstance(input_ids, torch.Tensor)
+                else None
+            )
+            record["positions"] = (
+                [int(x) for x in positions.detach().cpu().view(-1).tolist()]
+                if isinstance(positions, torch.Tensor)
+                else None
+            )
+            record["mrope_positions"] = (
+                mrope_positions.detach().cpu().tolist()
+                if isinstance(mrope_positions, torch.Tensor)
+                else None
+            )
+        return record
+
+    def _write_logits_dump_record(
+        self, record: dict[str, Any], next_token_ids: Any
+    ) -> None:
+        dump_path = os.getenv("SGLANG_OMNI_LOGITS_DUMP")
+        if not dump_path:
+            return
+        if isinstance(next_token_ids, torch.Tensor):
+            record["sampled_token_ids"] = [
+                int(x) for x in next_token_ids.detach().cpu().view(-1).tolist()
+            ]
+        try:
+            with open(dump_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError:
+            logger.exception("failed to write SGLang logits dump to %s", dump_path)
 
     def _apply_repetition_penalty(self, logits_output: Any, requests: list) -> None:
         logits = logits_output.next_token_logits

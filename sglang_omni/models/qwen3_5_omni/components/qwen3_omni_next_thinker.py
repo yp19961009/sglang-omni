@@ -9,12 +9,85 @@ HF checkpoint 的 q/k/v 拆分参数名，便于 `load_module(strict=True)` 直�
 from __future__ import annotations
 
 import math
+import json
+import os
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _append_audio_debug_record(path: str, record: dict[str, Any]) -> None:
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except OSError:
+        pass
+
+
+def _audio_debug_tensor_stats(
+    tensor: torch.Tensor | None,
+    sample_size: int = 8,
+) -> dict[str, Any] | None:
+    if not isinstance(tensor, torch.Tensor):
+        return None
+    data = tensor.detach()
+    stats_data = data.float()
+    flat = stats_data.reshape(-1, stats_data.shape[-1])
+    last = flat[-1]
+    stats: dict[str, Any] = {
+        "shape": list(data.shape),
+        "dtype": str(data.dtype),
+        "mean": float(stats_data.mean().cpu()),
+        "std": float(stats_data.std(unbiased=False).cpu()),
+        "norm": float(torch.linalg.vector_norm(stats_data).cpu()),
+        "last_mean": float(last.mean().cpu()),
+        "last_std": float(last.std(unbiased=False).cpu()),
+        "last_norm": float(torch.linalg.vector_norm(last).cpu()),
+        "last_first_values": [
+            float(x) for x in last[:sample_size].detach().cpu().tolist()
+        ],
+    }
+    if os.getenv("QWEN35_AUDIO_EMBED_DUMP_TOKEN_NORMS"):
+        stats["token_norms"] = [
+            float(x) for x in torch.linalg.vector_norm(flat, dim=-1).cpu().tolist()
+        ]
+    return stats
+
+
+def _audio_debug_tensor_values(
+    tensor: torch.Tensor | None,
+    max_items: int = 512,
+) -> Any | None:
+    if not isinstance(tensor, torch.Tensor) or tensor.numel() > max_items:
+        return None
+    return tensor.detach().cpu().tolist()
+
+
+def _audio_debug_layer_filter() -> set[int] | None:
+    value = os.getenv("QWEN35_AUDIO_EMBED_DUMP_LAYERS", "").strip()
+    if not value:
+        return set()
+    if value.lower() == "all":
+        return None
+    selected: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            selected.add(int(item))
+        except ValueError:
+            continue
+    return selected
+
+
+def _audio_debug_layer_selected(selected: set[int] | None, layer_id: int) -> bool:
+    return selected is None or layer_id in selected
 
 
 def _get_feat_extract_output_lengths(
@@ -282,10 +355,51 @@ class Qwen3OmniNextAudioEncoder(nn.Module):
             dtype=torch.int32,
         ).cumsum(-1)
 
-        for encoder_layer in self.layers:
+        dump_path = os.environ.get("QWEN35_AUDIO_EMBED_DUMP")
+        selected_layers = _audio_debug_layer_filter()
+        should_dump_layers = bool(dump_path) and bool(
+            os.environ.get("QWEN35_AUDIO_EMBED_DUMP_LAYERS")
+        )
+        if should_dump_layers and dump_path:
+            _append_audio_debug_record(
+                dump_path,
+                {
+                    "source": "sglang-audio-encoder",
+                    "stage": "audio_layer_input",
+                    "layer_id": 0,
+                    "hidden": _audio_debug_tensor_stats(hidden_states),
+                    "cu_seqlens": _audio_debug_tensor_values(cu_seqlens),
+                },
+            )
+
+        for layer_id, encoder_layer in enumerate(self.layers):
             hidden_states = encoder_layer(hidden_states, cu_seqlens)
+            if (
+                should_dump_layers
+                and dump_path
+                and _audio_debug_layer_selected(selected_layers, layer_id)
+            ):
+                _append_audio_debug_record(
+                    dump_path,
+                    {
+                        "source": "sglang-audio-encoder",
+                        "stage": "audio_layer",
+                        "layer_id": int(layer_id),
+                        "hidden": _audio_debug_tensor_stats(hidden_states),
+                    },
+                )
 
         hidden_states = self.ln_post(hidden_states)
         hidden_states = self.proj1(hidden_states)
         hidden_states = self.act(hidden_states)
-        return self.proj2(hidden_states)
+        hidden_states = self.proj2(hidden_states)
+        if should_dump_layers and dump_path:
+            _append_audio_debug_record(
+                dump_path,
+                {
+                    "source": "sglang-audio-encoder",
+                    "stage": "audio_tower_output",
+                    "hidden": _audio_debug_tensor_stats(hidden_states),
+                },
+            )
+        return hidden_states

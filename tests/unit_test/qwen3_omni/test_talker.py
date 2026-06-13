@@ -126,6 +126,66 @@ def test_qwen_talker_decode_input_preserves_feedback_until_text_arrives() -> Non
     )
 
 
+def test_qwen_talker_qwen35_decode_paces_text_replacement() -> None:
+    """Qwen3.5 mirrors vLLM external-data handoff instead of summing text."""
+    sched_req = _sched_req(
+        pending_feedback_queue=deque(
+            [
+                torch.tensor([1.0, 2.0]),
+                torch.tensor([3.0, 4.0]),
+                torch.tensor([5.0, 6.0]),
+            ]
+        ),
+        pending_text_queue=deque([torch.tensor([20.0, 30.0])]),
+        thinker_chunks_done=False,
+        tts_pad_embed=torch.tensor([7.0, 8.0]),
+        talker_decode_input_mode="qwen35_vllm",
+        talker_text_feedback_stride=4,
+        talker_text_feedback_countdown=1,
+    )
+
+    assert torch.equal(_take_decode_input(sched_req), torch.tensor([1.0, 2.0]))
+    assert sched_req.data.last_talker_decode_input_kind == "feedback"
+    assert sched_req.data.talker_text_feedback_countdown == 0
+    assert len(sched_req.data.pending_feedback_queue) == 2
+    assert len(sched_req.data.pending_text_queue) == 1
+
+    assert torch.equal(_take_decode_input(sched_req), torch.tensor([3.0, 4.0]))
+    assert sched_req.data.last_talker_decode_input_kind == "boundary_feedback"
+    assert sched_req.data.last_talker_decode_should_emit is False
+    assert sched_req.data.talker_text_feedback_countdown == 0
+    assert sched_req.data.talker_text_chunk_remaining == 1
+    assert len(sched_req.data.pending_feedback_queue) == 1
+    assert len(sched_req.data.pending_text_queue) == 1
+    assert torch.equal(
+        sched_req.data.pending_feedback_queue[0],
+        torch.tensor([5.0, 6.0]),
+    )
+
+    assert torch.equal(_take_decode_input(sched_req), torch.tensor([20.0, 30.0]))
+    assert sched_req.data.last_talker_decode_input_kind == "text"
+    assert sched_req.data.last_talker_decode_should_emit is False
+    assert sched_req.data.talker_text_feedback_countdown == 4
+    assert len(sched_req.data.pending_feedback_queue) == 0
+    assert len(sched_req.data.pending_text_queue) == 0
+
+
+def test_qwen_talker_qwen35_decode_waits_when_countdown_exhausted() -> None:
+    sched_req = _sched_req(
+        pending_feedback_queue=deque([torch.tensor([1.0, 2.0])]),
+        pending_text_queue=deque(),
+        thinker_chunks_done=False,
+        tts_pad_embed=torch.tensor([7.0, 8.0]),
+        talker_decode_input_mode="qwen35_vllm",
+        talker_text_feedback_stride=4,
+        talker_text_feedback_countdown=0,
+    )
+
+    assert not QwenTalkerModelRunner._data_has_next_decode_input(sched_req.data)
+    assert _take_decode_input(sched_req) is None
+    assert len(sched_req.data.pending_feedback_queue) == 1
+
+
 def test_qwen_talker_decode_readiness_requires_feedback_and_text_or_pad() -> None:
     """Preserves decode gating across no-text, text-ready, and pad-ready states."""
     no_text = SimpleNamespace(

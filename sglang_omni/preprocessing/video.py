@@ -23,6 +23,36 @@ from .resource_connector import global_thread_pool
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_IMAGE_PATCH_SIZE = 14
+
+
+def _qwen_image_factor() -> int:
+    image_factor = getattr(qwen_vision, "IMAGE_FACTOR", None)
+    if image_factor is not None:
+        return int(image_factor)
+    return _DEFAULT_IMAGE_PATCH_SIZE * int(qwen_vision.SPATIAL_MERGE_SIZE)
+
+
+def _qwen_video_min_pixels() -> int:
+    min_pixels = getattr(qwen_vision, "VIDEO_MIN_PIXELS", None)
+    if min_pixels is not None:
+        return int(min_pixels)
+    return int(qwen_vision.VIDEO_MIN_TOKEN_NUM) * _qwen_image_factor() ** 2
+
+
+def _qwen_video_max_pixels() -> int:
+    max_pixels = getattr(qwen_vision, "VIDEO_MAX_PIXELS", None)
+    if max_pixels is not None:
+        return int(max_pixels)
+    return int(qwen_vision.VIDEO_MAX_TOKEN_NUM) * _qwen_image_factor() ** 2
+
+
+def _qwen_video_total_pixels() -> int:
+    total_pixels = getattr(qwen_vision, "VIDEO_TOTAL_PIXELS", None)
+    if total_pixels is not None:
+        return int(total_pixels)
+    return int(qwen_vision.MODEL_SEQ_LEN * _qwen_image_factor() ** 2 * 0.9)
+
 
 class VideoDecodeError(RuntimeError):
     """Raised when video decoding fails."""
@@ -392,12 +422,12 @@ def load_video_path(
                 f"{fallback_exc}"
             ) from fallback_exc
     nframes, _, height, width = video.shape
-    min_pixels = ele.get("min_pixels", qwen_vision.VIDEO_MIN_PIXELS)
-    total_pixels = ele.get("total_pixels", qwen_vision.VIDEO_TOTAL_PIXELS)
+    min_pixels = ele.get("min_pixels", _qwen_video_min_pixels())
+    total_pixels = ele.get("total_pixels", _qwen_video_total_pixels())
     max_pixels_from_total = total_pixels / nframes * qwen_vision.FRAME_FACTOR
     if not override_max_pixels:
         max_pixels_from_total = min(
-            qwen_vision.VIDEO_MAX_PIXELS,
+            _qwen_video_max_pixels(),
             max_pixels_from_total,
         )
     max_pixels = max(
@@ -415,13 +445,13 @@ def load_video_path(
         resized_height, resized_width = qwen_vision.smart_resize(
             ele["resized_height"],
             ele["resized_width"],
-            factor=qwen_vision.IMAGE_FACTOR,
+            factor=_qwen_image_factor(),
         )
     else:
         resized_height, resized_width = qwen_vision.smart_resize(
             height,
             width,
-            factor=qwen_vision.IMAGE_FACTOR,
+            factor=_qwen_image_factor(),
             min_pixels=min_pixels,
             max_pixels=max_pixels,
         )
@@ -480,7 +510,7 @@ def derive_video_total_pixels_from_mm_len(max_mm_len: int) -> int:
     # 中文说明：Qwen video token 数约等于 3D 像素预算 / IMAGE_FACTOR^2。
     # vLLM Qwen3-VL 的 effective max pixels 使用同一类 unit^2 换算；
     # Omni 的 loader 再按帧数和 FRAME_FACTOR 分摊为逐帧 max_pixels。
-    return int(max_mm_len) * int(qwen_vision.IMAGE_FACTOR) ** 2
+    return int(max_mm_len) * _qwen_image_factor() ** 2
 
 
 def _check_if_video_has_audio(video_path: str | Path) -> bool:

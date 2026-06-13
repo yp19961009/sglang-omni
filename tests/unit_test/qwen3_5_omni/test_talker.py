@@ -125,6 +125,30 @@ def _install_fakes(monkeypatch):
     monkeypatch.setattr(talker, "_LinearProjection", _FakeProjection)
 
 
+def _decode_sched_req(**data_overrides):
+    sampling_params = SimpleNamespace(
+        temperature=0.0,
+        top_k=0,
+        top_p=1.0,
+        min_p=0.0,
+        sampling_seed=None,
+        repetition_penalty=1.0,
+    )
+    data = SimpleNamespace(
+        req=SimpleNamespace(
+            sampling_params=sampling_params,
+            output_ids=[],
+            _codec_suppress_tokens=None,
+        ),
+        suppress_tokens=None,
+        pending_text_queue=[],
+        thinker_chunks_done=False,
+    )
+    for key, value in data_overrides.items():
+        setattr(data, key, value)
+    return SimpleNamespace(data=data)
+
+
 def test_qwen35_talker_exposes_runtime_contract(monkeypatch):
     _install_fakes(monkeypatch)
     model = talker.Qwen3OmniNextTalkerModel(_config())
@@ -315,11 +339,34 @@ def test_qwen35_talker_forward_projected_prefill(monkeypatch):
     assert model.model.last_inputs_embeds is input_embeds
 
 
+def test_qwen35_talker_decode_uses_feedback_buffer(monkeypatch):
+    _install_fakes(monkeypatch)
+    model = talker.Qwen3OmniNextTalkerModel(_config())
+    feedback = torch.full((4,), 7.0, dtype=model._feedback_buffer.dtype)
+    model._feedback_buffer[0].copy_(feedback)
+    model._feedback_mask[0] = True
+    forward_batch = SimpleNamespace(
+        mrope_positions=None,
+        forward_mode=_ForwardMode(decode=True),
+        positions=torch.tensor([0]),
+    )
+
+    model(
+        input_ids=torch.tensor([1]),
+        positions=torch.tensor([0]),
+        forward_batch=forward_batch,
+    )
+
+    assert torch.equal(model.model.last_inputs_embeds[0], feedback)
+    assert not bool(model._feedback_mask[0].item())
+
+
 def test_qwen35_talker_code_predictor_fills_runtime_buffers(monkeypatch):
     _install_fakes(monkeypatch)
     model = talker.Qwen3OmniNextTalkerModel(_config())
     for head in model.code_predictor.lm_head:
         nn.init.zeros_(head.linear.weight)
+    model._subtalker_temperature.zero_()
     layer0_codes = torch.tensor([[4]])
     hidden = torch.ones(1, 1, 4)
 
@@ -463,7 +510,7 @@ def test_qwen35_talker_embeds_clone_codec_codes_layout(monkeypatch):
     assert embeds.tolist() == [[36.0] * 4, [39.0] * 4]
 
 
-def test_qwen35_talker_passes_request_sampling_to_subtalker(monkeypatch):
+def test_qwen35_talker_uses_subtalker_defaults_without_subtalker_params(monkeypatch):
     _install_fakes(monkeypatch)
     model = talker.Qwen3OmniNextTalkerModel(_config())
     captured = {}
@@ -493,10 +540,19 @@ def test_qwen35_talker_passes_request_sampling_to_subtalker(monkeypatch):
         requests=requests,
     )
 
-    assert torch.allclose(captured["temperature"].cpu(), torch.tensor([0.7]))
-    assert captured["top_k"].tolist() == [3]
-    assert torch.allclose(captured["top_p"].cpu(), torch.tensor([0.8]))
-    assert torch.allclose(captured["min_p"].cpu(), torch.tensor([0.0]))
+    assert torch.allclose(
+        captured["temperature"].cpu(),
+        torch.tensor([model._subtalker_default_temperature]),
+    )
+    assert captured["top_k"].tolist() == [model._subtalker_default_top_k]
+    assert torch.allclose(
+        captured["top_p"].cpu(),
+        torch.tensor([model._subtalker_default_top_p]),
+    )
+    assert torch.allclose(
+        captured["min_p"].cpu(),
+        torch.tensor([model._subtalker_default_min_p]),
+    )
 
 
 def test_qwen35_talker_prefers_subtalker_sampling_params(monkeypatch):
@@ -539,6 +595,44 @@ def test_qwen35_talker_prefers_subtalker_sampling_params(monkeypatch):
     assert torch.allclose(captured["top_p"].cpu(), torch.tensor([0.95]))
     assert torch.allclose(captured["min_p"].cpu(), torch.tensor([0.03]))
     assert captured["seed"].tolist() == [456]
+
+
+def test_qwen35_talker_decode_suppresses_codec_eos_while_text_pending(monkeypatch):
+    _install_fakes(monkeypatch)
+    model = talker.Qwen3OmniNextTalkerModel(_config())
+    requests = [
+        _decode_sched_req(
+            pending_text_queue=[torch.ones(4)],
+            thinker_chunks_done=False,
+        )
+    ]
+    logits = torch.zeros(1, 8)
+    logits[0, 5] = 10.0
+    logits[0, 4] = 8.0
+
+    model.prepare_decode_buffers(requests)
+    sampled = model._sample_decode_tokens(logits)
+
+    assert sampled.tolist() == [4]
+
+
+def test_qwen35_talker_decode_allows_codec_eos_after_text_done(monkeypatch):
+    _install_fakes(monkeypatch)
+    model = talker.Qwen3OmniNextTalkerModel(_config())
+    requests = [
+        _decode_sched_req(
+            pending_text_queue=[],
+            thinker_chunks_done=True,
+        )
+    ]
+    logits = torch.zeros(1, 8)
+    logits[0, 5] = 10.0
+    logits[0, 4] = 8.0
+
+    model.prepare_decode_buffers(requests)
+    sampled = model._sample_decode_tokens(logits)
+
+    assert sampled.tolist() == [5]
 
 
 def test_qwen35_talker_decode_uses_sglang_sampler_metadata(monkeypatch):

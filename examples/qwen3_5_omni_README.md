@@ -270,6 +270,48 @@ python -m sglang_omni.cli serve \
   --host 0.0.0.0 \
 ```
 
+### 离线推理与精度对齐脚本
+
+`scripts/qwen35_omni_alignment.py` 可以用同一段音频顺序跑 vLLM baseline
+和 SGLang-Omni speech server，保存两侧文本、WAV、ASR transcript 和
+`alignment_report.md`。例如宿主机 `/home/gangouyu` bind 到容器 `/myapp`
+时，可以直接用 vLLM 镜像和已有 SGLang 容器编排：
+
+```bash
+VLLM_IMAGE="tongyi-duanwu-registry-vpc.cn-beijing.cr.aliyuncs.com/dashscope/"
+VLLM_IMAGE="${VLLM_IMAGE}dashllm:cuda129_cp312_test_vl_13589"
+
+python3 scripts/qwen35_omni_alignment.py \
+  --backend compare \
+  --model-path "$MODEL_DIR" \
+  --prompt '请用两到三句话详细描述这段音频的内容。' \
+  --vllm-root '' \
+  --vllm-docker-image "$VLLM_IMAGE" \
+  --vllm-docker-mount /home/gangouyu:/myapp \
+  --disable-vllm-mtp \
+  --launch-sglang \
+  --sglang-python python \
+  --sglang-container b5f665f3d883 \
+  --sglang-port 8101 \
+  --asr-container b5f665f3d883 \
+  --asr-model base \
+  --asr-language zh \
+  --voice-type tina \
+  --max-tokens 256 \
+  --no-code2wav-torch-compile \
+  --output-dir results/qwen35_omni_alignment
+```
+
+如果 SGLang 服务已经启动，可以不传 `--launch-sglang`，改用
+`--sglang-base-url http://127.0.0.1:8101`。默认测试音频来自 vLLM
+Qwen3.5-Omni 单测里的公开样本；也可以用 `--audio-path /path/to/input.wav`
+替换成本地音频。ASR 默认走 `openai-whisper`，已有内部 ASR 命令时可传
+`--asr-command 'your_asr --audio {audio}'`。如果 vLLM 不跑 Docker，也可以
+用 `--vllm-python /path/to/vllm-env/bin/python` 指向对应 Python 环境。
+当前 vLLM 镜像里建议用 `--vllm-root ''` 走镜像内置的已编译 vLLM 包；
+`--disable-vllm-mtp` 用于对齐当前 SGLang-Omni 已实现的 base thinker AR
+主链路，后续接入 SGLang speculative/MTP 后再打开 MTP 做性能路径对齐。
+
 vLLM server/offline demo 脚本里的 `host`、`port` / `serve_port`、
 `text_only` 和 `omni_video_fps` 会分别映射到通用 `serve` 的
 `--host`、`--port`、`--text-only` 和 `--video-fps`。

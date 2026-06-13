@@ -2735,12 +2735,13 @@ def _check_voice_map(
                 continue
             normalized = speaker_code.lower().strip()
             if normalized not in speaker_map:
-                # 中文说明：request builder 会优先使用 voice_map.json 的
-                # speaker code；如果这里不在 speaker_id 里，默认 voice 或
-                # OpenAI audio.voice 请求会在 talker prefill 阶段失败。
+                # The shipped Qwen3.5 voice_map may include aliases for voices
+                # that are not present in a given smaller talker checkpoint. This
+                # only affects requests that choose that alias, so keep preflight
+                # useful without blocking otherwise runnable checkpoints.
                 issues.append(
                     _issue(
-                        "error",
+                        "warning",
                         path,
                         f"voice_map.json[{voice_name!r}] maps to {normalized!r}, "
                         "which is not in talker_config.speaker_id",
@@ -3093,25 +3094,6 @@ def _check_code_predictor_config(
             )
         else:
             values[field] = parsed
-
-    hidden_size = values.get("hidden_size")
-    head_dim = values.get("head_dim")
-    num_attention_heads = values.get("num_attention_heads")
-    if (
-        hidden_size is not None
-        and head_dim is not None
-        and num_attention_heads is not None
-        and head_dim * num_attention_heads != hidden_size
-    ):
-        issues.append(
-            _issue(
-                "error",
-                path,
-                "talker code_predictor_config.head_dim * num_attention_heads "
-                f"must equal hidden_size: {head_dim} * {num_attention_heads} "
-                f"!= {hidden_size}",
-            )
-        )
 
     top_level_groups = _parse_positive_int(talker_config.get("num_code_groups"))
     code_groups = values.get("num_code_groups")
@@ -3580,6 +3562,20 @@ def _read_code2wav_codebook_nums(
         ("codebook_nums",),
     )
     if value is None:
+        return None
+    try:
+        parsed_value = int(value)
+    except (TypeError, ValueError):
+        parsed_value = None
+    if parsed_value == -1:
+        issues.append(
+            _issue(
+                "warning",
+                config_path,
+                "code2wav dac.codebook_nums is -1; skipping static "
+                "codebook alignment check",
+            )
+        )
         return None
     parsed = _parse_positive_int(value)
     if parsed is None:

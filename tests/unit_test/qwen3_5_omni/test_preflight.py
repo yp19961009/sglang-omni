@@ -1202,7 +1202,7 @@ def test_qwen35_preflight_accepts_voice_map_matching_speaker_id(tmp_path):
     assert report.ok
 
 
-def test_qwen35_preflight_rejects_voice_map_unknown_speaker(tmp_path):
+def test_qwen35_preflight_warns_voice_map_unknown_speaker(tmp_path):
     model_root = tmp_path / "qwen35"
     _write_json(model_root / "config.json", _root_config())
     _write_json(model_root / "voice_map.json", {"Cherry": "missing"})
@@ -1212,9 +1212,10 @@ def test_qwen35_preflight_rejects_voice_map_unknown_speaker(tmp_path):
 
     report = run_qwen35_preflight(str(model_root))
 
-    assert not report.ok
+    assert report.ok
     assert any(
-        "voice_map.json['Cherry'] maps to 'missing'" in issue.message
+        issue.severity == "warning"
+        and "voice_map.json['Cherry'] maps to 'missing'" in issue.message
         for issue in report.issues
     )
 
@@ -1912,7 +1913,10 @@ def test_qwen35_preflight_rejects_invalid_code_predictor_shape(tmp_path):
         in issue.message
         for issue in report.issues
     )
-    assert any("head_dim * num_attention_heads" in issue.message for issue in report.issues)
+    assert not any(
+        "head_dim * num_attention_heads" in issue.message
+        for issue in report.issues
+    )
     assert any("code_predictor_config.hidden_act" in issue.message for issue in report.issues)
 
 
@@ -2033,6 +2037,23 @@ def test_qwen35_preflight_rejects_code2wav_codebook_mismatch(tmp_path):
     assert not report.ok
     assert any(
         "code2wav dac.codebook_nums does not match" in issue.message
+        for issue in report.issues
+    )
+
+
+def test_qwen35_preflight_allows_code2wav_codebook_sentinel(tmp_path):
+    model_root = tmp_path / "qwen35"
+    _write_json(model_root / "config.json", _root_config())
+    _touch_hf_weights(model_root)
+    _touch_processor_assets(model_root)
+    _touch_code2wav(model_root / "code2wav", codebook_nums=-1)
+
+    report = run_qwen35_preflight(str(model_root))
+
+    assert report.ok
+    assert any(
+        issue.severity == "warning"
+        and "code2wav dac.codebook_nums is -1" in issue.message
         for issue in report.issues
     )
 

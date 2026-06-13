@@ -199,7 +199,9 @@ def _sample_logits(
 
     probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
     if seed is None:
-        sampled = torch.multinomial(probs, num_samples=1).squeeze(1)
+        noise = torch.empty_like(probs)
+        noise.exponential_()
+        sampled = probs.div_(noise).argmax(dim=-1)
     else:
         seed = seed.to(device=logits.device, dtype=torch.long).reshape(-1)
         sampled = torch.empty(logits.shape[0], dtype=torch.long, device=logits.device)
@@ -207,19 +209,14 @@ def _sample_logits(
             if bool(greedy[row_idx]):
                 sampled[row_idx] = greedy_ids[row_idx]
                 continue
-            if int(seed[row_idx].item()) < 0:
-                sampled[row_idx] = torch.multinomial(
-                    probs[row_idx],
-                    num_samples=1,
-                )[0]
-                continue
-            generator = torch.Generator(device=logits.device)
-            generator.manual_seed(int(seed[row_idx].item()))
-            sampled[row_idx] = torch.multinomial(
-                probs[row_idx],
-                num_samples=1,
-                generator=generator,
-            )[0]
+            noise = torch.empty_like(probs[row_idx])
+            if int(seed[row_idx].item()) >= 0:
+                generator = torch.Generator(device=logits.device)
+                generator.manual_seed(int(seed[row_idx].item()))
+                noise.exponential_(generator=generator)
+            else:
+                noise.exponential_()
+            sampled[row_idx] = probs[row_idx].div(noise).argmax(dim=-1)
     return torch.where(greedy, greedy_ids, sampled)
 
 
@@ -271,27 +268,56 @@ def _probe_next_predictor() -> tuple[bool, str | None]:
 class _RMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        # Qwen3OmniNext RMSNorm stores a zero-centered scale and applies
+        # normalized * (1 + weight), unlike Llama-style RMSNorm.
+        self.weight = nn.Parameter(torch.zeros(hidden_size))
+        self.eps = eps
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.float()
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(
-            variance + self.variance_epsilon
-        )
-        return self.weight * hidden_states.to(input_dtype)
+        output = hidden_states.float()
+        variance = output.pow(2).mean(-1, keepdim=True)
+        output = output * torch.rsqrt(variance + self.eps)
+        output = output * (1.0 + self.weight.float())
+        return output.to(input_dtype)
 
 
 class _RotaryEmbedding(nn.Module):
-    def __init__(self, head_dim: int, rope_theta: float) -> None:
+    def __init__(
+        self,
+        rotary_dim: int,
+        rope_theta: float,
+        *,
+        interleaved: bool = False,
+        mrope_section: tuple[int, int, int] | None = None,
+    ) -> None:
         super().__init__()
         inv_freq = 1.0 / (
             rope_theta
-            ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+            ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.interleaved = bool(interleaved)
+        self.mrope_section = mrope_section or (24, 20, 20)
+
+    @staticmethod
+    def _apply_interleaved_mrope(
+        freqs: torch.Tensor,
+        mrope_section: tuple[int, int, int],
+    ) -> torch.Tensor:
+        # Match HF Qwen3OmniNextRotaryEmbedding.apply_interleaved_mrope:
+        # mrope_interleaved rearranges T/H/W frequency bands before the normal
+        # RoPE layout is duplicated as [freqs, freqs]. It is not the
+        # even/odd pairwise RoPE layout used by some GLM-style implementations.
+        freqs_t = freqs[0].clone()
+        rotary_half = freqs_t.shape[-1]
+        for dim, offset in enumerate((1, 2), start=1):
+            length = min(int(mrope_section[dim]) * 3, rotary_half)
+            if offset < length:
+                idx = slice(offset, length, 3)
+                freqs_t[..., idx] = freqs[dim, ..., idx]
+        return freqs_t
 
     def forward(
         self,
@@ -301,7 +327,24 @@ class _RotaryEmbedding(nn.Module):
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inv_freq = self.inv_freq.to(device=device)
-        freqs = torch.einsum("bt,d->btd", position_ids.float(), inv_freq)
+        position_ids = position_ids.to(device=device)
+        if position_ids.ndim == 2:
+            if self.interleaved:
+                position_ids = position_ids[None, ...].expand(
+                    3,
+                    position_ids.shape[0],
+                    -1,
+                )
+            else:
+                position_ids = position_ids[None, ...]
+        if position_ids.ndim == 3:
+            freqs = torch.einsum("zbt,d->zbtd", position_ids.float(), inv_freq)
+            if self.interleaved:
+                freqs = self._apply_interleaved_mrope(freqs, self.mrope_section)
+            else:
+                freqs = freqs[0]
+        else:
+            freqs = torch.einsum("bt,d->btd", position_ids.float(), inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
 
@@ -309,6 +352,12 @@ class _RotaryEmbedding(nn.Module):
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     half = x.shape[-1] // 2
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+def _rotate_interleaved(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
 
 
 def _resolve_rotary_dim(config: Any, head_dim: int) -> int:
@@ -340,7 +389,10 @@ def _apply_rotary(
     cos: torch.Tensor,
     sin: torch.Tensor,
     rotary_dim: int,
+    *,
+    interleaved: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    del interleaved
     q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
     k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
     cos = cos.unsqueeze(1)
@@ -354,8 +406,6 @@ def _apply_rotary(
 
 
 class _NextSelfAttention(nn.Module):
-    """Qwen3Next-style attention with output gating and QK norm."""
-
     def __init__(self, config: Any) -> None:
         super().__init__()
         self.hidden_size = _get_int(config, "hidden_size", 0)
@@ -365,6 +415,8 @@ class _NextSelfAttention(nn.Module):
             "num_key_value_heads",
             self.num_heads,
         )
+        if self.hidden_size % self.num_heads != 0:
+            raise ValueError("subtalker hidden_size must divide num_attention_heads")
         if self.num_heads % self.num_kv_heads != 0:
             raise ValueError("subtalker num_attention_heads must divide kv heads")
         self.head_dim = _get_int(
@@ -373,30 +425,54 @@ class _NextSelfAttention(nn.Module):
             self.hidden_size // self.num_heads,
         )
         self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
         self.rotary_dim = _resolve_rotary_dim(config, self.head_dim)
+        rope_parameters = _get_plain_dict(getattr(config, "rope_parameters", None))
+        rope_scaling = _get_plain_dict(getattr(config, "rope_scaling", None))
+        self.mrope_interleaved = bool(
+            rope_parameters.get(
+                "mrope_interleaved",
+                rope_scaling.get("mrope_interleaved", False),
+            )
+        )
         self.num_kv_groups = self.num_heads // self.num_kv_heads
+        attn_output_gate = getattr(config, "attn_output_gate", True)
+        self.attn_output_gate = True if attn_output_gate is None else bool(
+            attn_output_gate
+        )
         bias = bool(getattr(config, "attention_bias", False))
-        # q_proj outputs query + gate (hence *2)
-        self.q_proj = nn.Linear(self.hidden_size, self.q_size * 2, bias=bias)
-        self.k_proj = nn.Linear(self.hidden_size, self.kv_size, bias=bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.kv_size, bias=bias)
+        kv_size = self.num_kv_heads * self.head_dim
+        q_out_size = self.q_size * (2 if self.attn_output_gate else 1)
+        self.q_proj = nn.Linear(self.hidden_size, q_out_size, bias=bias)
+        self.k_proj = nn.Linear(self.hidden_size, kv_size, bias=bias)
+        self.v_proj = nn.Linear(self.hidden_size, kv_size, bias=bias)
         self.o_proj = nn.Linear(self.q_size, self.hidden_size, bias=bias)
         eps = _get_float(config, "rms_norm_eps", 1e-6)
         self.q_norm = _RMSNorm(self.head_dim, eps)
         self.k_norm = _RMSNorm(self.head_dim, eps)
+        mrope_section = rope_parameters.get(
+            "mrope_section",
+            rope_scaling.get("mrope_section"),
+        )
+        if mrope_section is None:
+            mrope_section = (24, 20, 20)
         self.rotary_emb = _RotaryEmbedding(
             self.rotary_dim,
             _get_float(config, "rope_theta", 10000.0),
+            interleaved=self.mrope_interleaved,
+            mrope_section=tuple(mrope_section),
         )
 
     def _shape(
         self,
         tensor: torch.Tensor,
         num_heads: int,
+        norm: _RMSNorm | None = None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = tensor.shape
-        return tensor.view(bsz, seq_len, num_heads, self.head_dim).transpose(1, 2)
+        tensor = tensor.view(bsz, seq_len, num_heads, self.head_dim)
+        if norm is not None:
+            tensor = norm(tensor)
+        return tensor.transpose(1, 2)
 
     def forward(
         self,
@@ -408,17 +484,24 @@ class _NextSelfAttention(nn.Module):
         use_cache: bool = False,
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
-
-        # q_proj outputs [query, gate] interleaved per head
-        qg = self.q_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim * 2)
-        query_states, gate = qg.chunk(2, dim=-1)
-        gate = gate.reshape(bsz, seq_len, self.q_size)
-
-        # QK normalization
-        query_states = self.q_norm(query_states).transpose(1, 2)
-        key_states = self.k_norm(
-            self.k_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
-        ).transpose(1, 2)
+        q_proj = self.q_proj(hidden_states)
+        gate = None
+        if self.attn_output_gate:
+            q_gate = q_proj.view(bsz, seq_len, self.num_heads, self.head_dim * 2)
+            query_states, gate = torch.chunk(q_gate, 2, dim=-1)
+            query_states = self.q_norm(query_states).transpose(1, 2)
+            gate = gate.reshape(bsz, seq_len, self.q_size)
+        else:
+            query_states = self._shape(
+                q_proj,
+                self.num_heads,
+                self.q_norm,
+            )
+        key_states = self._shape(
+            self.k_proj(hidden_states),
+            self.num_kv_heads,
+            self.k_norm,
+        )
         value_states = self._shape(self.v_proj(hidden_states), self.num_kv_heads)
 
         cos, sin = self.rotary_emb(
@@ -432,10 +515,14 @@ class _NextSelfAttention(nn.Module):
             cos,
             sin,
             self.rotary_dim,
+            interleaved=self.mrope_interleaved,
         )
         if use_cache and past_key_values is not None:
             if layer_idx is None:
                 raise ValueError("subtalker KV cache requires layer_idx")
+            # 中文说明：vLLM perf_v2 的 subtalker 会先缓存
+            # [talker_hidden, layer0_embed]，后续 residual 组只喂 1 token。
+            # 本地 decoder 同步这个增量路径，避免每个 codec group 重算前缀。
             key_states, value_states = past_key_values.update(
                 key_states,
                 value_states,
@@ -469,8 +556,8 @@ class _NextSelfAttention(nn.Module):
         attn_output = torch.matmul(attn_probs, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, seq_len, self.q_size)
-        # Output gating
-        attn_output = attn_output * torch.sigmoid(gate)
+        if gate is not None:
+            attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output)
 
 

@@ -516,9 +516,21 @@ def _chat_talker_extra_params(
     req: ChatCompletionRequest,
     default_talker_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    params = _talker_extra_params(req)
+    audio_config = _chat_audio_config(req)
+    if isinstance(audio_config, dict) and not any(
+        params.get(key) is not None for key in ("voice_type", "voice", "speaker")
+    ):
+        for key in ("voice_type", "voice", "speaker"):
+            value = audio_config.get(key)
+            if value is not None:
+                # 中文说明：audio.voice 是请求级 OpenAI 字段，应覆盖服务启动
+                # 默认 voice_type；显式 parameters.voice_type 仍保持优先。
+                params["voice_type"] = value
+                break
     return _merge_default_talker_params(
         default_talker_params,
-        _talker_extra_params(req),
+        params,
     )
 
 
@@ -1541,7 +1553,9 @@ def build_speech_generate_request(
     # 中文说明：metadata 保留给 HTTP/TTS 响应层；Qwen3.5 talker/code2wav
     # request builder 从 OmniRequest.params 读取 voice、clone、subtalker
     # 采样等控制项，所以这里必须通过 extra_params 进入 client._build_params。
-    extra_params = _speech_talker_extra_params(req, default_talker_params)
+    extra_params.update(
+        _speech_talker_extra_params(req, default_talker_params)
+    )
 
     return GenerateRequest(
         model=_normalize_openai_model_name(req.model or default_model),

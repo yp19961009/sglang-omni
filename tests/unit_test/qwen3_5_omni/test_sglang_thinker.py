@@ -350,3 +350,44 @@ def test_qwen35_hidden_capture_records_layer_output_after_deepstack():
 
     assert hidden.tolist() == [[15.0]]
     assert [tensor.tolist() for tensor in aux] == [[[3.0]], [[15.0]]]
+
+
+def test_qwen35_hidden_capture_delegates_native_capture_without_deepstack():
+    class FakeForwardMode:
+        def is_idle(self):
+            return False
+
+    class NativeCaptureTextModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers_to_capture = [0, 1]
+            self.layers = nn.ModuleList(
+                [
+                    nn.Module(),
+                ]
+            )
+            self.native_called = False
+
+        def forward(self, input_ids, positions, forward_batch, inputs_embeds=None):
+            del input_ids, positions, forward_batch
+            layers_to_capture = self.layers_to_capture
+            aux_hidden_states = [inputs_embeds + layer for layer in layers_to_capture]
+            self.native_called = True
+            return inputs_embeds + 10, aux_hidden_states
+
+        def embed_tokens(self, input_ids):
+            return input_ids.to(dtype=torch.float32).unsqueeze(-1)
+
+    text_model = NativeCaptureTextModel()
+    sglang_thinker._install_layers_to_capture_support(text_model)
+
+    hidden, aux = text_model(
+        torch.tensor([3]),
+        torch.tensor([0]),
+        SimpleNamespace(forward_mode=FakeForwardMode()),
+        inputs_embeds=torch.tensor([[2.0]]),
+    )
+
+    assert text_model.native_called
+    assert hidden.tolist() == [[12.0]]
+    assert [tensor.tolist() for tensor in aux] == [[[2.0]], [[3.0]]]

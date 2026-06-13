@@ -13,6 +13,7 @@ import importlib
 import inspect
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,9 +33,9 @@ logger = logging.getLogger(__name__)
 
 QWEN35_CODEC_EOS_TOKEN_ID = 2150
 QWEN35_CODE2WAV_SAMPLE_RATE = 24000
-# 中文说明：对齐 vLLM dev/qwenc_perf_v2 H20 profile 的 send_chunk_size=8。
+# 中文说明：对齐 vLLM Qwen3.5 50Hz code2wav 的 4-codec 增量输出切块；
 # 用户仍可通过 --code2wav-stream-chunk-size 或 YAML factory_args 覆盖。
-QWEN35_CODE2WAV_STREAM_CHUNK_SIZE = 8
+QWEN35_CODE2WAV_STREAM_CHUNK_SIZE = 4
 QWEN35_CODE2WAV_DYNAMIC_CHUNK_SIZES = (2, 4, 6, 8)
 QWEN35_CODE2WAV_DYNAMIC_CHUNK_STEPS = (8, 4, 2, 1)
 QWEN35_CODE2WAV_ODEINT_METHODS = frozenset({"euler", "rk4"})
@@ -630,6 +631,7 @@ class Qwen35Code2WavScheduler(Code2WavScheduler):
         super().__init__(*args, sample_rate=sample_rate, **kwargs)
         self._qwen35_skip_code2wav: dict[str, bool] = {}
         self._qwen35_dynamic_chunk_index: dict[str, int] = {}
+        self._qwen35_padding_interval = self._compute_padding_interval()
         self._qwen35_code2wav_voice_types = _normalize_code2wav_voice_types(
             code2wav_voice_types
         )
@@ -651,6 +653,94 @@ class Qwen35Code2WavScheduler(Code2WavScheduler):
             chunk_sizes,
             chunk_steps,
         )
+
+    def _compute_padding_interval(self) -> int:
+        max_chunk_size = self._left_context_size + self._stream_chunk_size
+        return (max_chunk_size // 8 + 1) * 8
+
+    def _decode_incremental(
+        self,
+        request_id: str,
+        code_chunks: list[torch.Tensor],
+        start: int,
+        end: int,
+    ) -> "np.ndarray":
+        # Qwen3.5's Next DAC path follows vLLM's omni3_5_code2wav_engine:
+        # stack codec rows as [B, T, K], pad T to the decoder alignment, then
+        # slice only the newly valid chunk from the decoded waveform.
+        import numpy as np
+
+        if start >= end:
+            return np.zeros((0,), dtype=np.float32)
+
+        context = min(self._left_context_size, start)
+        window = torch.stack(code_chunks[start - context : end], dim=0).to(
+            device=self._device,
+            dtype=torch.long,
+        )
+        valid_chunk = end - start
+        code_len = int(window.shape[0])
+        code_groups = int(window.shape[1])
+        padding_to = max(code_len, self._qwen35_padding_interval)
+        if padding_to % self._qwen35_padding_interval != 0:
+            padding_to += self._qwen35_padding_interval - (
+                padding_to % self._qwen35_padding_interval
+            )
+
+        batched_codec = torch.zeros(
+            (1, padding_to, code_groups),
+            dtype=window.dtype,
+            device=self._device,
+        )
+        batched_codec[0, :code_len, :] = window
+
+        with torch.no_grad():
+            if self._device.type == "cuda":
+                torch.cuda.set_device(self._device)
+            decode = getattr(self._model, "decode", None)
+            if callable(decode):
+                wav = decode(batched_codec).to(torch.float32)
+            else:
+                wav = self._model(batched_codec.transpose(1, 2)).to(torch.float32)
+
+        audio_start = (code_len - valid_chunk) * self._total_upsample
+        audio_end = code_len * self._total_upsample
+        audio = wav.reshape(wav.shape[0], -1)[0, audio_start:audio_end]
+        audio_np = audio.detach().cpu().float().numpy().copy()
+        _maybe_dump_code2wav_audio(
+            request_id,
+            {
+                "start": int(start),
+                "end": int(end),
+                "context": int(context),
+                "code_len": int(code_len),
+                "valid_chunk": int(valid_chunk),
+                "padding_to": int(padding_to),
+                "groups": int(code_groups),
+                "samples": int(audio_np.shape[0]),
+                "min": float(audio_np.min()) if audio_np.size else None,
+                "max": float(audio_np.max()) if audio_np.size else None,
+                "mean": float(audio_np.mean()) if audio_np.size else None,
+                "rms": (
+                    float((audio_np.astype("float64") ** 2).mean() ** 0.5)
+                    if audio_np.size
+                    else None
+                ),
+                "first": audio_np[:8].tolist(),
+            },
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Qwen3.5 Code2Wav decode req=%s code_len=%s valid=%s "
+                "padding_to=%s groups=%s samples=%s",
+                request_id,
+                code_len,
+                valid_chunk,
+                padding_to,
+                code_groups,
+                int(audio_np.shape[0]),
+            )
+        return audio_np
 
     def on_streaming_new_request(self, request_id: str, payload: StagePayload) -> None:
         super().on_streaming_new_request(request_id, payload)
@@ -696,6 +786,7 @@ class Qwen35Code2WavScheduler(Code2WavScheduler):
     ) -> list[OutgoingMessage]:
         if self._qwen35_skip_code2wav.get(request_id, False):
             return []
+        _maybe_dump_code2wav_chunk(request_id, chunk)
         if not self._qwen35_enable_dynamic_chunk:
             return super().on_stream_chunk(request_id, chunk)
 
@@ -724,6 +815,40 @@ class Qwen35Code2WavScheduler(Code2WavScheduler):
                 sample_rate=self._sample_rate,
             )
         return super().on_stream_done(request_id)
+
+
+def _maybe_dump_code2wav_chunk(request_id: str, chunk: StreamItem) -> None:
+    path = os.environ.get("QWEN35_DEBUG_CODE2WAV_CODES")
+    if not path:
+        return
+    data = chunk.data.detach().cpu().long().reshape(-1)
+    values = data.tolist()
+    payload = {
+        "request_id": request_id,
+        "shape": list(chunk.data.shape),
+        "min": min(values) if values else None,
+        "max": max(values) if values else None,
+        "first": values[:32],
+        "num_ge_2048": sum(1 for value in values if value >= 2048),
+        "num_negative": sum(1 for value in values if value < 0),
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.exception("failed to dump Qwen3.5 code2wav debug chunk")
+
+
+def _maybe_dump_code2wav_audio(request_id: str, payload: dict[str, Any]) -> None:
+    path = os.environ.get("QWEN35_DEBUG_CODE2WAV_AUDIO")
+    if not path:
+        return
+    record = {"request_id": request_id, **payload}
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.exception("failed to dump Qwen3.5 code2wav audio debug")
 
 
 def _call_enable_torch_compile(model: Any, *, compile_first_chunk: bool) -> None:

@@ -1212,16 +1212,18 @@ def test_qwen35_tts_generate_mode_env_instructions_keeps_instructions(monkeypatc
 
 def test_qwen35_assistant_part_uses_language_codec_tokens():
     model = _FakeTalkerModel()
-    assistant_embed = torch.zeros(5, 4)
-    tts_special = torch.zeros(1, 4)
+    assistant_embed = torch.arange(5, dtype=torch.float32).view(-1, 1).expand(-1, 4)
+    tts_bos = torch.full((1, 4), 10.0)
+    tts_eos = torch.full((1, 4), 11.0)
+    tts_pad = torch.full((1, 4), 12.0)
 
     no_lang = request_builders._build_qwen35_assistant_part(
         assistant_embed=assistant_embed,
         text_projection=nn.Identity(),
         codec_embed_fn=model.get_input_embeddings(),
-        tts_bos_embed=tts_special,
-        tts_eos_embed=tts_special,
-        tts_pad_embed=tts_special,
+        tts_bos_embed=tts_bos,
+        tts_eos_embed=tts_eos,
+        tts_pad_embed=tts_pad,
         speaker_id=9,
         codec_nothink_id=41,
         codec_think_id=46,
@@ -1235,9 +1237,9 @@ def test_qwen35_assistant_part_uses_language_codec_tokens():
         assistant_embed=assistant_embed,
         text_projection=nn.Identity(),
         codec_embed_fn=model.get_input_embeddings(),
-        tts_bos_embed=tts_special,
-        tts_eos_embed=tts_special,
-        tts_pad_embed=tts_special,
+        tts_bos_embed=tts_bos,
+        tts_eos_embed=tts_eos,
+        tts_pad_embed=tts_pad,
         speaker_id=9,
         codec_nothink_id=41,
         codec_think_id=46,
@@ -1249,21 +1251,31 @@ def test_qwen35_assistant_part_uses_language_codec_tokens():
         language_id=77,
     )
 
-    assert no_lang["input_embeds"][3:9, 0].tolist() == [
+    assert no_lang["input_embeds"][:, 0].tolist() == [
+        0.0,
+        1.0,
+        2.0,
         41.0,
         42.0,
         43.0,
-        9.0,
-        44.0,
+        10.0,
         40.0,
+        3.0,
+        4.0,
     ]
-    assert with_lang["input_embeds"][3:9, 0].tolist() == [
+    assert no_lang["future_text_rows"][:, 0].tolist() == [11.0]
+    assert with_lang["input_embeds"][:, 0].tolist() == [
+        0.0,
+        1.0,
+        2.0,
         46.0,
         42.0,
         77.0,
         43.0,
-        44.0,
+        10.0,
         40.0,
+        3.0,
+        4.0,
     ]
 
 
@@ -1291,19 +1303,18 @@ def test_qwen35_assistant_part_inserts_instruction_text_rows():
         tts_pad_token_id=12,
     )
 
-    assert result["input_embeds"].shape == (11, 4)
+    assert result["input_embeds"].shape == (12, 4)
     assert result["input_embeds"][3:5, 0].tolist() == [70.0, 71.0]
-    assert result["input_embeds"][5:11, 0].tolist() == [
+    assert result["input_embeds"][5:10, 0].tolist() == [
         41.0,
         42.0,
         43.0,
-        9.0,
-        44.0,
+        0.0,
         40.0,
     ]
 
 
-def test_qwen35_assistant_part_omits_speaker_codec_row():
+def test_qwen35_assistant_part_omits_speaker_and_codec_pad_rows():
     model = _FakeTalkerModel()
     assistant_embed = torch.zeros(5, 4)
     tts_special = torch.zeros(1, 4)
@@ -1327,14 +1338,42 @@ def test_qwen35_assistant_part_omits_speaker_codec_row():
         tts_pad_token_id=12,
     )
 
-    assert result["input_embeds"].shape == (11, 4)
-    assert result["input_embeds"][6:11, 0].tolist() == [
+    assert result["input_embeds"].shape == (12, 4)
+    assert result["input_embeds"][5:10, 0].tolist() == [
         41.0,
         42.0,
         43.0,
-        44.0,
+        0.0,
         40.0,
     ]
+
+
+def test_qwen35_assistant_part_prefills_four_text_rows_and_queues_rest():
+    model = _FakeTalkerModel()
+    assistant_embed = torch.arange(10, dtype=torch.float32).view(-1, 1).expand(-1, 4)
+    tts_bos = torch.full((1, 4), 10.0)
+    tts_eos = torch.full((1, 4), 11.0)
+    tts_pad = torch.full((1, 4), 12.0)
+
+    result = request_builders._build_qwen35_assistant_part(
+        assistant_embed=assistant_embed,
+        text_projection=nn.Identity(),
+        codec_embed_fn=model.get_input_embeddings(),
+        tts_bos_embed=tts_bos,
+        tts_eos_embed=tts_eos,
+        tts_pad_embed=tts_pad,
+        speaker_id=9,
+        codec_nothink_id=41,
+        codec_think_id=46,
+        codec_think_bos_id=42,
+        codec_think_eos_id=43,
+        codec_pad_id=44,
+        codec_bos_id=40,
+        tts_pad_token_id=12,
+    )
+
+    assert result["input_embeds"][-4:, 0].tolist() == [3.0, 4.0, 5.0, 6.0]
+    assert result["future_text_rows"][:, 0].tolist() == [7.0, 8.0, 9.0, 11.0]
 
 
 def test_qwen35_user_prefill_limits_multimodal_rows():
@@ -1554,7 +1593,10 @@ def test_qwen35_mrope_positions_delegate_audio_only_to_qwen3_builder(monkeypatch
 
     assert captured["input_ids"] is input_ids
     assert captured["model_inputs"] is model_inputs
-    assert captured["thinker_config"] is config
+    assert captured["thinker_config"] is not config
+    assert captured["thinker_config"].audio_token_id == config.audio_token_id
+    assert captured["thinker_config"].audio_start_token_id == config.audio_token_id
+    assert captured["thinker_config"].position_id_per_seconds == 1
     assert positions.tolist() == torch.ones(3, 4, dtype=torch.long).tolist()
     assert delta == 5
 
@@ -1868,7 +1910,7 @@ def test_qwen35_talker_sampling_uses_passed_codec_eos_id(monkeypatch):
 
     assert sampling_config["codec_eos_id"] == 7
     assert sampling_config["max_new_tokens"] == 2048
-    assert 7 not in sampling_config["suppress_tokens"]
+    assert sampling_config["suppress_tokens"] == []
     assert (
         sampling_config["mrope_position_builder"]
         is request_builders._compute_qwen35_mrope_positions
@@ -1980,7 +2022,9 @@ def test_qwen35_talker_default_cap_wins_over_large_text_limit(monkeypatch):
     assert captured["max_new_tokens"] == 2048
 
 
-def test_qwen35_talker_and_subtalker_seed_fall_back_to_base_seed(monkeypatch):
+def test_qwen35_talker_and_subtalker_require_explicit_stage_seed(
+    monkeypatch,
+):
     captured = {}
 
     def _fake_build_talker_request_data(payload, **kwargs):
@@ -2013,8 +2057,8 @@ def test_qwen35_talker_and_subtalker_seed_fall_back_to_base_seed(monkeypatch):
     req_data = request_builder(payload)
     sub_sp = req_data.req._qwen35_subtalker_sampling_params
 
-    assert captured["seed"] == 0
-    assert sub_sp.sampling_seed == 0
+    assert captured["seed"] is None
+    assert sub_sp.sampling_seed is None
 
 
 def test_qwen35_talker_max_tokens_uses_talker_cap_with_text_limit(monkeypatch):

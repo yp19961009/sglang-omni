@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import pickle
 import re
@@ -22,6 +23,7 @@ from sglang_omni.models.qwen3_omni.components.talker_input import (
 from sglang_omni.models.qwen3_omni.request_builders import *  # noqa: F401,F403
 from sglang_omni.models.qwen3_omni.components.talker_prefill import (
     TalkerPrefillBuilder,
+    coerce_feature_tensor,
     resolve_speaker_id,
 )
 from sglang_omni.models.qwen3_omni.payload_types import Qwen3OmniPipelineState
@@ -30,6 +32,8 @@ from sglang_omni.models.qwen3_omni.request_builders import (
 )
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
+
+logger = logging.getLogger(__name__)
 
 _VOICE_TO_SPK_MAPPING = {
     # 中文说明：这里包含 vLLM perf_v2 示例脚本里暴露给用户的 voice alias。
@@ -96,6 +100,8 @@ _VOICE_TO_SPK_MAPPING = {
     "joseph chen": "m103_minnan",
 }
 _VOICE_CONTROL_SUFFIXES = ("prefix_caching",)
+_QWEN35_TALKER_NUM_OUTPUT_IN_CHUNK = 4
+_QWEN35_TALKER_TEXT_FEEDBACK_STRIDE = _QWEN35_TALKER_NUM_OUTPUT_IN_CHUNK - 1
 _VOICE_PARAM_KEYS = ("speaker", "voice", "voice_type")
 _OPENAI_AUDIO_VOICE_KEYS = ("voice_type", "voice", "speaker")
 _VOICE_STYLE_PATTERN = re.compile(
@@ -108,6 +114,27 @@ _VOICE_STYLE_CONTAINS = re.compile(
     r"<?\s*/?voice_style",
     re.IGNORECASE,
 )
+
+
+def _qwen35_talker_text_feedback_stride() -> int:
+    raw = os.environ.get("QWEN35_TALKER_TEXT_FEEDBACK_STRIDE")
+    if raw is None:
+        # 中文说明：vLLM 的 external-data scheduler 会在 chunk 边界做
+        # countdown/drop bookkeeping。prefill 已经产生了当前 chunk 的
+        # 第一个 codec，所以本地 decode 会先跑 num_output_in_chunk - 1
+        # 个会发声的 feedback step；在下一组外部 text rows 到来前，
+        # runner 还会补一个 vLLM 同款的 boundary feedback drop step。
+        return _QWEN35_TALKER_TEXT_FEEDBACK_STRIDE
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid QWEN35_TALKER_TEXT_FEEDBACK_STRIDE=%r",
+            raw,
+        )
+        return _QWEN35_TALKER_TEXT_FEEDBACK_STRIDE
+
+
 _VOICE_STYLE_TRAILING_PREFIX = re.compile(r"^(?:[>\s]|\\[nrt])*")
 _LIVETRANSLATE_TARGET_PATTERN = re.compile(
     r"\bspeech\s+into\b\s+([A-Za-z_][\w-]*)",
@@ -689,6 +716,12 @@ def _decode_token_ids(tokenizer: Any, token_ids: list[int]) -> str | None:
             return str(decode(token_ids))
 
 
+def _looks_like_chinese_text(text: str | None) -> bool:
+    if not text:
+        return False
+    return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+
 def _parse_voice_style_prefix(text: str) -> tuple[str, str]:
     match = _VOICE_STYLE_PATTERN.match(text)
     if match is None:
@@ -947,6 +980,7 @@ def _resolve_prefixed_sampling_seed(
     nested_params: dict[str, Any],
     *,
     prefix: str,
+    fallback_base_seed: bool = True,
 ) -> int | None:
     value = _first_param_value(
         base_params,
@@ -955,7 +989,7 @@ def _resolve_prefixed_sampling_seed(
     )
     if value is None:
         value = _first_param_value(nested_params, ("seed", "sampling_seed"), None)
-    if value is None:
+    if value is None and fallback_base_seed:
         value = _first_param_value(base_params, ("seed", "sampling_seed"), None)
     if value is None:
         return None
@@ -968,6 +1002,7 @@ def _resolve_nested_sampling_params(
     nested_key: str,
     prefix: str,
     defaults: dict[str, Any],
+    fallback_base_seed: bool = True,
 ) -> dict[str, Any]:
     nested = _as_params_mapping(params.get(nested_key))
     return {
@@ -1029,6 +1064,7 @@ def _resolve_nested_sampling_params(
             params,
             nested,
             prefix=prefix,
+            fallback_base_seed=fallback_base_seed,
         ),
     }
 
@@ -1185,7 +1221,7 @@ def _compute_qwen35_mrope_positions(
             return qwen3_request_builders._compute_mrope_positions(
                 input_ids,
                 model_inputs,
-                thinker_config,
+                _audio_mrope_compat_config(thinker_config),
             )
         return None
 
@@ -1325,7 +1361,7 @@ def _compute_qwen35_mrope_positions(
             "Qwen3.5-Omni M-RoPE position length mismatch: "
             f"positions={positions.shape[1]} input={len(input_tokens)}"
         )
-    position_delta = torch.tensor([int(positions.max().item() + 1 - len(input_tokens))], dtype=torch.long)
+    position_delta = int(positions.max().item() + 1 - len(input_tokens))
     return positions, position_delta
 
 
@@ -1338,6 +1374,41 @@ def _has_audio_mrope_inputs(model_inputs: dict[str, Any]) -> bool:
     if isinstance(audio_feature_lengths, (list, tuple)):
         return len(audio_feature_lengths) > 0
     return True
+
+
+def _audio_mrope_compat_config(thinker_config: Any) -> SimpleNamespace:
+    vision_config = getattr(thinker_config, "vision_config", SimpleNamespace())
+    audio_token_id = _get_token_id(thinker_config, "audio_token_id")
+    return SimpleNamespace(
+        image_token_id=_get_token_id(thinker_config, "image_token_id"),
+        video_token_id=_get_token_id(thinker_config, "video_token_id"),
+        vision_start_token_id=_get_token_id(thinker_config, "vision_start_token_id"),
+        audio_token_id=audio_token_id,
+        audio_start_token_id=int(
+            getattr(thinker_config, "audio_start_token_id", audio_token_id)
+        ),
+        audio_end_token_id=int(
+            getattr(thinker_config, "audio_end_token_id", audio_token_id)
+        ),
+        position_id_per_seconds=int(
+            getattr(thinker_config, "position_id_per_seconds", 1)
+        ),
+        vision_config=SimpleNamespace(
+            spatial_merge_size=int(getattr(vision_config, "spatial_merge_size", 1)),
+            tokens_per_second=getattr(vision_config, "tokens_per_second", None),
+        ),
+    )
+
+
+def _append_qwen35_debug_jsonl(env_name: str, record: dict[str, Any]) -> None:
+    path = os.environ.get(env_name)
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        logger.debug("failed to write %s debug record", env_name, exc_info=True)
 
 
 def _normalize_deepstack_layers(value: Any) -> list[torch.Tensor]:
@@ -1770,7 +1841,7 @@ def _build_qwen35_assistant_part(
     tts_pad_token_id: int,
     language_id: int | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Build Qwen3.5 assistant prefill rows with optional language codec tags."""
+    """Build Qwen3.5 assistant rows in the vLLM omni3_5 layout."""
     device = assistant_embed.device
     dtype = assistant_embed.dtype
     projected = text_projection(assistant_embed)
@@ -1786,73 +1857,61 @@ def _build_qwen35_assistant_part(
             dtype=dtype,
         )
 
-    fourth_token = (
-        projected[3:4]
-        if projected.shape[0] > 3
-        else torch.zeros((1, projected.shape[-1]), device=device, dtype=dtype)
-    )
-    text_hidden = torch.cat(
-        [
-            projected[:3],
-            assistant_instruct_embed,
-            tts_pad_embed.expand(4, -1),
-            tts_bos_embed,
-            fourth_token,
-        ],
-        dim=0,
-    )
-
     if language_id is not None and language_id >= 0 and codec_think_id is not None:
-        # 中文说明：Qwen3.5 在已知语言时使用 think codec 头，
-        # 对齐 vLLM perf_v2 的 _get_talker_assistant_parts。
-        leading_codec_ids = [
+        leading_codec_ids = (
             int(codec_think_id),
             int(codec_think_bos_id),
             int(language_id),
             int(codec_think_eos_id),
-        ]
+        )
     else:
-        leading_codec_ids = [
+        leading_codec_ids = (
             int(codec_nothink_id),
             int(codec_think_bos_id),
             int(codec_think_eos_id),
-        ]
-        if speaker_id is not None:
-            leading_codec_ids.append(int(speaker_id))
+        )
+    del speaker_id, codec_pad_id
 
     codec_special_ids = torch.tensor(
-        [*leading_codec_ids, int(codec_pad_id), int(codec_bos_id)],
+        [*leading_codec_ids],
         device=device,
         dtype=torch.long,
     )
-    codec_embeds = codec_embed_fn(codec_special_ids)
-    zero_rows = text_hidden.shape[0] - codec_embeds.shape[0]
-    codec_hidden = torch.cat(
-        [
-            # 中文说明：assistant instruction 是纯文本侧条件，codec 侧补零占位。
-            torch.zeros(
-                (zero_rows, text_hidden.shape[-1]),
-                device=device,
-                dtype=dtype,
-            ),
-            codec_embeds,
-        ],
+    spoken_rows = (
+        projected[3:]
+        if projected.shape[0] > 3
+        else projected.new_empty((0, projected.shape[-1]))
+    )
+    initial_text_rows = spoken_rows[:_QWEN35_TALKER_NUM_OUTPUT_IN_CHUNK]
+    future_text_rows = spoken_rows[_QWEN35_TALKER_NUM_OUTPUT_IN_CHUNK:]
+
+    text_parts = [
+        projected[:3],
+        assistant_instruct_embed,
+        codec_embed_fn(codec_special_ids),
+        tts_bos_embed,
+        codec_embed_fn(
+            torch.tensor([int(codec_bos_id)], device=device, dtype=torch.long)
+        ),
+        initial_text_rows,
+    ]
+    assistant_text_hidden = torch.cat(
+        [part.to(device=device, dtype=dtype) for part in text_parts if part.shape[0] > 0],
         dim=0,
     )
-    input_embeds = text_hidden + codec_hidden
     input_ids = torch.full(
-        (text_hidden.shape[0],),
+        (assistant_text_hidden.shape[0],),
         tts_pad_token_id,
         dtype=torch.long,
         device=device,
     )
 
-    if projected.shape[0] > 4:
-        future_text_rows = torch.cat([projected[4:], tts_eos_embed], dim=0)
+    if future_text_rows.shape[0] > 0:
+        future_text_rows = torch.cat([future_text_rows, tts_eos_embed], dim=0)
     else:
         future_text_rows = tts_eos_embed.clone()
     return {
-        "input_embeds": input_embeds,
+        "input_embeds": assistant_text_hidden,
         "input_ids": input_ids,
         "future_text_rows": future_text_rows,
     }
@@ -1995,8 +2054,9 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
         """Load thinker-dimension embeddings for prompt_hidden (2048d)."""
         return super()._load_prompt_token_embeddings(token_ids)
 
-    def _reconstruct_prompt_states(self, state):
-        from sglang_omni.models.qwen3_omni.components.talker_prefill import merge_prompt_modality
+    def _reconstruct_prompt_states(
+        self, state: Qwen3OmniPipelineState
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
         prompt = state.prompt or {}
         prompt_input_ids = prompt["input_ids"]
         if prompt_input_ids.dim() == 2:
@@ -2007,21 +2067,26 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
         prompt_hidden = self._load_thinker_hidden_embeddings(prompt_ids)
         prompt_model_inputs = self._prompt_model_inputs(state)
 
-        merge_prompt_modality(
-            prompt_ids, prompt_embed, prompt_hidden,
-            token_id=self._audio_token_id,
-            features=prompt_model_inputs.get("audio_embeds"),
-        )
-        merge_prompt_modality(
-            prompt_ids, prompt_embed, prompt_hidden,
-            token_id=self._image_token_id,
-            features=prompt_model_inputs.get("image_embeds"),
-        )
-        merge_prompt_modality(
-            prompt_ids, prompt_embed, prompt_hidden,
-            token_id=self._video_token_id,
-            features=prompt_model_inputs.get("video_embeds"),
-        )
+        for modality_key, token_id in (
+            ("audio_embeds", self._audio_token_id),
+            ("image_embeds", self._image_token_id),
+            ("video_embeds", self._video_token_id),
+        ):
+            if token_id is None:
+                continue
+            feature_tensor = coerce_feature_tensor(
+                prompt_model_inputs.get(modality_key)
+            )
+            if feature_tensor is None:
+                continue
+            mask = prompt_ids == int(token_id)
+            if not mask.any():
+                continue
+            prompt_hidden[mask] = feature_tensor.to(
+                device=prompt_hidden.device,
+                dtype=prompt_hidden.dtype,
+            )
+
         return prompt_ids, prompt_embed, prompt_hidden, prompt_model_inputs
 
     def _filter_voice_style_prefix(
@@ -2101,13 +2166,9 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
             assistant_embed = self._load_prompt_token_embeddings(assistant_token_ids)
         else:
             assistant_embed = prompt_embed.new_empty((0, prompt_embed.shape[-1]))
-        if thinker_chunks:
-            assistant_hidden = torch.stack(
-                [self.chunk_layer_hidden_or_embed(chunk) for chunk in thinker_chunks],
-                dim=0,
-            ).to(device=self._device, dtype=self._dtype)
-        else:
-            assistant_hidden = prompt_hidden.new_empty((0, prompt_hidden.shape[-1]))
+        assistant_hidden = prompt_hidden.new_empty(
+            (assistant_token_ids.shape[0], prompt_hidden.shape[-1])
+        )
 
         thinker_input_ids = torch.cat([prompt_ids, assistant_token_ids], dim=0)
         thinker_embed = torch.cat([prompt_embed, assistant_embed], dim=0)
@@ -2127,16 +2188,19 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
         ):
             params["voice_style"] = voice_style_instruction
         params = self._normalize_voice_clone_params(params)
-        speaker_prefix = self._build_speaker_prefix(params)
         if _should_ignore_voice(params):
+            speaker_prefix = None
             speaker_id = None
         else:
-            speaker_id = (
-                self._codec_pad_id
-                if speaker_prefix is not None
-                else resolve_speaker_id(params, self._speaker_map)
-            )
+            _, speaker_id = self._resolve_speaker_name_and_id(params)
+            speaker_prefix = self._build_speaker_prefix(params)
+        assistant_text = _decode_token_ids(
+            self._tokenizer,
+            assistant_token_ids.detach().cpu().tolist(),
+        )
         language_id = self._resolve_language_id(params)
+        if language_id is None and _looks_like_chinese_text(assistant_text):
+            language_id = self._talker_language_id.get("chinese")
         assistant_instruct_ids = self._resolve_assistant_instruct_ids(params)
         assistant_instruct_embed = (
             self._text_embeds(assistant_instruct_ids)
@@ -2185,11 +2249,34 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
             input_embeds = torch.cat([speaker_prefix, input_embeds], dim=0)
             input_ids = torch.cat([prefix_ids, input_ids], dim=0)
 
+        future_text_rows = prefill["future_text_rows"]
+        _append_qwen35_debug_jsonl(
+            "QWEN35_DEBUG_TALKER_PREFILL",
+            {
+                "request_id": payload.request_id,
+                "assistant_token_count": int(assistant_token_ids.numel()),
+                "assistant_text": assistant_text,
+                "prefill_rows_no_speaker": int(prefill["input_embeds"].shape[0]),
+                "speaker_prefix_rows": int(
+                    speaker_prefix.shape[0] if speaker_prefix is not None else 0
+                ),
+                "prefill_rows_total": int(input_embeds.shape[0]),
+                "future_text_rows": int(
+                    future_text_rows.shape[0]
+                    if isinstance(future_text_rows, torch.Tensor)
+                    else 0
+                ),
+                "speaker_id": speaker_id,
+                "language_id": language_id,
+                "thinker_done": bool(thinker_done),
+            },
+        )
+
         return {
             "input_embeds": input_embeds,
             "input_ids": input_ids,
             "pending_text_queue": self.tensor_rows_to_queue(
-                prefill["future_text_rows"]
+                future_text_rows
             ),
             "tts_pad_embed": tts_pad_embed[0].detach(),
             "tts_eos_embed": tts_eos_embed[0].detach(),
@@ -2256,16 +2343,7 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
             seg_ids = thinker_input_ids[start:end]
 
             if seg["role"] == "user":
-                user_part, user_ids = self._build_user_part(
-                    thinker_embed=seg_embed,
-                    thinker_hidden=seg_hidden,
-                    thinker_input_ids=seg_ids,
-                    multimodal_mask=seg_mm_mask,
-                    text_projection=text_projection,
-                    hidden_projection=hidden_projection,
-                )
-                all_embeds.append(user_part)
-                all_ids.append(user_ids.to(dtype=torch.long))
+                continue
             elif seg["role"] == "assistant":
                 if last_assistant_idx is not None and seg_idx != last_assistant_idx:
                     continue
@@ -2308,10 +2386,9 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
                 ):
                     future_text_rows = future_text_rows[:-1]
 
-        target_device = all_embeds[0].device if all_embeds else torch.device("cpu")
         return {
             "input_embeds": torch.cat(all_embeds, dim=0),
-            "input_ids": torch.cat([ids.to(device=target_device) for ids in all_ids], dim=0),
+            "input_ids": torch.cat(all_ids, dim=0),
             "future_text_rows": future_text_rows,
         }
 
@@ -2325,9 +2402,6 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
         text_projection,
         hidden_projection,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        device = thinker_embed.device
-        multimodal_mask = multimodal_mask.to(device=device)
-        thinker_hidden = thinker_hidden.to(device=device)
         mm_pos = multimodal_mask.nonzero(as_tuple=True)[0]
         text_pos = (~multimodal_mask).nonzero(as_tuple=True)[0]
         limit = self._max_thinker_to_talker_mm_tokens
@@ -2352,7 +2426,7 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
         selected_embed = thinker_embed.index_select(0, selected_pos)
         selected_hidden = thinker_hidden.index_select(0, selected_pos)
         selected_mask = multimodal_mask.index_select(0, selected_pos)
-        selected_ids = thinker_input_ids.index_select(0, selected_pos.cpu())
+        selected_ids = thinker_input_ids.index_select(0, selected_pos)
 
         out_size = text_projection(selected_embed[:1]).shape[-1]
         output = torch.empty(
@@ -2682,9 +2756,9 @@ def make_talker_scheduler_adapters(
             nested_key="talker_params",
             prefix="talker",
             defaults={
-                # 中文说明：对齐 vLLM perf_v2 qwen_omni_v35_server.py：
-                # audio-output 请求默认 talker max_tokens=2048。请求级
-                # talker_max_tokens/talker_params.max_tokens 仍可显式覆盖。
+                # 中文说明：沿用 vLLM perf_v2 Qwen3.5 server 的稳态 talker
+                # 采样默认值；audio-output 请求默认 talker max_tokens=2048。
+                # 请求级 talker_max_tokens/talker_params.max_tokens 仍可显式覆盖。
                 "max_new_tokens": 2048,
                 "temperature": 0.9,
                 "top_k": 50,
@@ -2692,6 +2766,7 @@ def make_talker_scheduler_adapters(
                 "min_p": 0.0,
                 "repetition_penalty": 1.05,
             },
+            fallback_base_seed=False,
         )
         model_codec_eos_id = getattr(model.config, "codec_eos_token_id", None)
         if model_codec_eos_id is None:
@@ -2700,11 +2775,6 @@ def make_talker_scheduler_adapters(
             )
         else:
             resolved_codec_eos_id = int(model_codec_eos_id)
-        suppress_tokens = [
-            token_id
-            for token_id in range(max(codec_vocab_size - 1024, 0), codec_vocab_size)
-            if token_id != resolved_codec_eos_id
-        ]
         max_new_tokens = _resolve_qwen35_talker_max_new_tokens(
             params,
             talker_sampling["max_new_tokens"],
@@ -2719,7 +2789,7 @@ def make_talker_scheduler_adapters(
             "codec_eos_id": (
                 resolved_codec_eos_id if resolved_codec_eos_id >= 0 else None
             ),
-            "suppress_tokens": suppress_tokens,
+            "suppress_tokens": [],
             "seed": talker_sampling["seed"],
         }
 
@@ -2731,15 +2801,17 @@ def make_talker_scheduler_adapters(
                 nested_key="subtalker_params",
                 prefix="subtalker",
                 defaults={
-                    # 中文说明：对齐 vLLM perf_v2 qwen_omni_v35_server.py
-                    # 的 residual codec 采样默认值；主 talker 使用 0.9/50。
+                    # 中文说明：对齐 vLLM v1/spec_decode/code_predictor.py 的
+                    # residual codec 采样默认值。不能复用主请求的贪心/低
+                    # top-k 配置，否则 15 个 residual 声码本会坍缩成噪音。
                     "max_new_tokens": 0,
-                    "temperature": 0.1,
-                    "top_k": 5,
+                    "temperature": 0.9,
+                    "top_k": 50,
                     "top_p": 1.0,
                     "min_p": 0.0,
                     "repetition_penalty": 1.05,
                 },
+                fallback_base_seed=False,
             )
         )
         req_data = _build_talker_request_data(
@@ -2758,6 +2830,14 @@ def make_talker_scheduler_adapters(
         if hasattr(req_data, "req"):
             req_data.req._qwen35_subtalker_sampling_params = subtalker_sampling
             req_data.subtalker_sampling_params = subtalker_sampling
+            req_data.talker_decode_input_mode = "qwen35_vllm"
+            feedback_stride = _qwen35_talker_text_feedback_stride()
+            req_data.talker_text_feedback_stride = feedback_stride
+            req_data.talker_text_feedback_countdown = feedback_stride
+            req_data.talker_text_chunk_size = _QWEN35_TALKER_NUM_OUTPUT_IN_CHUNK
+            req_data.talker_text_chunk_remaining = 0
+            req_data.talker_text_outputs_to_drop = 0
+            req_data.last_talker_decode_should_emit = True
         return req_data
 
     def result_adapter(data):

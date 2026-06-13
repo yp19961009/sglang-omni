@@ -120,6 +120,13 @@ def _bind_default_weight_loaders(module: nn.Module) -> None:
             param.weight_loader = default_weight_loader
 
 
+def _should_suppress_codec_eos_for_decode(data: Any) -> bool:
+    pending_text_queue = getattr(data, "pending_text_queue", None)
+    if pending_text_queue:
+        return True
+    return not bool(getattr(data, "thinker_chunks_done", False))
+
+
 def _direct_weight_loader(param: nn.Parameter):
     return getattr(param, "weight_loader", default_weight_loader)
 
@@ -285,6 +292,18 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
             "num_code_groups",
             _get_int(self.code_predictor_config, "num_code_groups", 1),
         )
+        self._subtalker_default_temperature = float(
+            getattr(self.code_predictor_config, "temperature", 1.0)
+        )
+        self._subtalker_default_top_k = int(
+            getattr(self.code_predictor_config, "top_k", 50) or 0
+        )
+        self._subtalker_default_top_p = float(
+            getattr(self.code_predictor_config, "top_p", 1.0)
+        )
+        self._subtalker_default_min_p = float(
+            getattr(self.code_predictor_config, "min_p", 0.0)
+        )
         self.codec_pad_id = _get_int(self.config, "codec_pad_id", 0)
         self.codec_eos_token_id = getattr(self.config, "codec_eos_token_id", None)
         self.codec_vocab_size = _get_int(
@@ -380,23 +399,32 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
             dtype=torch.int64,
             device=device,
         )
-        self._subtalker_temperature = torch.zeros(
+        self._sampling_seed_enabled = torch.zeros(
             max_batch_size,
+            dtype=torch.bool,
+            device=device,
+        )
+        self._subtalker_temperature = torch.full(
+            (max_batch_size,),
+            self._subtalker_default_temperature,
             dtype=torch.float32,
             device=device,
         )
-        self._subtalker_top_k = torch.zeros(
-            max_batch_size,
+        self._subtalker_top_k = torch.full(
+            (max_batch_size,),
+            self._subtalker_default_top_k,
             dtype=torch.long,
             device=device,
         )
-        self._subtalker_top_p = torch.ones(
-            max_batch_size,
+        self._subtalker_top_p = torch.full(
+            (max_batch_size,),
+            self._subtalker_default_top_p,
             dtype=torch.float32,
             device=device,
         )
-        self._subtalker_min_p = torch.zeros(
-            max_batch_size,
+        self._subtalker_min_p = torch.full(
+            (max_batch_size,),
+            self._subtalker_default_min_p,
             dtype=torch.float32,
             device=device,
         )
@@ -499,10 +527,13 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
         self._sampling_top_ks[:batch_size] = 0
         self._sampling_min_ps[:batch_size] = 0.0
         self._sampling_seeds[:batch_size] = 0
-        self._subtalker_temperature[:batch_size] = 0.0
-        self._subtalker_top_k[:batch_size] = 0
-        self._subtalker_top_p[:batch_size] = 1.0
-        self._subtalker_min_p[:batch_size] = 0.0
+        self._sampling_seed_enabled[:batch_size] = False
+        self._subtalker_temperature[:batch_size] = (
+            self._subtalker_default_temperature
+        )
+        self._subtalker_top_k[:batch_size] = self._subtalker_default_top_k
+        self._subtalker_top_p[:batch_size] = self._subtalker_default_top_p
+        self._subtalker_min_p[:batch_size] = self._subtalker_default_min_p
         self._subtalker_seeds[:batch_size] = 0
         self._subtalker_seed_enabled[:batch_size] = False
 
@@ -527,25 +558,38 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
             self._sampling_top_ps[row_idx] = top_p
             self._sampling_min_ps[row_idx] = min_p
             self._sampling_seeds[row_idx] = int(seed) if seed is not None else 0
+            self._sampling_seed_enabled[row_idx] = seed is not None
             sub_sp = getattr(req, "_qwen35_subtalker_sampling_params", None)
             if sub_sp is None:
                 sub_sp = getattr(data, "subtalker_sampling_params", None)
-            if sub_sp is None:
-                sub_sp = sp
-            # 中文说明：Qwen3.5 的 residual codec predictor 可以有独立
-            # subtalker_params；未传时才回退到主 talker 的采样参数。
-            self._subtalker_temperature[row_idx] = float(
-                getattr(sub_sp, "temperature", temperature)
-            )
-            self._subtalker_top_k[row_idx] = int(getattr(sub_sp, "top_k", top_k) or 0)
-            self._subtalker_top_p[row_idx] = float(getattr(sub_sp, "top_p", top_p))
-            self._subtalker_min_p[row_idx] = float(getattr(sub_sp, "min_p", min_p))
-            sub_seed = getattr(sub_sp, "sampling_seed", None)
-            if sub_seed is None:
-                sub_seed = getattr(sub_sp, "seed", None)
-            if sub_seed is not None:
-                self._subtalker_seeds[row_idx] = int(sub_seed)
-                self._subtalker_seed_enabled[row_idx] = True
+            # 中文说明：Qwen3.5 的 residual codec predictor 有自己的
+            # generation defaults（vLLM CodePredictor 默认
+            # temperature=0.9/top_k=50）。未显式传 subtalker_params 时，
+            # 必须使用这些默认值；若跟主 talker 的 greedy 参数绑定，会让
+            # residual codec 坍缩，code2wav 输出不可懂的噪音。
+            if sub_sp is not None:
+                self._subtalker_temperature[row_idx] = float(
+                    getattr(
+                        sub_sp,
+                        "temperature",
+                        self._subtalker_default_temperature,
+                    )
+                )
+                self._subtalker_top_k[row_idx] = int(
+                    getattr(sub_sp, "top_k", self._subtalker_default_top_k) or 0
+                )
+                self._subtalker_top_p[row_idx] = float(
+                    getattr(sub_sp, "top_p", self._subtalker_default_top_p)
+                )
+                self._subtalker_min_p[row_idx] = float(
+                    getattr(sub_sp, "min_p", self._subtalker_default_min_p)
+                )
+                sub_seed = getattr(sub_sp, "sampling_seed", None)
+                if sub_seed is None:
+                    sub_seed = getattr(sub_sp, "seed", None)
+                if sub_seed is not None:
+                    self._subtalker_seeds[row_idx] = int(sub_seed)
+                    self._subtalker_seed_enabled[row_idx] = True
             penalty = float(getattr(sp, "repetition_penalty", 1.0))
             self._repetition_penalties[row_idx, 0] = penalty
             if penalty != 1.0 and req.output_ids:
@@ -558,6 +602,13 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
                 rep_toks.extend(unique)
 
             suppress_tokens = data.suppress_tokens or req._codec_suppress_tokens
+            if _should_suppress_codec_eos_for_decode(data):
+                codec_eos = self.codec_eos_token_id
+                if codec_eos is not None:
+                    suppress_tokens = [
+                        *(suppress_tokens or ()),
+                        int(codec_eos),
+                    ]
             if suppress_tokens:
                 valid = [
                     int(tok)
@@ -621,6 +672,17 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
                 thinker_hidden_states=input_deepstack_embeds,
                 is_multimodal_mask=input_deepstack_mask,
             )
+        elif input_embeds is None:
+            batch_size = int(input_ids.shape[0])
+            feedback_mask = self._feedback_mask[:batch_size]
+            if bool(feedback_mask.any().item()):
+                codec_embeds = self.model.codec_embedding(input_ids)
+                input_embeds = torch.where(
+                    feedback_mask.unsqueeze(-1),
+                    self._feedback_buffer[:batch_size].to(codec_embeds.dtype),
+                    codec_embeds,
+                )
+                self._feedback_mask[:batch_size] = False
 
         if forward_batch.mrope_positions is not None:
             positions = forward_batch.mrope_positions
@@ -675,10 +737,19 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        logits = torch.matmul(
-            hidden_states.to(self.codec_head.weight.dtype),
-            self.codec_head.weight.T,
-        )
+        head_weight = getattr(self.codec_head, "weight", None)
+        if head_weight is not None:
+            logits = torch.matmul(
+                hidden_states.to(head_weight.dtype),
+                head_weight.T,
+            )
+        else:
+            logits_output = self.codec_head(hidden_states)
+            logits = (
+                logits_output[0]
+                if isinstance(logits_output, tuple)
+                else logits_output
+            )
         return self._mask_invalid_codec_logits(logits)
 
     def _mask_invalid_codec_logits(self, logits: torch.Tensor) -> torch.Tensor:
@@ -741,6 +812,7 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
         need_top_p_sampling = bool((top_ps < 1.0).any().item())
         need_top_k_sampling = bool((top_ks > 0).any().item())
         need_min_p_sampling = bool((min_ps > 0.0).any().item())
+        seed_enabled = self._sampling_seed_enabled[:batch_size]
         return SamplingBatchInfo(
             temperatures=temperatures,
             top_ps=top_ps,
@@ -759,7 +831,11 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
             has_custom_logit_processor=False,
             custom_params=None,
             custom_logit_processor=None,
-            sampling_seed=self._sampling_seeds[:batch_size],
+            sampling_seed=(
+                self._sampling_seeds[:batch_size]
+                if bool(seed_enabled.any().item())
+                else None
+            ),
             device=self._sampling_temperatures.device.type,
             logit_bias=None,
         )
@@ -840,23 +916,27 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
                 seed if bool(seed_enabled.any().item()) else None,
             )
 
-        temperature = torch.zeros(
-            batch_size,
+        temperature = torch.full(
+            (batch_size,),
+            self._subtalker_default_temperature,
             dtype=torch.float32,
             device=self._subtalker_temperature.device,
         )
-        top_k = torch.zeros(
-            batch_size,
+        top_k = torch.full(
+            (batch_size,),
+            self._subtalker_default_top_k,
             dtype=torch.long,
             device=self._subtalker_top_k.device,
         )
-        top_p = torch.ones(
-            batch_size,
+        top_p = torch.full(
+            (batch_size,),
+            self._subtalker_default_top_p,
             dtype=torch.float32,
             device=self._subtalker_top_p.device,
         )
-        min_p = torch.zeros(
-            batch_size,
+        min_p = torch.full(
+            (batch_size,),
+            self._subtalker_default_min_p,
             dtype=torch.float32,
             device=self._subtalker_min_p.device,
         )
@@ -878,11 +958,17 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
             if sp is None:
                 sp = getattr(data, "subtalker_sampling_params", None)
             if sp is None:
-                sp = req.sampling_params
-            temperature[row_idx] = float(getattr(sp, "temperature", 0.0))
-            top_k[row_idx] = int(getattr(sp, "top_k", 0) or 0)
-            top_p[row_idx] = float(getattr(sp, "top_p", 1.0))
-            min_p[row_idx] = float(getattr(sp, "min_p", 0.0))
+                continue
+            temperature[row_idx] = float(
+                getattr(sp, "temperature", self._subtalker_default_temperature)
+            )
+            top_k[row_idx] = int(
+                getattr(sp, "top_k", self._subtalker_default_top_k) or 0
+            )
+            top_p[row_idx] = float(getattr(sp, "top_p", self._subtalker_default_top_p))
+            min_p[row_idx] = float(
+                getattr(sp, "min_p", self._subtalker_default_min_p)
+            )
             sp_seed = getattr(sp, "sampling_seed", None)
             if sp_seed is None:
                 sp_seed = getattr(sp, "seed", None)

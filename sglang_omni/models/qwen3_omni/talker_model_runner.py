@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import inspect
+import json
+import os
 from typing import Any
 
 import torch
@@ -11,6 +13,19 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.scheduling.messages import OutgoingMessage
+
+_QWEN35_VLLM_DECODE_INPUT_MODE = "qwen35_vllm"
+
+
+def _append_debug_jsonl(env_name: str, record: dict[str, Any]) -> None:
+    path = os.environ.get(env_name)
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
 
 
 class QwenTalkerModelRunner(ModelRunner):
@@ -145,21 +160,25 @@ class QwenTalkerModelRunner(ModelRunner):
             req = schedule_batch.reqs[idx]
             code_chunk = self.model._output_codes[idx].detach().clone()
             feedback_row = self.model._output_embeds[idx].detach().clone()
+            should_emit = bool(
+                getattr(sched_req.data, "last_talker_decode_should_emit", True)
+            )
             # Tell code2wav whether to forward audio chunks to the Coordinator.
             stage_payload = sched_req.data.stage_payload
             is_streaming = bool(
                 stage_payload is not None
                 and (stage_payload.request.params or {}).get("stream", False)
             )
-            self._outbox.put(
-                OutgoingMessage(
-                    request_id=req.rid,
-                    type="stream",
-                    data=code_chunk,
-                    target=self._code2wav_target,
-                    metadata={"stream": is_streaming},
+            if should_emit:
+                self._outbox.put(
+                    OutgoingMessage(
+                        request_id=req.rid,
+                        type="stream",
+                        data=code_chunk,
+                        target=self._code2wav_target,
+                        metadata={"stream": is_streaming},
+                    )
                 )
-            )
             sched_req.data.pending_feedback_queue.append(feedback_row)
 
     def sample_before_post_prefill(
@@ -374,10 +393,71 @@ class QwenTalkerModelRunner(ModelRunner):
         rows: list[int] = []
         embeds: list[torch.Tensor] = []
         for row_idx, sched_req in enumerate(requests):
+            pending_feedback_queue = getattr(
+                sched_req.data,
+                "pending_feedback_queue",
+                None,
+            )
+            pending_text_queue = getattr(sched_req.data, "pending_text_queue", None)
+            feedback_before = (
+                len(pending_feedback_queue) if pending_feedback_queue is not None else 0
+            )
+            text_before = len(pending_text_queue) if pending_text_queue is not None else 0
+            had_next_text = self._peek_left(pending_text_queue) is not None
             combined = self._take_next_decode_input_embed(
                 sched_req=sched_req,
                 device=feedback_buffer.device,
                 dtype=feedback_buffer.dtype,
+            )
+            _append_debug_jsonl(
+                "QWEN35_DEBUG_TALKER_DECODE",
+                {
+                    "request_id": getattr(sched_req, "request_id", None),
+                    "row_idx": row_idx,
+                    "feedback_before": feedback_before,
+                    "text_before": text_before,
+                    "had_next_text": bool(had_next_text),
+                    "used_pad": bool(not had_next_text),
+                    "input_kind": getattr(
+                        sched_req.data,
+                        "last_talker_decode_input_kind",
+                        None,
+                    ),
+                    "text_feedback_countdown": getattr(
+                        sched_req.data,
+                        "talker_text_feedback_countdown",
+                        None,
+                    ),
+                    "text_chunk_remaining": getattr(
+                        sched_req.data,
+                        "talker_text_chunk_remaining",
+                        None,
+                    ),
+                    "text_outputs_to_drop": getattr(
+                        sched_req.data,
+                        "talker_text_outputs_to_drop",
+                        None,
+                    ),
+                    "should_emit": getattr(
+                        sched_req.data,
+                        "last_talker_decode_should_emit",
+                        True,
+                    ),
+                    "combined_is_none": combined is None,
+                    "combined_norm": (
+                        float(combined.detach().float().norm().item())
+                        if isinstance(combined, torch.Tensor)
+                        else None
+                    ),
+                    "feedback_after": (
+                        len(pending_feedback_queue)
+                        if pending_feedback_queue is not None
+                        else 0
+                    ),
+                    "text_after": (
+                        len(pending_text_queue) if pending_text_queue is not None else 0
+                    ),
+                },
             )
             if combined is None:
                 continue
@@ -397,6 +477,17 @@ class QwenTalkerModelRunner(ModelRunner):
         pending_feedback_queue = getattr(data, "pending_feedback_queue", None)
         if not pending_feedback_queue:
             return False
+        if (
+            getattr(data, "talker_decode_input_mode", "sum")
+            == _QWEN35_VLLM_DECODE_INPUT_MODE
+        ):
+            if int(getattr(data, "talker_text_chunk_remaining", 0) or 0) > 0:
+                return True
+            if getattr(data, "pending_text_queue", None):
+                return True
+            if getattr(data, "thinker_chunks_done", False):
+                return True
+            return int(getattr(data, "talker_text_feedback_countdown", 0) or 0) > 0
         pending_text_queue = getattr(data, "pending_text_queue", None)
         if pending_text_queue:
             return True
@@ -490,6 +581,92 @@ class QwenTalkerModelRunner(ModelRunner):
         )
 
     @staticmethod
+    def _take_next_qwen35_vllm_decode_input_embed(
+        *,
+        data: Any,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        pending_feedback_queue = getattr(data, "pending_feedback_queue", None)
+        feedback = QwenTalkerModelRunner._peek_left(pending_feedback_queue)
+        if feedback is None:
+            data.last_talker_decode_input_kind = None
+            data.last_talker_decode_should_emit = True
+            return None
+
+        pending_text_queue = getattr(data, "pending_text_queue", None)
+        input_kind = "feedback"
+        should_emit = True
+
+        text_chunk_remaining = int(
+            getattr(data, "talker_text_chunk_remaining", 0) or 0
+        )
+        if text_chunk_remaining > 0:
+            row = QwenTalkerModelRunner._pop_left(pending_text_queue)
+            if row is None:
+                data.talker_text_chunk_remaining = 0
+                data.last_talker_decode_input_kind = None
+                data.last_talker_decode_should_emit = True
+                return None
+            input_kind = "text"
+            data.talker_text_chunk_remaining = text_chunk_remaining - 1
+            # Qwen3.5 vLLM-style external text rows are conditioning inputs for
+            # the next feedback step; only feedback-generated rows are emitted
+            # to code2wav as audio codec frames.
+            should_emit = False
+            drop_count = int(getattr(data, "talker_text_outputs_to_drop", 0) or 0)
+            if drop_count > 0:
+                data.talker_text_outputs_to_drop = drop_count - 1
+            else:
+                data.talker_text_outputs_to_drop = 0
+            if data.talker_text_chunk_remaining <= 0:
+                data.talker_text_feedback_countdown = max(
+                    0,
+                    int(getattr(data, "talker_text_feedback_stride", 0) or 0),
+                )
+        elif pending_text_queue:
+            countdown = int(getattr(data, "talker_text_feedback_countdown", 0) or 0)
+            if countdown > 0:
+                data.talker_text_feedback_countdown = countdown - 1
+                row = feedback
+            else:
+                chunk_size = max(
+                    1,
+                    int(getattr(data, "talker_text_chunk_size", 1) or 1),
+                )
+                available = len(pending_text_queue)
+                if available <= 0:
+                    data.last_talker_decode_input_kind = None
+                    data.last_talker_decode_should_emit = True
+                    return None
+                rows_in_chunk = min(chunk_size, available)
+                data.talker_text_chunk_remaining = rows_in_chunk
+                data.talker_text_outputs_to_drop = max(0, rows_in_chunk)
+                # vLLM generates one feedback-token step at the external-data
+                # boundary, drops that codec from user-visible output, then
+                # consumes the incoming text rows on following decode steps.
+                # Keeping the dropped boundary step preserves the talker state
+                # seen by the next emitted codec.
+                input_kind = "boundary_feedback"
+                should_emit = False
+                row = feedback
+        elif not getattr(data, "thinker_chunks_done", False):
+            countdown = int(getattr(data, "talker_text_feedback_countdown", 0) or 0)
+            if countdown <= 0:
+                data.last_talker_decode_input_kind = None
+                data.last_talker_decode_should_emit = True
+                return None
+            data.talker_text_feedback_countdown = countdown - 1
+            row = feedback
+        else:
+            row = feedback
+
+        QwenTalkerModelRunner._pop_left(pending_feedback_queue)
+        data.last_talker_decode_input_kind = input_kind
+        data.last_talker_decode_should_emit = should_emit
+        return QwenTalkerModelRunner._decode_row(row, device=device, dtype=dtype)
+
+    @staticmethod
     def _take_next_decode_input_embed(
         *,
         sched_req: Any,
@@ -497,17 +674,31 @@ class QwenTalkerModelRunner(ModelRunner):
         dtype: torch.dtype,
     ) -> torch.Tensor | None:
         data = sched_req.data
+        if (
+            getattr(data, "talker_decode_input_mode", "sum")
+            == _QWEN35_VLLM_DECODE_INPUT_MODE
+        ):
+            return QwenTalkerModelRunner._take_next_qwen35_vllm_decode_input_embed(
+                data=data,
+                device=device,
+                dtype=dtype,
+            )
+
         combined = QwenTalkerModelRunner._combine_feedback_with_next_text(
             data=data,
             device=device,
             dtype=dtype,
         )
         if combined is None:
+            data.last_talker_decode_input_kind = None
             return None
 
         QwenTalkerModelRunner._pop_left(getattr(data, "pending_feedback_queue", None))
         if getattr(data, "pending_text_queue", None):
             QwenTalkerModelRunner._pop_left(data.pending_text_queue)
+            data.last_talker_decode_input_kind = "sum_text"
+        else:
+            data.last_talker_decode_input_kind = "sum_pad"
         return combined
 
     def _forward_with_input_embeds(

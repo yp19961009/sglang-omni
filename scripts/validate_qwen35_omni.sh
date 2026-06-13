@@ -19,6 +19,7 @@ PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/codex_pycache_q35}" \
   benchmarks/tasks/video_understanding.py \
   examples/run_qwen3_5_omni_server.py \
   examples/run_qwen3_5_omni_speech_server.py \
+  scripts/qwen35_omni_alignment.py \
   scripts/qwen35_omni_preflight.py \
   sglang_omni/config/runtime.py \
   sglang_omni/config/schema.py \
@@ -47,6 +48,7 @@ paths += [
     Path("examples/qwen3_5_omni_README.md"),
     Path("examples/configs/qwen3_5_omni_colocated_h20.yaml"),
     Path("scripts/validate_qwen35_omni.sh"),
+    Path("scripts/qwen35_omni_alignment.py"),
     Path("scripts/qwen35_omni_preflight.py"),
     Path("sglang_omni/config/runtime.py"),
     Path("sglang_omni/config/schema.py"),

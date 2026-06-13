@@ -400,12 +400,16 @@ def create_sglang_thinker_executor_from_config(
     overrides: dict[str, Any] = {"disable_cuda_graph": True, "mem_fraction_static": 0.88}
     overrides.setdefault("max_prefill_tokens", QWEN3_5_OMNI_MAX_PREFILL_TOKENS)
     overrides.setdefault("chunked_prefill_size", QWEN3_5_OMNI_CHUNKED_PREFILL_SIZE)
+    has_user_mem_fraction_static = (
+        server_args_overrides is not None
+        and server_args_overrides.get("mem_fraction_static") is not None
+    )
     if server_args_overrides:
         overrides.update(server_args_overrides)
     overrides["tp_size"] = tp_size
     has_explicit_colocated_mem_fraction = (
         total_gpu_memory_fraction is not None
-        and overrides.get("mem_fraction_static") is not None
+        and has_user_mem_fraction_static
     )
     colocated_encoder_mem_reserve = (
         encoder_mem_reserve

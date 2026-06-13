@@ -13,6 +13,7 @@ from sglang_omni.models.qwen3_5_omni.components import preprocessor
 from sglang_omni.models.qwen3_5_omni.components import common as qwen35_common
 from sglang_omni.models.qwen3_5_omni.components.preprocessor import (
     Qwen35OmniPreprocessor,
+    _Qwen35ProcessorShim,
     _load_qwen3_omni_next_processor,
 )
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -63,6 +64,55 @@ class _FakeMediaIO:
         return ("bytes", data)
 
 
+class _ShimFakeTokenizer:
+    image_token = "<|image_pad|>"
+    audio_token = "<|audio_pad|>"
+    video_token = "<|video_pad|>"
+    vision_bos_token = "<|vision_start|>"
+    vision_eos_token = "<|vision_end|>"
+    audio_bos_token = "<|audio_start|>"
+    audio_eos_token = "<|audio_end|>"
+    chat_template = "{% for message in messages %}{{ message.content }}{% endfor %}"
+    model_input_names = ["input_ids", "attention_mask"]
+
+    def __init__(self) -> None:
+        self.last_text = None
+
+    def apply_chat_template(self, *args, **kwargs):
+        return "<templated>"
+
+    def __call__(self, text, **kwargs):
+        del kwargs
+        self.last_text = text
+        counts = [sample.count(self.audio_token) for sample in text]
+        max_len = max(counts) if counts else 0
+        rows = []
+        for count in counts:
+            rows.append([1] * count + [0] * (max_len - count))
+        return {
+            "input_ids": torch.tensor(rows, dtype=torch.long),
+            "attention_mask": torch.tensor(rows, dtype=torch.long),
+        }
+
+
+class _ShimFakeFeatureExtractor:
+    sampling_rate = 16000
+    hop_length = 160
+    model_input_names = ["input_features"]
+
+    def __call__(self, audio, **kwargs):
+        del kwargs
+        return {
+            "input_features": torch.ones(len(audio), 4, 100),
+            "attention_mask": torch.ones(len(audio), 100, dtype=torch.long),
+        }
+
+
+class _ShimFakeImageProcessor:
+    merge_size = 2
+    model_input_names = ["pixel_values"]
+
+
 def _new_preprocessor_for_unit() -> Qwen35OmniPreprocessor:
     obj = object.__new__(Qwen35OmniPreprocessor)
     obj.max_seq_len = None
@@ -104,6 +154,36 @@ def test_qwen35_preprocessor_accepts_next_audio_feature_alias():
 
     assert audio_inputs["input_features"] is input_audio_features
     assert audio_inputs["audio_feature_lengths"].tolist() == [8]
+
+
+def test_qwen35_processor_shim_expands_audio_tokens_and_features():
+    tokenizer = _ShimFakeTokenizer()
+    shim = _Qwen35ProcessorShim(
+        tokenizer=tokenizer,
+        image_processor=_ShimFakeImageProcessor(),
+        feature_extractor=_ShimFakeFeatureExtractor(),
+    )
+
+    result = shim(
+        text="<|audio_pad|>",
+        audio=[torch.zeros(16000).numpy()],
+        audio_kwargs={
+            "sampling_rate": 16000,
+            "padding": True,
+            "return_attention_mask": True,
+            "truncation": False,
+            "timestamp_interval": 60,
+            "downsample_times": 4,
+            "downsample_chunk_size": 100,
+        },
+        add_special_tokens=False,
+        return_tensors="pt",
+    )
+
+    assert "input_audio_features" in result
+    assert "feature_attention_mask" in result
+    assert result["input_ids"].shape[1] == 7
+    assert tokenizer.last_text == ["<0.0 seconds>" + "<|audio_pad|>" * 7]
 
 
 def test_qwen35_audio_cache_context_distinguishes_video_audio_order():
