@@ -165,7 +165,7 @@ def test_qwen35_audio_output_gating_prefers_metadata_modalities():
     assert not request_builders.should_generate_audio_output(request)
 
 
-def test_qwen35_audio_output_gating_accepts_vllm_boolean_flag():
+def test_qwen35_audio_output_gating_accepts_boolean_flags():
     enabled = OmniRequest(inputs={}, params={"enable_audio_output": True})
     disabled = OmniRequest(inputs={}, params={"enable_audio_output": False})
     alias_enabled = OmniRequest(inputs={}, params={"return_audio": "on"})
@@ -925,7 +925,7 @@ def test_qwen35_talker_prefill_resolves_voice_alias_and_default():
     )
 
 
-def test_qwen35_talker_prefill_resolves_vllm_example_voice_aliases():
+def test_qwen35_talker_prefill_resolves_example_voice_aliases():
     model = _FakeTalkerModel()
     builder = _builder(
         model,
@@ -1165,7 +1165,7 @@ def test_qwen35_talker_prefill_resolves_assistant_instruct_ids():
 
 
 def test_qwen35_tts_generate_mode_default_ignores_instructions(monkeypatch):
-    monkeypatch.delenv("VLLM_QWEN_TTS_GENERATE_MODE", raising=False)
+    monkeypatch.delenv("SGLANG_OMNI_QWEN_TTS_GENERATE_MODE", raising=False)
 
     params = request_builders._apply_tts_generate_mode(
         {
@@ -1182,7 +1182,7 @@ def test_qwen35_tts_generate_mode_default_ignores_instructions(monkeypatch):
 
 
 def test_qwen35_tts_generate_mode_voice_design_forces_no_speaker(monkeypatch):
-    monkeypatch.delenv("VLLM_QWEN_TTS_GENERATE_MODE", raising=False)
+    monkeypatch.delenv("SGLANG_OMNI_QWEN_TTS_GENERATE_MODE", raising=False)
 
     params = request_builders._apply_tts_generate_mode(
         {
@@ -1197,7 +1197,7 @@ def test_qwen35_tts_generate_mode_voice_design_forces_no_speaker(monkeypatch):
 
 
 def test_qwen35_tts_generate_mode_env_instructions_keeps_instructions(monkeypatch):
-    monkeypatch.setenv("VLLM_QWEN_TTS_GENERATE_MODE", "instructions")
+    monkeypatch.setenv("SGLANG_OMNI_QWEN_TTS_GENERATE_MODE", "instructions")
 
     params = request_builders._apply_tts_generate_mode(
         {
@@ -1374,6 +1374,76 @@ def test_qwen35_assistant_part_prefills_four_text_rows_and_queues_rest():
 
     assert result["input_embeds"][-4:, 0].tolist() == [3.0, 4.0, 5.0, 6.0]
     assert result["future_text_rows"][:, 0].tolist() == [7.0, 8.0, 9.0, 11.0]
+
+
+def test_qwen35_prefill_strips_static_assistant_template_suffix():
+    model = _FakeTalkerModel()
+    builder = _builder(model)
+    token_ids = torch.tensor(
+        [
+            20,
+            32,
+            198,
+            248068,
+            271,
+            248069,
+            271,
+            101,
+            102,
+            103,
+            104,
+            105,
+        ],
+        dtype=torch.long,
+    )
+    thinker_embed = token_ids.to(dtype=torch.float32).view(-1, 1).expand(-1, 4)
+    tts_bos = torch.full((1, 4), 10.0)
+    tts_eos = torch.full((1, 4), 11.0)
+    tts_pad = torch.full((1, 4), 12.0)
+
+    result = builder._build_prefill_input(
+        thinker_embed=thinker_embed,
+        thinker_hidden=thinker_embed,
+        thinker_input_ids=token_ids,
+        multimodal_mask=torch.zeros(token_ids.numel(), dtype=torch.bool),
+        assistant_token_count=5,
+        text_projection=nn.Identity(),
+        hidden_projection=nn.Identity(),
+        codec_embed_fn=model.get_input_embeddings(),
+        tts_bos_embed=tts_bos,
+        tts_eos_embed=tts_eos,
+        tts_pad_embed=tts_pad,
+        assistant_instruct_embed=None,
+        im_start_token_id=20,
+        system_token_id=30,
+        user_token_id=31,
+        assistant_token_id=32,
+        speaker_id=9,
+        codec_nothink_id=41,
+        codec_think_id=46,
+        codec_think_bos_id=42,
+        codec_think_eos_id=43,
+        codec_pad_id=44,
+        codec_bos_id=40,
+        tts_pad_token_id=12,
+        im_end_token_id=21,
+    )
+
+    assert result["input_embeds"][:, 0].tolist() == [
+        20.0,
+        32.0,
+        198.0,
+        41.0,
+        42.0,
+        43.0,
+        10.0,
+        40.0,
+        101.0,
+        102.0,
+        103.0,
+        104.0,
+    ]
+    assert result["future_text_rows"][:, 0].tolist() == [105.0, 11.0]
 
 
 def test_qwen35_user_prefill_limits_multimodal_rows():
@@ -1613,6 +1683,7 @@ def test_qwen35_mrope_positions_skip_text_only_without_audio():
 
 
 def test_qwen35_thinker_adapter_uses_next_mrope_builder(monkeypatch):
+    monkeypatch.delenv("QWEN35_LIMIT_PREFIX_CACHE_BEFORE_MEDIA", raising=False)
     captured = {}
 
     def _fake_build_sglang_thinker_request(*args, **kwargs):
@@ -1646,6 +1717,39 @@ def test_qwen35_thinker_adapter_uses_next_mrope_builder(monkeypatch):
         captured["mrope_position_builder"]
         is request_builders._compute_qwen35_mrope_positions
     )
+    assert captured["limit_prefix_cache_before_media"] is False
+
+
+def test_qwen35_thinker_adapter_can_limit_prefix_cache_before_media(monkeypatch):
+    captured = {}
+
+    def _fake_build_sglang_thinker_request(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return SimpleNamespace(stage_payload=None)
+
+    monkeypatch.setenv("QWEN35_LIMIT_PREFIX_CACHE_BEFORE_MEDIA", "1")
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "build_sglang_thinker_request",
+        _fake_build_sglang_thinker_request,
+    )
+
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    state = Qwen3OmniPipelineState(prompt={"input_ids": torch.tensor([1])})
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(inputs={}),
+        data=state.to_dict(),
+    )
+
+    request_builder(payload)
+
+    assert captured["limit_prefix_cache_before_media"] is True
 
 
 def test_qwen35_thinker_sampling_accepts_openai_max_tokens_alias():
@@ -2099,7 +2203,7 @@ def test_qwen35_talker_max_tokens_uses_talker_cap_with_text_limit(monkeypatch):
     assert captured["max_new_tokens"] == 1200
 
 
-def test_qwen35_talker_adapter_accepts_vllm_nested_sampling_params(monkeypatch):
+def test_qwen35_talker_adapter_accepts_nested_sampling_params(monkeypatch):
     captured = {}
 
     def _fake_build_talker_request_data(payload, **kwargs):

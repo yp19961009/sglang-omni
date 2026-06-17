@@ -103,19 +103,12 @@ async def _measure_one(
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "modalities": ["text", "audio"],
-        # sglang-omni honors modalities; vLLM perf_v2 gates talker on
-        # enable_audio_output and offline scripts commonly use do_wave.
-        # Keep all three so one command can target either server family.
-        "enable_audio_output": True,
-        "do_wave": True,
         "audio": audio_config,
         "stream": True,
         "seed": seed,
         "max_tokens": max_tokens,
         "metadata": {"client_label": request_id_hint},
     }
-    if voice:
-        payload["voice_type"] = voice
 
     start = time.perf_counter()
     ttft: float | None = None
@@ -163,11 +156,6 @@ def _event_text_delta(evt: dict) -> str | None:
 
 
 def _event_audio_data(evt: dict) -> str | None:
-    top_level_audio = evt.get("audio")
-    if isinstance(top_level_audio, dict) and top_level_audio.get("data"):
-        # 中文说明：vLLM perf_v2 的 Qwen3.5 streaming server 在最后
-        # 发送 object=chat.completion.audio 的顶层 audio 事件。
-        return top_level_audio["data"]
     for choice in evt.get("choices", []):
         delta = choice.get("delta") or {}
         audio = delta.get("audio")
@@ -360,7 +348,7 @@ def main(argv: list[str] | None = None) -> int:
         "--voice",
         default=None,
         help=(
-            "Optional voice/voice_type. Omit to use the server default, "
+            "Optional audio.voice value. Omit to use the server default, "
             "which is useful for Qwen3.5-Omni."
         ),
     )

@@ -36,7 +36,7 @@ from sglang_omni.scheduling.messages import OutgoingMessage
 logger = logging.getLogger(__name__)
 
 _VOICE_TO_SPK_MAPPING = {
-    # 中文说明：这里包含 vLLM perf_v2 示例脚本里暴露给用户的 voice alias。
+    # 中文说明：这里包含 Qwen3.5-Omni 常见的用户侧 voice alias。
     "芊悦": "f245",
     "cherry": "f245",
     "苏瑶": "f05",
@@ -119,11 +119,11 @@ _VOICE_STYLE_CONTAINS = re.compile(
 def _qwen35_talker_text_feedback_stride() -> int:
     raw = os.environ.get("QWEN35_TALKER_TEXT_FEEDBACK_STRIDE")
     if raw is None:
-        # 中文说明：vLLM 的 external-data scheduler 会在 chunk 边界做
+        # 中文说明：Qwen3.5 external-text handoff 会在 chunk 边界做
         # countdown/drop bookkeeping。prefill 已经产生了当前 chunk 的
         # 第一个 codec，所以本地 decode 会先跑 num_output_in_chunk - 1
         # 个会发声的 feedback step；在下一组外部 text rows 到来前，
-        # runner 还会补一个 vLLM 同款的 boundary feedback drop step。
+        # runner 还会补一个 boundary feedback drop step。
         return _QWEN35_TALKER_TEXT_FEEDBACK_STRIDE
     try:
         return max(0, int(raw))
@@ -163,10 +163,10 @@ _TRANSLATION_TARGET_KEYS = (
     "language",
     "lang",
 )
-# 中文说明：vLLM perf_v2 的 live-translate/tts 路径会暴露 Chinese、
-# English、Filipino 这类人类可读语种名，而 Qwen3.5 talker 配置里常见
-# 的 talker_language_id key 是 zh/en/tagalog/yue 等 code。请求解析时统一
-# 展开候选，既兼容 vLLM 参数，也不要求用户手写 language_id。
+# 中文说明：live-translate/tts 请求会暴露 Chinese、English、Filipino
+# 这类人类可读语种名，而 Qwen3.5 talker 配置里常见的 talker_language_id
+# key 是 zh/en/tagalog/yue 等 code。请求解析时统一展开候选，不要求用户
+# 手写 language_id。
 _LANGUAGE_NAME_ALIASES = {
     "chinese": ("zh", "zh-cn", "cmn"),
     "mandarin": ("zh", "zh-cn", "cmn"),
@@ -366,8 +366,8 @@ def _explicit_audio_output_enabled(request: OmniRequest | None) -> bool | None:
     for key in ("enable_audio_output", "audio_output", "return_audio", "do_wave"):
         value = _coerce_optional_bool(params.get(key))
         if value is not None:
-            # 中文说明：vLLM Qwen3.5 OpenAI server 暴露
-            # enable_audio_output；do_wave 是离线/压测脚本里常见的
+            # 中文说明：enable_audio_output 是 Qwen3.5 音频输出开关；
+            # do_wave 是离线/压测脚本里常见的
             # “需要合成 waveform” 开关，这里一起兼容。
             return value
     return None
@@ -379,7 +379,7 @@ def output_modalities(request: OmniRequest | None) -> set[str] | None:
         modalities = _coerce_output_modalities(metadata.get("output_modalities"))
         if modalities is not None:
             # 中文说明：Qwen3 基类只做简单 lower；Qwen3.5 需要兼容
-            # vLLM/OpenAI 压测常见的 ["text,audio"] 写法。
+            # OpenAI 压测常见的 ["text,audio"] 写法。
             return modalities
 
     metadata_modalities = qwen3_request_builders.output_modalities(request)
@@ -633,7 +633,7 @@ def _infer_livetranslate_target_language(request: Any) -> str | None:
             language = match.group(1).strip()
             if not language:
                 continue
-            # 中文说明：vLLM perf_v2 live-translate 会把 Filipino 归一到
+            # 中文说明：Qwen3.5 live-translate 会把 Filipino 归一到
             # Tagalog，talker_language_id 通常也用 tagalog 作为 key。
             return "Tagalog" if language.lower() == "filipino" else language
     return None
@@ -649,7 +649,7 @@ def _params_with_request_language_fallback(
     if target_language is None:
         return params
     normalized = dict(params)
-    # 中文说明：兼容 vLLM Qwen3.5 live-translate 固定 prompt:
+    # 中文说明：兼容 Qwen3.5 live-translate 固定 prompt:
     # "... speech into Chinese ..."。只有请求没有显式语言时才从 prompt
     # 兜底推断，避免普通 TTS/显式翻译请求被文本内容覆盖。
     normalized["target_language"] = target_language
@@ -665,7 +665,7 @@ def _resolve_tts_generate_mode(params: dict[str, Any]) -> str | None:
         value = params.get(key)
         if value:
             return str(value).lower().strip()
-    env_value = os.environ.get("VLLM_QWEN_TTS_GENERATE_MODE")
+    env_value = os.environ.get("SGLANG_OMNI_QWEN_TTS_GENERATE_MODE")
     return env_value.lower().strip() if env_value else None
 
 
@@ -694,7 +694,7 @@ def _apply_tts_generate_mode(params: dict[str, Any]) -> dict[str, Any]:
             "style",
         ):
             normalized.pop(key, None)
-    # 中文说明：只在明确传入 mode 或设置同名 vLLM env 时生效，未设置时
+    # 中文说明：只在明确传入 mode 或设置同名 SGLang env 时生效，未设置时
     # 保留当前 sglang-omni 请求行为，避免把已有 instruction 请求静默丢掉。
     return normalized
 
@@ -898,8 +898,8 @@ def _voice_clone_prompt_code(raw: dict[str, Any]) -> Any:
         "prompt_code",
         "prompt_speaker_codes",
         "prompt_codes",
-        # 中文说明：vLLM zero-shot xvector loader 兼容旧资产里的
-        # ref_code；Qwen3.5 voice clone 目录也可能复用这类 feat.pkl。
+        # 中文说明：旧 zero-shot xvector 资产里可能使用 ref_code；
+        # Qwen3.5 voice clone 目录也可能复用这类 feat.pkl。
         "ref_code",
         "speaker_codec_codes",
         "voice_clone_codes",
@@ -1083,7 +1083,7 @@ def _resolve_qwen35_talker_max_new_tokens(
     if base_max_tokens is None:
         return int(resolved_talker_max_new_tokens)
 
-    # 中文说明：vLLM Qwen3.5 talker 会用文本侧 max_tokens/max_completion_tokens
+    # 中文说明：Qwen3.5 talker 会用文本侧 max_tokens/max_completion_tokens
     # * 40 作为音频 codec 上限，再和 talker 自身上限取 min。这样用户
     # 限制文本长度时，音频不会无限生成，也不会因为 1:1 token 上限过早截断。
     return min(
@@ -1494,6 +1494,13 @@ def _validate_qwen35_multimodal_feature_lengths(
     _validate_qwen35_multimodal_metadata_lengths(model_inputs)
 
 
+def _limit_prefix_cache_before_media_enabled() -> bool:
+    raw = os.getenv("QWEN35_LIMIT_PREFIX_CACHE_BEFORE_MEDIA")
+    if raw is None:
+        return False
+    return raw in {"1", "true", "True", "yes", "YES", "on", "ON"}
+
+
 def _metadata_length(value: Any) -> int | None:
     if value is None:
         return None
@@ -1702,6 +1709,7 @@ def make_thinker_scheduler_adapters(
             request_id=payload.request_id,
             thinker_config=thinker_config,
             mrope_position_builder=qwen35_mrope_builder,
+            limit_prefix_cache_before_media=_limit_prefix_cache_before_media_enabled(),
         )
         req_data.stage_payload = payload
         return req_data
@@ -1841,7 +1849,7 @@ def _build_qwen35_assistant_part(
     tts_pad_token_id: int,
     language_id: int | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Build Qwen3.5 assistant rows in the vLLM omni3_5 layout."""
+    """Build Qwen3.5 assistant rows in the omni3_5 layout."""
     device = assistant_embed.device
     dtype = assistant_embed.dtype
     projected = text_projection(assistant_embed)
@@ -2035,8 +2043,8 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
             # language_id/target_lang/translation_options 时必须优先生效。
             normalized["language"] = language
 
-        # 中文说明：对齐 vLLM 的 xvector_info 入口，但不新增独立调度分支；
-        # 后续仍复用 prompt_speaker_codes/system_instruct_ids 的 speaker prefix。
+        # 中文说明：xvector_info 不新增独立调度分支；后续仍复用
+        # prompt_speaker_codes/system_instruct_ids 的 speaker prefix。
         return normalized
 
     def _load_prompt_token_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -2116,7 +2124,7 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
         if drop_count is None or drop_count > len(thinker_chunks):
             return thinker_chunks, assistant_token_ids, ""
 
-        # 中文说明：vLLM perf_v2 会消费 thinker 开头的 <voice_style> 标签，
+        # 中文说明：Qwen3.5 会消费 thinker 开头的 <voice_style> 标签，
         # 并把标签 token 从 talker 文本里过滤掉。这里在完整 prefill 阶段做
         # 非流式等价处理，确保 token、embed、hidden 三者仍严格按 chunk 对齐。
         return (
@@ -2213,6 +2221,7 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
             thinker_hidden=thinker_hidden,
             thinker_input_ids=thinker_input_ids,
             multimodal_mask=multimodal_mask,
+            assistant_token_count=int(assistant_token_ids.numel()),
             text_projection=self._model.text_projection,
             hidden_projection=self._model.hidden_projection,
             codec_embed_fn=self._model.get_input_embeddings(),
@@ -2280,8 +2289,8 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
             ),
             "tts_pad_embed": tts_pad_embed[0].detach(),
             "tts_eos_embed": tts_eos_embed[0].detach(),
-            # 中文说明：vLLM Qwen3.5 talker 使用 prompt_embeds +
-            # multi_modal_data=None。这里不能把 thinker 的原始 grid 继续传给
+            # 中文说明：Qwen3.5 talker 使用 prompt_embeds。这里不能把
+            # thinker 的原始 grid 继续传给
             # talker 算 M-RoPE；尤其在 MM token 下采样后会造成长度错配。
             "prompt_model_inputs": {},
         }
@@ -2293,6 +2302,7 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
         thinker_hidden: torch.Tensor,
         thinker_input_ids: torch.Tensor,
         multimodal_mask: torch.Tensor,
+        assistant_token_count: int | None,
         text_projection,
         hidden_projection,
         codec_embed_fn,
@@ -2347,12 +2357,37 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
             elif seg["role"] == "assistant":
                 if last_assistant_idx is not None and seg_idx != last_assistant_idx:
                     continue
+                generated_count = (
+                    max(0, int(assistant_token_count))
+                    if assistant_token_count is not None
+                    else None
+                )
                 if (
                     im_end_token_id is not None
                     and seg_embed.shape[0] > 0
                     and int(thinker_input_ids[end - 1].item()) == im_end_token_id
                 ):
                     seg_embed = seg_embed[:-1]
+                    if generated_count is not None:
+                        generated_count = max(0, generated_count - 1)
+                if generated_count is not None:
+                    # Qwen3.5 chat templates may append static assistant prompt
+                    # suffixes such as "<think>\n\n</think>\n\n" after the
+                    # role prefix. Those prompt-only suffix tokens are not
+                    # spoken text; keeping them makes code2wav speak a
+                    # hallucinated word before the actual response.
+                    role_rows = min(3, int(seg_embed.shape[0]))
+                    available_generated = max(0, int(seg_embed.shape[0]) - role_rows)
+                    generated_count = min(generated_count, available_generated)
+                    generated_embed = (
+                        seg_embed[-generated_count:]
+                        if generated_count > 0
+                        else seg_embed.new_empty((0, seg_embed.shape[-1]))
+                    )
+                    seg_embed = torch.cat(
+                        [seg_embed[:role_rows], generated_embed],
+                        dim=0,
+                    )
                 assistant_result = _build_qwen35_assistant_part(
                     assistant_embed=seg_embed,
                     assistant_instruct_embed=assistant_instruct_embed,
@@ -2435,7 +2470,7 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
             dtype=selected_embed.dtype,
         )
         if selected_mask.any():
-            # 中文说明：Qwen3.5 vLLM 会等距采样过长 MM hidden，避免长视频
+            # 中文说明：Qwen3.5 会等距采样过长 MM hidden，避免长视频
             # 把 talker prefill 撑爆；文本和 role token 保持原顺序不裁剪。
             output[selected_mask] = hidden_projection(selected_hidden[selected_mask])
         text_mask = ~selected_mask
@@ -2502,8 +2537,7 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
             for candidate in _language_key_candidates(language):
                 mapped = self._talker_language_id.get(candidate)
                 if mapped is not None:
-                    # 中文说明：兼容 vLLM perf_v2 的
-                    # translation_options.target_lang，统一映射到 talker
+                    # 中文说明：translation_options.target_lang 统一映射到 talker
                     # language token，避免翻译请求只出文本不带目标语音控制。
                     return int(mapped)
         return None
@@ -2526,7 +2560,7 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
             mapped = self._talker_assistant_prompt_id_mapping.get(instruction)
             if mapped is not None:
                 # 中文说明：映射来自 Qwen3.5 config 的
-                # talker_assistant_prompt_id_mapping，对齐 vLLM voice_style。
+                # talker_assistant_prompt_id_mapping，对齐 voice_style。
                 return list(mapped)
         return []
 
@@ -2573,8 +2607,8 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
 
         voice_name = _strip_voice_control_suffix(voice_name)
         if not voice_name:
-            # 中文说明：vLLM Qwen3.5 里纯 prefix_caching 会跳过
-            # code2wav，但 talker 仍使用默认 speaker 构造可复用前缀。
+            # 中文说明：纯 prefix_caching 会跳过 code2wav，但 talker
+            # 仍使用默认 speaker 构造可复用前缀。
             return self._default_voice_code()
         if voice_name == "default":
             return self._default_voice_code()
@@ -2593,7 +2627,7 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
         for speaker_key in self._voice_map.values():
             if not self._speaker_map or speaker_key in self._speaker_map:
                 return speaker_key
-        # 中文说明：对齐 vLLM Qwen3.5 默认音色选择。多语种模型优先 Tina，
+        # 中文说明：Qwen3.5 默认音色选择：多语种模型优先 Tina，
         # 方言模型常见 Sunny；都不存在时退到 speaker_map 的第一个有效项。
         for voice_name in ("tina", "sunny"):
             speaker_key = _VOICE_TO_SPK_MAPPING[voice_name]
@@ -2644,7 +2678,7 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
 
     def _build_speaker_prefix(self, params: dict[str, Any]) -> torch.Tensor | None:
         if _should_ignore_voice(params):
-            # 中文说明：对齐 vLLM _ignore_voice(None/null)；这类请求不注入
+            # 中文说明：voice 为 None/null 时不注入
             # speaker codec prefix，避免把“无音色”误当 speaker_id=0。
             return None
         speaker_name, speaker_id = self._resolve_speaker_name_and_id(params)
@@ -2756,8 +2790,8 @@ def make_talker_scheduler_adapters(
             nested_key="talker_params",
             prefix="talker",
             defaults={
-                # 中文说明：沿用 vLLM perf_v2 Qwen3.5 server 的稳态 talker
-                # 采样默认值；audio-output 请求默认 talker max_tokens=2048。
+                # 中文说明：沿用 Qwen3.5 稳态 talker 采样默认值；
+                # audio-output 请求默认 talker max_tokens=2048。
                 # 请求级 talker_max_tokens/talker_params.max_tokens 仍可显式覆盖。
                 "max_new_tokens": 2048,
                 "temperature": 0.9,
@@ -2801,8 +2835,8 @@ def make_talker_scheduler_adapters(
                 nested_key="subtalker_params",
                 prefix="subtalker",
                 defaults={
-                    # 中文说明：对齐 vLLM v1/spec_decode/code_predictor.py 的
-                    # residual codec 采样默认值。不能复用主请求的贪心/低
+                    # 中文说明：residual codec 使用独立采样默认值。不能复用
+                    # 主请求的贪心/低
                     # top-k 配置，否则 15 个 residual 声码本会坍缩成噪音。
                     "max_new_tokens": 0,
                     "temperature": 0.9,
@@ -2830,7 +2864,7 @@ def make_talker_scheduler_adapters(
         if hasattr(req_data, "req"):
             req_data.req._qwen35_subtalker_sampling_params = subtalker_sampling
             req_data.subtalker_sampling_params = subtalker_sampling
-            req_data.talker_decode_input_mode = "qwen35_vllm"
+            req_data.talker_decode_input_mode = "qwen35_external"
             feedback_stride = _qwen35_talker_text_feedback_stride()
             req_data.talker_text_feedback_stride = feedback_stride
             req_data.talker_text_feedback_countdown = feedback_stride

@@ -20,12 +20,15 @@ server entrypoint is:
 examples/run_qwen3_5_omni_speech_server.py
 ```
 
-For the current two-GPU debug layout:
+For the current two-GPU layout:
 
 - thinker/audio/image stages use GPU 0
 - talker/code2wav stages use GPU 1
-- code2wav torch.compile is disabled for faster debug startup
-- code2wav uses 4-codec streaming chunks to match vLLM Qwen3.5 50 Hz output
+- code2wav torch.compile is disabled for faster startup while reviewing
+- code2wav uses 4-codec streaming chunks to match the Qwen3.5 50 Hz output
+- prefix/radix cache stays enabled by default; media pad tokens follow Qwen3's
+  stable media-key hashing, and Qwen3.5 uses Mamba-aware radix cache for safe
+  hybrid-SSM prefix hits
 
 Use the wrapper:
 
@@ -36,74 +39,48 @@ bash scripts/launch_qwen35_omni_sglang_server.sh
 Equivalent important arguments:
 
 ```bash
-python examples/run_qwen3_5_omni_speech_server.py \
+python -m sglang_omni.cli serve \
   --model-path /myapp/models/qwen3_5_omni_23b_final_multilingual_all_voice_bf16_0315 \
   --model-name qwen3_5-omni \
   --host 127.0.0.1 \
   --port 8161 \
   --voice-type m02 \
-  --max-tokens 256 \
+  --max-tokens 512 \
   --seed 3408 \
-  --gpu-thinker 0 \
-  --gpu-talker 1 \
-  --gpu-code2wav 1 \
+  --thinker-gpus 0 \
+  --talker-gpu 1 \
+  --code2wav-gpu 1 \
   --thinker-max-seq-len 192000 \
   --code2wav-model-path /myapp/models/qwen3_5_omni_23b_final_multilingual_all_voice_bf16_0315/qwen3_5_omni_codec_decode_online_0306 \
+  --prefix-caching on \
   --no-code2wav-torch-compile
 ```
 
-## vLLM Startup
-
-vLLM is not kept as a long-running server in these tests. The alignment driver
-starts a Docker worker, builds `OmniLLMEngine`, runs one request, writes
-artifacts, then exits.
-
-The worker is launched by:
-
-```bash
-scripts/qwen35_omni_alignment.py --backend vllm
-```
-
-The compare wrapper passes the vLLM runtime flags used during alignment:
-
-- `VLLM_OMNI_TALKER_REUSE_THINKER_PREPROCESS=True`
-- `VLLM_OMNI_TALKER_USE_EXTERNAL_EMBEDDING=True`
-- `VLLM_OMNI_USE_V35_RTC_PROMPT_STYLE=True`
-- `VLLM_OMNI_REALTIME_MM_METADATA=True`
-- `VLLM_OMNI_T2C_USE_ZMQ=False`
-- `VLLM_OMNI_T2T_USE_ZMQ=False`
-- `VLLM_ENABLE_TORCH_COMPILE=False`
-- `--disable-vllm-mtp`
-- `--vllm-enforce-eager`
-- `--vllm-default-talker-params`
-
 ## Audio-Only Test
 
-The audio-only test uses:
+The current audio-only smoke test uses:
 
 - System prompt: `你是一个智能手机女助手，用温柔的声音和用户聊天`
 - User prompt: empty
 - User content: audio only
-- Input audio text: `今天我心情不好，请给我讲个笑话。`
+- Input audio: `/myapp/data/hzeskbz6.wav`
+- Input audio ASR: `What are the names of some famous actors that started their careers on Broadway?`
 
 Run:
 
 ```bash
-bash scripts/run_qwen35_omni_audio_only_compare.sh
+cd /myapp/sglang-omni
+OUT_DIR=/tmp/qwen35_user_hzeskbz6 \
+AUDIO_PATH=/myapp/data/hzeskbz6.wav \
+bash examples/request_qwen35_omni_audio_only.sh
 ```
 
-The wrapper generates:
+The request script generates:
 
-- `results/qwen35_audio_only_joke_m02/inputs/user_audio.wav`
-- `results/qwen35_audio_only_joke_m02/input_asr.json`
-- `results/qwen35_audio_only_joke_m02/compare/vllm_output.wav`
-- `results/qwen35_audio_only_joke_m02/compare/sglang_output.wav`
-- `results/qwen35_audio_only_joke_m02/compare/alignment_summary.json`
-- `results/qwen35_audio_only_joke_m02/compare/alignment_report.md`
-
-The wrapper allows alignment failure by default because open-ended joke
-responses can be valid but wording/length can diverge. Set
-`ALLOW_ALIGNMENT_FAILURE=0` if a nonzero alignment decision should fail CI.
+- `/tmp/qwen35_user_hzeskbz6/request.json`
+- `/tmp/qwen35_user_hzeskbz6/response.json`
+- `/tmp/qwen35_user_hzeskbz6/output.txt`
+- `/tmp/qwen35_user_hzeskbz6/output.wav`
 
 ## Quick Test Commands
 
@@ -129,11 +106,9 @@ bash scripts/validate_qwen35_omni.sh
 
 ## What To Inspect
 
-For each compare run, check:
+For each request run, check:
 
-- `alignment_summary.json`: machine-readable inputs, texts, durations, ASR
-- `alignment_report.md`: human-readable summary
-- `vllm_docker_worker.log`: vLLM engine startup and talker/code2wav traces
-- `sglang_server.log`: SGLang stage startup and decode progress
-- `vllm_output.wav` and `sglang_output.wav`: listen to the generated speech
-
+- `request.json`: exact OpenAI-compatible request body
+- `response.json`: raw server response
+- `output.txt`: assistant text
+- `output.wav`: assistant speech

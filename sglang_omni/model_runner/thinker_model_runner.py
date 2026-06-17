@@ -99,6 +99,64 @@ class ThinkerModelRunner(ModelRunner):
     # Multimodal embedding injection (~160 lines, from SGLangModelRunner)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _request_prefix_len(req: Any, forward_batch: Any, req_index: int) -> int:
+        prefix_indices = getattr(req, "prefix_indices", None)
+        if prefix_indices is not None:
+            return len(prefix_indices)
+
+        prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        if prefix_lens is not None and req_index < len(prefix_lens):
+            return int(prefix_lens[req_index])
+
+        return 0
+
+    @staticmethod
+    def _count_prefix_tokens(req: Any, match_ids: set[int], prefix_len: int) -> int:
+        if prefix_len <= 0 or not match_ids:
+            return 0
+        origin_input_ids = getattr(req, "origin_input_ids", None) or []
+        return sum(
+            1
+            for token_id in origin_input_ids[:prefix_len]
+            if int(token_id) in match_ids
+        )
+
+    def _initial_omni_consumed(
+        self,
+        req: Any,
+        omni_inputs: dict[str, Any],
+        pad_values: dict[str, Any],
+        prefix_len: int,
+    ) -> dict[str, int]:
+        consumed: dict[str, int] = {}
+
+        for modality, token_id in [
+            ("image", self._image_token_id),
+            ("video", self._video_token_id),
+            ("audio", self._audio_token_id),
+        ]:
+            if omni_inputs.get(f"{modality}_embeds") is None:
+                continue
+            match_id = int(pad_values.get(modality, token_id))
+            prefix_count = self._count_prefix_tokens(req, {match_id}, prefix_len)
+            if prefix_count:
+                consumed[modality] = prefix_count
+
+        has_flat_deepstack = omni_inputs.get("deepstack_visual_embeds") is not None
+        if has_flat_deepstack:
+            visual_ids = {
+                int(pad_values.get("image", self._image_token_id)),
+                int(pad_values.get("video", self._video_token_id)),
+            }
+            visual_prefix_count = self._count_prefix_tokens(
+                req, visual_ids, prefix_len
+            )
+            if visual_prefix_count:
+                consumed["_visual"] = visual_prefix_count
+
+        return consumed
+
     def _inject_multimodal_embeds(
         self, forward_batch: Any, schedule_batch: Any
     ) -> tuple[torch.Tensor | None, list | None, torch.Tensor | None] | None:
@@ -134,9 +192,15 @@ class ThinkerModelRunner(ModelRunner):
             start = offsets[i]
             end = start + extend_lens[i]
             req_input_ids = forward_batch.input_ids[start:end]
-            consumed = req._omni_consumed or {}
             chunk_offsets: dict[str, tuple[int, int]] = {}
             pad_values = omni_inputs.get("pad_values", {})
+            if req._omni_consumed is None:
+                prefix_len = self._request_prefix_len(req, forward_batch, i)
+                consumed = self._initial_omni_consumed(
+                    req, omni_inputs, pad_values, prefix_len
+                )
+            else:
+                consumed = dict(req._omni_consumed)
 
             for modality, token_id in [
                 ("image", image_token_id),

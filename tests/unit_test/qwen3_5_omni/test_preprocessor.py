@@ -262,7 +262,7 @@ def test_qwen_preprocessor_distinguishes_audio_output_config_from_audio_input():
     )
 
 
-def test_qwen_preprocessor_accepts_rendered_vllm_prompt():
+def test_qwen_preprocessor_accepts_rendered_prompt():
     assert (
         qwen3_preprocessor._request_raw_prompt_text({"prompt": "<rendered>"})
         == "<rendered>"
@@ -282,7 +282,7 @@ def test_qwen_preprocessor_accepts_rendered_vllm_prompt():
     )
 
 
-def test_qwen_preprocessor_accepts_vllm_prompt_token_ids():
+def test_qwen_preprocessor_accepts_prompt_token_ids():
     token_ids = qwen3_preprocessor._request_prompt_token_ids(
         {"prompt_token_ids": [1, 2, 3]}
     )
@@ -295,7 +295,7 @@ def test_qwen_preprocessor_accepts_vllm_prompt_token_ids():
     assert qwen3_preprocessor._request_prompt_token_ids({"prompt": "text"}) is None
 
 
-def test_qwen35_preprocessor_uses_vllm_raw_prompt_without_template():
+def test_qwen35_preprocessor_uses_raw_prompt_without_template():
     obj = _new_preprocessor_for_unit()
     fake_processor = obj.processor
     payload = StagePayload(
@@ -318,7 +318,7 @@ def test_qwen35_preprocessor_uses_vllm_raw_prompt_without_template():
     assert torch.equal(prompt["input_ids"], torch.tensor([101, 102]))
 
 
-def test_qwen35_preprocessor_uses_vllm_prompt_token_ids_over_hf_ids():
+def test_qwen35_preprocessor_uses_prompt_token_ids_over_hf_ids():
     obj = _new_preprocessor_for_unit()
     fake_processor = obj.processor
     fake_processor.hf_input_ids = torch.tensor([[101, 102]], dtype=torch.long)
@@ -328,11 +328,8 @@ def test_qwen35_preprocessor_uses_vllm_prompt_token_ids_over_hf_ids():
         request=OmniRequest(
             inputs={
                 "prompt_token_ids": [7, 8, 9],
-                "multi_modal_data": {"audio": audio},
-                "multi_modal_uuids": {"audio": ["audio-hash-1"]},
-                "mm_processor_kwargs": {
-                    "audio_kwargs": {"timestamp_interval": 15},
-                },
+                "audios": [audio],
+                "audio_timestamp_interval": 15,
             },
             params={"max_tokens": 8},
         ),
@@ -350,51 +347,6 @@ def test_qwen35_preprocessor_uses_vllm_prompt_token_ids_over_hf_ids():
     assert torch.equal(prompt["input_ids"], torch.tensor([7, 8, 9]))
     assert torch.equal(prompt["attention_mask"], torch.ones(3, dtype=torch.long))
     assert result.data["mm_inputs"]["audio"]["audio_feature_lengths"].tolist() == [3]
-    assert result.data["encoder_inputs"]["audio_encoder"]["cache_key"].startswith(
-        'vllm_uuid:audio:["audio-hash-1"]'
-    )
-
-
-def test_qwen35_preprocessor_builds_vllm_uuid_cache_keys():
-    inputs = {
-        "multi_modal_uuids": [
-            {"video": "video-hash-1"},
-            {"videos": ["video-hash-2"]},
-        ]
-    }
-
-    assert preprocessor._vllm_uuid_cache_key(inputs, "video") == (
-        'vllm_uuid:video:["video-hash-1","video-hash-2"]'
-    )
-    assert preprocessor._vllm_uuid_cache_key(
-        inputs,
-        "video",
-        expected_count=2,
-    ) == 'vllm_uuid:video:["video-hash-1","video-hash-2"]'
-    assert (
-        preprocessor._vllm_uuid_cache_key(inputs, "video", expected_count=3)
-        is None
-    )
-    assert preprocessor._vllm_uuid_cache_key(inputs, "audio") is None
-
-
-def test_qwen35_preprocessor_falls_back_when_vllm_uuid_count_mismatches():
-    obj = _new_preprocessor_for_unit()
-    raw_videos = ["clip-a.mp4", "clip-b.mp4"]
-    request_inputs = {
-        "multi_modal_uuids": {
-            "video": ["video-hash-a"],
-        }
-    }
-
-    cache_key = obj._media_cache_key_for_request(
-        request_inputs=request_inputs,
-        modality="video",
-        raw_value=raw_videos,
-        compute_cache_key=lambda value: "raw:" + ",".join(value),
-    )
-
-    assert cache_key == "raw:clip-a.mp4,clip-b.mp4"
 
 
 def test_qwen35_preprocessor_derives_video_total_pixels_for_override(monkeypatch):
@@ -417,7 +369,7 @@ def test_qwen35_preprocessor_derives_video_total_pixels_for_override(monkeypatch
         request=OmniRequest(
             inputs={
                 "prompt": "watch",
-                "multi_modal_data": {"video": "clip.mp4"},
+                "videos": ["clip.mp4"],
             },
             params={"max_tokens": 8},
         ),
@@ -458,17 +410,15 @@ def test_qwen35_preprocessor_limit_mm_rejects_openai_content_parts():
         asyncio.run(obj._call_impl(payload))
 
 
-def test_qwen35_preprocessor_limit_mm_rejects_vllm_multimodal_data():
+def test_qwen35_preprocessor_limit_mm_rejects_top_level_video_data():
     obj = _new_preprocessor_for_unit()
     obj.limit_mm_per_prompt = {"video": 1}
     payload = StagePayload(
-        request_id="req-limit-vllm",
+        request_id="req-limit-video",
         request=OmniRequest(
             inputs={
                 "prompt": "watch",
-                "multi_modal_data": {
-                    "video": ["a.mp4", "b.mp4"],
-                },
+                "videos": ["a.mp4", "b.mp4"],
             },
             params={"max_tokens": 8},
         ),
@@ -1472,121 +1422,6 @@ def test_qwen35_preprocessor_wraps_openai_message_list_for_params():
     assert normalized["use_audio_in_video"] is True
 
 
-def test_qwen35_preprocessor_lifts_vllm_text_prompt_multimodal_fields():
-    inputs = {
-        "prompt": "<|im_start|>user\n<|vision_start|><|video_pad|>",
-        "multi_modal_data": {
-            "image": ["frame.png"],
-            "video": ["clip_tensor"],
-            "audio": ["video_audio"],
-        },
-        "mm_processor_kwargs": {
-            "fps": [2.0],
-            "use_audio_in_video": [True],
-            "dependent_audio": [0],
-            "videos_kwargs": {
-                "max_frames": 128,
-                "return_metadata": True,
-                "video_metadata": [{"fps": 2.0, "frames": 8}],
-            },
-            "images_kwargs": {"max_pixels": 401408},
-            "audio_kwargs": {"timestamp_interval": 15},
-        },
-        "multi_modal_uuids": {
-            "video": ["video-hash-1"],
-            "audio": ["audio-hash-1"],
-        },
-    }
-
-    normalized = preprocessor._normalize_vllm_multimodal_inputs(inputs)
-
-    assert normalized is not inputs
-    assert normalized["prompt"] == inputs["prompt"]
-    assert "messages" not in normalized
-    assert normalized["images"] == ["frame.png"]
-    assert normalized["videos"] == ["clip_tensor"]
-    assert normalized["audios"] == ["video_audio"]
-    assert normalized["video_fps"] == 2.0
-    assert normalized["video_max_frames"] == 128
-    assert normalized["image_max_pixels"] == 401408
-    assert normalized["audio_timestamp_interval"] == 15
-    assert normalized["use_audio_in_video"] == [True]
-    assert normalized["dependent_audio"] == [0]
-    assert normalized["return_video_metadata"] is True
-    assert normalized["video_metadata"] == [{"fps": 2.0, "frames": 8}]
-    assert normalized["multi_modal_uuids"] == {
-        "video": ["video-hash-1"],
-        "audio": ["audio-hash-1"],
-    }
-
-
-def test_qwen35_preprocessor_lifts_vllm_list_multimodal_fields():
-    inputs = {
-        "prompt": "<rendered>",
-        "multi_modal_data": [
-            {"image": ["frame-a.png"]},
-            {
-                "video": "clip.mp4",
-                "audio": ["speech.wav"],
-            },
-        ],
-        "mm_processor_kwargs": [
-            {"fps": [2.0]},
-            {
-                "videos_kwargs": {
-                    "max_frames": 128,
-                    "return_metadata": True,
-                },
-                "audio_kwargs": {"timestamp_interval": 15},
-            },
-        ],
-    }
-
-    normalized = preprocessor._normalize_vllm_multimodal_inputs(inputs)
-
-    assert normalized is not inputs
-    assert normalized["images"] == ["frame-a.png"]
-    assert normalized["videos"] == ["clip.mp4"]
-    assert normalized["audios"] == ["speech.wav"]
-    assert normalized["video_fps"] == 2.0
-    assert normalized["video_max_frames"] == 128
-    assert normalized["return_video_metadata"] is True
-    assert normalized["audio_timestamp_interval"] == 15
-
-
-def test_qwen35_preprocessor_vllm_audio_data_not_shadowed_by_output_config():
-    inputs = {
-        "prompt": "<rendered>",
-        "audio": {"voice": "Cherry", "format": "wav"},
-        "multi_modal_data": {"audio": ["speech.wav"]},
-    }
-
-    normalized = preprocessor._normalize_vllm_multimodal_inputs(inputs)
-    normalized = preprocessor._normalize_request_level_media_aliases(normalized)
-
-    assert normalized["audio"] == {"voice": "Cherry", "format": "wav"}
-    assert normalized["audios"] == ["speech.wav"]
-
-
-def test_qwen35_preprocessor_keeps_top_level_values_over_vllm_kwargs():
-    inputs = {
-        "prompt": "rendered",
-        "videos": ["top.mp4"],
-        "video_fps": 4,
-        "multi_modal_data": {"video": ["from_vllm.mp4"]},
-        "mm_processor_kwargs": {
-            "fps": 2,
-            "videos_kwargs": {"max_frames": 128},
-        },
-    }
-
-    normalized = preprocessor._normalize_vllm_multimodal_inputs(inputs)
-
-    assert normalized["videos"] == ["top.mp4"]
-    assert normalized["video_fps"] == 4
-    assert normalized["video_max_frames"] == 128
-
-
 def test_qwen35_preprocessor_passes_next_audio_kwargs():
     obj = object.__new__(Qwen35OmniPreprocessor)
     obj._audio_processor_defaults = {
@@ -1655,7 +1490,7 @@ def test_qwen35_preprocessor_requests_video_metadata_for_video_inputs():
     assert processor_kwargs["videos_kwargs"] == {"return_metadata": True}
 
 
-def test_qwen35_preprocessor_passes_vllm_video_metadata_kwargs():
+def test_qwen35_preprocessor_passes_video_metadata_kwargs():
     obj = object.__new__(Qwen35OmniPreprocessor)
     obj._audio_processor_defaults = {}
 
@@ -1956,7 +1791,7 @@ def test_qwen35_preprocessor_preserves_per_video_audio_flags_for_processor():
     assert obj._processor_use_audio_in_video_value("false") is False
 
 
-def test_qwen35_preprocessor_marks_vllm_dependent_audio_indices():
+def test_qwen35_preprocessor_marks_dependent_audio_indices():
     obj = object.__new__(Qwen35OmniPreprocessor)
 
     audio_is_dependent = obj._audio_is_dependent_for_request(

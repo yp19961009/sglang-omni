@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3.5-Omni Code2Wav scheduler.
 
-Qwen3.5-Omni uses the Qwen3OmniNext DAC/codec decoder path from the vLLM
-perf_v2 branch. If that decoder is available, this module plugs it into
-sglang-omni's existing streaming Code2WavScheduler. Otherwise the stage remains
-importable and fails clearly when audio output is requested.
+Qwen3.5-Omni uses the Qwen3OmniNext DAC/codec decoder path from the Qwen reference
+perf_v2 branch. The decoder is vendored in sglang-omni and plugs into the
+existing streaming Code2WavScheduler. If it cannot be imported, the stage
+remains importable and fails clearly when audio output is requested.
 """
 
 from __future__ import annotations
 
-import importlib
 import inspect
 import json
 import logging
@@ -33,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 QWEN35_CODEC_EOS_TOKEN_ID = 2150
 QWEN35_CODE2WAV_SAMPLE_RATE = 24000
-# 中文说明：对齐 vLLM Qwen3.5 50Hz code2wav 的 4-codec 增量输出切块；
+# 中文说明：对齐 Qwen reference Qwen3.5 50Hz code2wav 的 4-codec 增量输出切块；
 # 用户仍可通过 --code2wav-stream-chunk-size 或 YAML factory_args 覆盖。
 QWEN35_CODE2WAV_STREAM_CHUNK_SIZE = 4
 QWEN35_CODE2WAV_DYNAMIC_CHUNK_SIZES = (2, 4, 6, 8)
@@ -59,7 +58,7 @@ _MISSING_CODE2WAV_MESSAGE = (
 )
 
 _CODE2WAV_DIR_NAMES = (
-    # 中文说明：vLLM perf_v2/HF reference 里出现过 0306 和 0226
+    # 中文说明：HF reference 里出现过 0306 和 0226
     # 两版在线解码器目录名；优先新目录，但保留旧目录兼容。
     "qwen3_5_omni_codec_decode_online_0306",
     "qwen3_5_omni_codec_decode_online_0226",
@@ -126,18 +125,13 @@ class Code2WavFiles:
 
 
 def _load_next_dac_loader():
-    for module_name in (
-        "sglang_omni.models.qwen3_5_omni.components.qwen3_omni_next_codec_decoder",
-        "vllm.model_executor.models.qwen3_omni_next_codec_decoder",
-    ):
-        try:
-            module = importlib.import_module(module_name)
-        except ImportError:
-            continue
-        loader = getattr(module, "load_qwen3_omni_next_dac_from_config", None)
-        if loader is not None:
-            return loader
-    return None
+    try:
+        from sglang_omni.models.qwen3_5_omni.components.qwen3_omni_next_codec_decoder import (
+            load_qwen3_omni_next_dac_from_config,
+        )
+    except ImportError:
+        return None
+    return load_qwen3_omni_next_dac_from_config
 
 
 def _iter_code2wav_candidate_dirs(model_path: str) -> tuple[Path, ...]:
@@ -208,7 +202,7 @@ def _missing_code2wav_message(
     if loader_available is False:
         lines.append(
             "Next DAC loader was not importable from the local Qwen3.5 "
-            "implementation or the vLLM perf_v2 module."
+            "implementation or the reference module."
         )
     # 中文说明：真实 checkpoint 目录不完整时，这条错误会直接列出查找路径和
     # 期望文件名，避免只看到 Missing scheduler 后还要回源码里反查布局。
@@ -505,7 +499,7 @@ def _load_code2wav_voice_types(model_path: str) -> tuple[str, ...]:
         normalized = str(key).strip()
         if not normalized:
             continue
-        # 中文说明：vLLM perf_v2 会把 spk_dict.pt 里的展示名映射成
+        # 中文说明：reference 会把 spk_dict.pt 里的展示名映射成
         # code2wav 内部 speaker id；这里保留同一规则，避免 Cherry 等
         # 用户可见音色在 code2wav 阶段被误判为未知。
         voice_types.append(_CODE2WAV_VOICE_TYPE_MAPPING.get(normalized.lower(), normalized))
@@ -616,7 +610,7 @@ def _filter_supported_loader_kwargs(
 
 
 class Qwen35Code2WavScheduler(Code2WavScheduler):
-    """Qwen3.5 code2wav scheduler with vLLM-style prefix-cache skip."""
+    """Qwen3.5 code2wav scheduler with Qwen reference-style prefix-cache skip."""
 
     def __init__(
         self,
@@ -665,7 +659,7 @@ class Qwen35Code2WavScheduler(Code2WavScheduler):
         start: int,
         end: int,
     ) -> "np.ndarray":
-        # Qwen3.5's Next DAC path follows vLLM's omni3_5_code2wav_engine:
+        # Qwen3.5's Next DAC path follows the reference omni3_5_code2wav_engine:
         # stack codec rows as [B, T, K], pad T to the decoder alignment, then
         # slice only the newly valid chunk from the decoded waveform.
         import numpy as np
@@ -901,7 +895,7 @@ def _apply_code2wav_torch_compile(
             "Qwen3.5 code2wav has no known torch.compile entry point; "
             "leaving model unchanged"
         )
-    # 中文说明：对齐 vLLM perf_v2 的 compile 优先级。真实模型如果暴露
+    # 中文说明：对齐 reference 的 compile 优先级。真实模型如果暴露
     # _decode_inner 就只编译内部热路径；否则优先走模型自带开关，最后才
     # 编译 decode 方法。Qwen3.5 默认开启，用户可用 CLI/YAML 显式关闭。
     return model
@@ -997,7 +991,7 @@ def _apply_code2wav_runtime_options(
     frequency: str | None = None,
     dit_quant: str | None = None,
 ) -> Any:
-    """Apply vLLM-compatible Code2Wav runtime knobs when the model supports them."""
+    """Apply Qwen3.5 Code2Wav runtime knobs when the model supports them."""
 
     if odeint_method is not None and not _apply_code2wav_odeint_method(
         model,
@@ -1040,7 +1034,7 @@ def _apply_code2wav_runtime_options(
             "ignoring requested dit_quant=%s",
             dit_quant,
         )
-    # 中文说明：这些参数来自 vLLM perf_v2 的 code2wav DIT 路线。当前内置
+    # 中文说明：这些参数来自 reference 的 code2wav DIT 路线。当前内置
     # Next DAC 如果没有对应属性就安全忽略；后续接入真实 DIT/在线 decoder
     # 时，同名 setter/属性会自动生效。
     return model

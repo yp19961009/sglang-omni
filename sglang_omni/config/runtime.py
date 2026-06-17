@@ -73,7 +73,7 @@ def resolve_stage_factory_args(
     runtime_overrides = global_cfg.runtime_overrides.get(stage_cfg.name, {})
     _validate_runtime_sources(stage_cfg, args, runtime_overrides)
     _merge_factory_arg_overrides(args, runtime_overrides)
-    _apply_typed_runtime_args(args, stage_cfg)
+    _apply_typed_runtime_args(args, stage_cfg) # 把通用 runtime 配置应用到当前 stage 的 factory kwargs 上
 
     factory = import_string(stage_cfg.factory)
     sig = inspect.signature(factory)

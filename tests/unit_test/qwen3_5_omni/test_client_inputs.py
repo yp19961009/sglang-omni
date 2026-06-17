@@ -166,7 +166,7 @@ def test_client_extract_inputs_preserves_chat_template_tools_metadata():
     }
 
 
-def test_client_extract_inputs_preserves_vllm_singular_media_aliases():
+def test_client_extract_inputs_preserves_singular_media_aliases():
     request = GenerateRequest(
         prompt="<rendered qwen3.5 prompt>",
         metadata={
@@ -289,7 +289,7 @@ def test_client_extract_inputs_accepts_array_media_metadata():
     assert inputs["audio_target_sr"] == 16000
 
 
-def test_client_extract_inputs_preserves_vllm_audio_sampling_rate_alias():
+def test_client_extract_inputs_preserves_audio_sampling_rate_alias():
     request = GenerateRequest(
         prompt="<rendered qwen3.5 prompt>",
         metadata={
@@ -304,30 +304,6 @@ def test_client_extract_inputs_preserves_vllm_audio_sampling_rate_alias():
         "prompt": "<rendered qwen3.5 prompt>",
         "audios": ["speech.wav"],
         "sampling_rate": 16000,
-    }
-
-
-def test_client_extract_inputs_preserves_vllm_text_prompt_metadata():
-    request = GenerateRequest(
-        prompt="<rendered qwen3.5 prompt>",
-        metadata={
-            "multi_modal_data": {"audio": ["speech.wav"]},
-            "mm_processor_kwargs": {
-                "audio_kwargs": {"timestamp_interval": 15},
-            },
-            "multi_modal_uuids": {"audio": ["audio-hash-1"]},
-        },
-    )
-
-    inputs = _extract_inputs(request)
-
-    assert inputs == {
-        "prompt": "<rendered qwen3.5 prompt>",
-        "multi_modal_data": {"audio": ["speech.wav"]},
-        "mm_processor_kwargs": {
-            "audio_kwargs": {"timestamp_interval": 15},
-        },
-        "multi_modal_uuids": {"audio": ["audio-hash-1"]},
     }
 
 

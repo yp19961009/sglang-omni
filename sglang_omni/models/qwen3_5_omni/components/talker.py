@@ -101,7 +101,7 @@ def _resolve_talker_quant_config(
         return quant_config
 
     # 中文说明：Qwen3.5 root checkpoint 可能带 root-level quant_config，
-    # 但 talker 子模型未必量化。vLLM perf_v2 会只在 talker text_config
+    # 但 talker 子模型未必量化。reference 会只在 talker text_config
     # 自己声明量化/压缩时保留 quant_config；这里保持一致，避免 root
     # quant 误套到 talker 权重映射后的子模型上。
     return None
@@ -148,7 +148,7 @@ def _normalize_speaker_codec_embeddings(
     if loaded_weight.shape[2] == num_code_groups:
         return loaded_weight
     if loaded_weight.shape[1] == num_code_groups:
-        # 中文说明：vLLM perf_v2 的原始 checkpoint 存的是 [S,K,T]，
+        # 中文说明：reference 的原始 checkpoint 存的是 [S,K,T]，
         # engine 加载时转成运行时使用的 [S,T,K]。这里同步这个约定，
         # 避免 speaker prompt 的时间维和 codec group 维被反着解释。
         return loaded_weight.transpose(1, 2).contiguous()
@@ -160,14 +160,14 @@ def _normalize_speaker_codec_embeddings(
 
 
 def _normalize_weight_name(name: str) -> str | None:
-    """Map HF/vLLM Qwen3.5-Omni talker names to this wrapper's names."""
+    """Map HF Qwen3.5-Omni talker names to this wrapper's names."""
     if name.startswith(_SKIP_PREFIXES):
         return None
     if name.startswith("talker."):
         name = name[len("talker.") :]
     if name.endswith("rotary_emb.inv_freq"):
         # 中文说明：Qwen3.5 subtalker/Next 模型的 rotary inv_freq 是由
-        # config 现场计算的 buffer。不同 HF/vLLM 版本可能把它暴露在
+        # config 现场计算的 buffer。不同 HF 版本可能把它暴露在
         # state_dict 里，但它不应该作为真实权重强制加载。
         return None
 
@@ -452,7 +452,7 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
     def codec_code_embeddings(self, codes: torch.Tensor) -> torch.Tensor:
         """Embed codec groups and sum them into talker hidden rows.
 
-        中文说明：vLLM Qwen3.5 的 speaker code 使用 [T, K] 或
+        中文说明：Qwen reference Qwen3.5 的 speaker code 使用 [T, K] 或
         [B, K, T] 的多码本 codec id。第 0 组走主 talker codec embedding，
         后续 residual 组走 subtalker/code_predictor 的 codec embedding。
         """
@@ -563,7 +563,7 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
             if sub_sp is None:
                 sub_sp = getattr(data, "subtalker_sampling_params", None)
             # 中文说明：Qwen3.5 的 residual codec predictor 有自己的
-            # generation defaults（vLLM CodePredictor 默认
+            # generation defaults（Qwen reference CodePredictor 默认
             # temperature=0.9/top_k=50）。未显式传 subtalker_params 时，
             # 必须使用这些默认值；若跟主 talker 的 greedy 参数绑定，会让
             # residual codec 坍缩，code2wav 输出不可懂的噪音。

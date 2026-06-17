@@ -67,15 +67,10 @@ def _chat_completion_audio_obj(
     body: dict[str, Any],
     message: dict[str, Any],
 ) -> dict[str, Any] | None:
+    del body
     audio_obj = message.get("audio")
     if isinstance(audio_obj, dict):
         return audio_obj
-    top_level_audio = body.get("audio")
-    if isinstance(top_level_audio, dict):
-        # 中文说明：sglang-omni 使用 OpenAI-style message.audio；
-        # vLLM perf_v2 的 Qwen3.5 server 非流式响应把音频放在顶层
-        # audio。benchmark 同时兼容，方便同一套脚本横向对比。
-        return top_level_audio
     return None
 
 
@@ -136,12 +131,6 @@ def _event_text_delta(evt: dict[str, Any]) -> str | None:
 
 
 def _event_audio_obj(evt: dict[str, Any]) -> dict[str, Any] | None:
-    top_level_audio = evt.get("audio")
-    if isinstance(top_level_audio, dict) and top_level_audio.get("data"):
-        # 中文说明：vLLM perf_v2 的 Qwen3.5 streaming server 会发送
-        # object=chat.completion.audio 的顶层 audio 事件；sglang-omni
-        # 则走 choices[].delta.audio。两种都算首音频 chunk。
-        return top_level_audio
     for choice in evt.get("choices", []):
         delta = choice.get("delta") or {}
         audio = delta.get("audio")
@@ -263,15 +252,9 @@ async def _apply_chat_completion_stream_response(
             if decoded is not None:
                 wav_bytes, duration_s = decoded
                 audio_duration_s += duration_s
-                if evt.get("object") == "chat.completion.audio":
-                    # 中文说明：vLLM 顶层 audio 事件通常是完整 WAV，可保存
-                    # 给 WER；sglang-omni 的 delta.audio 则在下面按 PCM
-                    # 拼接，避免直接拼 WAV 文件头。
-                    full_audio_wav = wav_bytes
-                else:
-                    wav_chunk = _wav_chunk_payload(wav_bytes)
-                    if wav_chunk is not None:
-                        delta_audio_chunks.append(wav_chunk)
+                wav_chunk = _wav_chunk_payload(wav_bytes)
+                if wav_chunk is not None:
+                    delta_audio_chunks.append(wav_chunk)
 
         evt_usage = _event_usage(evt)
         if evt_usage:
@@ -308,8 +291,6 @@ async def _apply_chat_completion_stream_response(
             return False
         result.wav_path = wav_path
 
-    # 中文说明：streaming 下如果只有 delta audio 而没有完整顶层 WAV，
-    # 仍然可以用于性能压测；WER 需要 --skip-wer 或 vLLM 顶层完整音频事件。
     result.is_success = True
     return True
 
@@ -359,9 +340,8 @@ def make_video_send_fn(
 
         payload: dict[str, Any] = {
             "model": model_name,
-            # 中文说明：用 OpenAI content parts 同时兼容 sglang-omni 和
-            # vLLM perf_v2 的 Qwen3.5 OpenAI server；后者不会读取顶层
-            # videos/audios 字段。
+            # 中文说明：使用 OpenAI content parts，和服务端 chat
+            # completions 入口保持一致。
             "messages": [{"role": "user", "content": content_parts}],
             "modalities": modalities,
             "max_tokens": max_tokens,
@@ -370,17 +350,12 @@ def make_video_send_fn(
             "metadata": {"sample_id": sample.sample_id},
         }
         if audio_output_dir:
-            # sglang-omni honors modalities; vLLM perf_v2 server uses
-            # enable_audio_output, while offline scripts commonly use do_wave.
-            payload["enable_audio_output"] = True
-            payload["do_wave"] = True
             audio_config = {"format": audio_format}
             # 中文说明：Qwen3.5-Omni talker 支持通过 OpenAI audio 字段
             # 选择 voice/language。benchmark 只透传显式参数，默认行为仍和
             # Qwen3-Omni 旧压测一致。
             if audio_voice:
                 audio_config["voice"] = audio_voice
-                payload["voice_type"] = audio_voice
             if audio_language:
                 audio_config["language"] = audio_language
             payload["audio"] = audio_config

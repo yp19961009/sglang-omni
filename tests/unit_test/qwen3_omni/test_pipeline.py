@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import typer
+import xxhash
 
 import sglang_omni.models.qwen3_omni.stages as qwen_stages
 from sglang_omni.cli.serve import (
@@ -30,6 +31,7 @@ from sglang_omni.models.qwen3_omni.config import (
 from sglang_omni.models.qwen3_omni.merge import decode_events, merge_for_thinker
 from sglang_omni.models.qwen3_omni.payload_types import Qwen3OmniPipelineState
 from sglang_omni.models.qwen3_omni.request_builders import (
+    build_sglang_talker_request,
     build_sglang_thinker_request,
     project_preprocessing_to_mm_aggregate,
     project_talker_to_code2wav,
@@ -60,6 +62,17 @@ def _server_args_overrides(config: PipelineConfig, name: str) -> dict[str, objec
 
 def _runtime_mem_fraction_static(config, name: str) -> float | None:
     return _stage(config, name).runtime.sglang_server_args.mem_fraction_static
+
+
+def _patch_sampling_params(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "sglang.srt.sampling.sampling_params.SamplingParams.normalize",
+        lambda self, tokenizer: None,
+    )
+    monkeypatch.setattr(
+        "sglang.srt.sampling.sampling_params.SamplingParams.verify",
+        lambda self, vocab_size: None,
+    )
 
 
 def test_qwen_pipeline_config_and_state_contracts() -> None:
@@ -1035,14 +1048,7 @@ def test_qwen_sglang_request_hashes_media_tokens_without_changing_mrope_ids(
         captured["input_ids"] = input_ids.clone()
         return torch.zeros((3, input_ids.numel()), dtype=torch.long), torch.tensor(0)
 
-    monkeypatch.setattr(
-        "sglang.srt.sampling.sampling_params.SamplingParams.normalize",
-        lambda self, tokenizer: None,
-    )
-    monkeypatch.setattr(
-        "sglang.srt.sampling.sampling_params.SamplingParams.verify",
-        lambda self, vocab_size: None,
-    )
+    _patch_sampling_params(monkeypatch)
     monkeypatch.setattr(
         "sglang_omni.models.qwen3_omni.request_builders._compute_mrope_positions",
         fake_mrope,
@@ -1074,3 +1080,172 @@ def test_qwen_sglang_request_hashes_media_tokens_without_changing_mrope_ids(
     assert pad_values["audio"] >= 256
     assert int(req_data.input_ids[1]) == pad_values["audio"]
     assert captured["input_ids"].tolist() == input_ids.tolist()
+    assert req_data.req.extra_key is None
+    assert not hasattr(req_data.req, "_omni_max_prefix_cache_len")
+
+
+def test_qwen_sglang_request_can_limit_prefix_cache_before_media(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_sampling_params(monkeypatch)
+
+    audio_token_id = 77
+    input_ids = torch.tensor([10, audio_token_id, audio_token_id, 11])
+    state = make_qwen_state(
+        prompt={"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)},
+        thinker_inputs={
+            "model_inputs": {"audio_embeds": torch.ones((2, 4))},
+            "media_cache_keys": {"audio": "audio:cache"},
+        },
+    )
+
+    req_data = build_sglang_thinker_request(
+        state,
+        params={"max_new_tokens": 3},
+        tokenizer=FakeQwenTokenizer(),
+        vocab_size=256,
+        request_id="rid-limit",
+        thinker_config=SimpleNamespace(
+            image_token_id=55,
+            video_token_id=66,
+            audio_token_id=audio_token_id,
+        ),
+        mrope_position_builder=lambda *args: None,
+        limit_prefix_cache_before_media=True,
+    )
+
+    expected_audio_pad = 256 + xxhash.xxh3_64("audio:cache".encode()).intdigest() % (
+        1 << 62
+    )
+    assert int(req_data.input_ids[1]) == expected_audio_pad
+    assert int(req_data.input_ids[2]) == expected_audio_pad
+    assert req_data.req._omni_max_prefix_cache_len == 1
+
+
+def test_qwen_sglang_request_reuses_media_pad_tokens_for_same_cache_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Qwen3 media cache keys produce stable pad tokens across requests."""
+    _patch_sampling_params(monkeypatch)
+
+    audio_token_id = 77
+    input_ids = torch.tensor([10, audio_token_id, 11], dtype=torch.long)
+    thinker_config = SimpleNamespace(
+        image_token_id=55,
+        video_token_id=66,
+        audio_token_id=audio_token_id,
+    )
+
+    def build(cache_key: str, request_id: str):
+        state = make_qwen_state(
+            prompt={
+                "input_ids": input_ids,
+                "attention_mask": torch.ones_like(input_ids),
+            },
+            thinker_inputs={
+                "model_inputs": {"audio_embeds": torch.ones((1, 4))},
+                "media_cache_keys": {"audio": cache_key},
+            },
+        )
+        return build_sglang_thinker_request(
+            state,
+            params={"max_new_tokens": 3},
+            tokenizer=FakeQwenTokenizer(),
+            vocab_size=256,
+            request_id=request_id,
+            thinker_config=thinker_config,
+            mrope_position_builder=lambda *args: None,
+        )
+
+    req_a = build("audio:cache", "rid-a")
+    req_b = build("audio:cache", "rid-b")
+    req_c = build("audio:other-cache", "rid-c")
+
+    assert req_a.req.extra_key is None
+    assert req_b.req.extra_key is None
+    expected_audio_pad = 256 + xxhash.xxh3_64("audio:cache".encode()).intdigest() % (
+        1 << 62
+    )
+    assert int(req_a.input_ids[1]) == expected_audio_pad
+    assert int(req_b.input_ids[1]) == expected_audio_pad
+    assert int(req_c.input_ids[1]) != expected_audio_pad
+
+
+def test_qwen_sglang_request_uses_request_scoped_key_for_uncacheable_media(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Media tensors without stable cache keys cannot safely share radix cache."""
+    _patch_sampling_params(monkeypatch)
+
+    input_ids = torch.tensor([10, 77, 11], dtype=torch.long)
+
+    def build(request_id: str):
+        state = make_qwen_state(
+            prompt={
+                "input_ids": input_ids,
+                "attention_mask": torch.ones_like(input_ids),
+            },
+            thinker_inputs={"model_inputs": {"audio_embeds": torch.ones((1, 4))}},
+        )
+        return build_sglang_thinker_request(
+            state,
+            params={"max_new_tokens": 3},
+            tokenizer=FakeQwenTokenizer(),
+            vocab_size=256,
+            request_id=request_id,
+        )
+
+    req_a = build("rid-a")
+    req_b = build("rid-b")
+
+    assert req_a.req.extra_key.startswith("media-inputs:rid-a:")
+    assert req_b.req.extra_key.startswith("media-inputs:rid-b:")
+    assert req_a.req.extra_key != req_b.req.extra_key
+
+
+def test_qwen_sglang_text_request_keeps_default_radix_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_sampling_params(monkeypatch)
+    input_ids = torch.tensor([10, 11], dtype=torch.long)
+    state = make_qwen_state(
+        prompt={"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
+    )
+
+    req_data = build_sglang_thinker_request(
+        state,
+        params={"max_new_tokens": 3},
+        tokenizer=FakeQwenTokenizer(),
+        vocab_size=256,
+        request_id="rid-text",
+    )
+
+    assert req_data.req.extra_key is None
+
+
+@pytest.mark.parametrize(
+    ("projected", "expected_prefix"),
+    [
+        (False, "input-embeds:talker-rid:"),
+        (True, "projected-input-embeds:talker-rid:"),
+    ],
+)
+def test_qwen_talker_request_separates_embedding_radix_cache_keys(
+    monkeypatch: pytest.MonkeyPatch, projected: bool, expected_prefix: str
+) -> None:
+    _patch_sampling_params(monkeypatch)
+    thinker_hidden_states = torch.ones((3, 4))
+    talker_embeds = torch.ones((3, 4)) if projected else None
+
+    req_data = build_sglang_talker_request(
+        thinker_hidden_states,
+        tokenizer=FakeQwenTokenizer(),
+        codec_vocab_size=256,
+        request_id="talker-rid",
+        talker_input_embeds=talker_embeds,
+        talker_input_ids=[1, 2, 3] if projected else None,
+        input_embeds_are_projected=projected,
+    )
+
+    assert req_data.req.extra_key.startswith(expected_prefix)
+    assert (req_data.req.input_embeds is None) is projected

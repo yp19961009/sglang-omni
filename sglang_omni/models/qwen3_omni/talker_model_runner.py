@@ -14,7 +14,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.scheduling.messages import OutgoingMessage
 
-_QWEN35_VLLM_DECODE_INPUT_MODE = "qwen35_vllm"
+_QWEN35_EXTERNAL_DECODE_INPUT_MODE = "qwen35_external"
 
 
 def _append_debug_jsonl(env_name: str, record: dict[str, Any]) -> None:
@@ -479,7 +479,7 @@ class QwenTalkerModelRunner(ModelRunner):
             return False
         if (
             getattr(data, "talker_decode_input_mode", "sum")
-            == _QWEN35_VLLM_DECODE_INPUT_MODE
+            == _QWEN35_EXTERNAL_DECODE_INPUT_MODE
         ):
             if int(getattr(data, "talker_text_chunk_remaining", 0) or 0) > 0:
                 return True
@@ -581,7 +581,7 @@ class QwenTalkerModelRunner(ModelRunner):
         )
 
     @staticmethod
-    def _take_next_qwen35_vllm_decode_input_embed(
+    def _take_next_qwen35_external_decode_input_embed(
         *,
         data: Any,
         device: torch.device,
@@ -610,11 +610,12 @@ class QwenTalkerModelRunner(ModelRunner):
                 return None
             input_kind = "text"
             data.talker_text_chunk_remaining = text_chunk_remaining - 1
-            # Qwen3.5 vLLM-style external text rows are conditioning inputs for
-            # the next feedback step; only feedback-generated rows are emitted
-            # to code2wav as audio codec frames.
-            should_emit = False
             drop_count = int(getattr(data, "talker_text_outputs_to_drop", 0) or 0)
+            # Qwen3.5 drops the boundary step and the first N-1 text-conditioning
+            # outputs for an N-token external chunk. The Nth text step produces
+            # the first audible codec for that chunk; subsequent feedback steps
+            # produce the rest.
+            should_emit = drop_count <= 0
             if drop_count > 0:
                 data.talker_text_outputs_to_drop = drop_count - 1
             else:
@@ -641,8 +642,8 @@ class QwenTalkerModelRunner(ModelRunner):
                     return None
                 rows_in_chunk = min(chunk_size, available)
                 data.talker_text_chunk_remaining = rows_in_chunk
-                data.talker_text_outputs_to_drop = max(0, rows_in_chunk)
-                # vLLM generates one feedback-token step at the external-data
+                data.talker_text_outputs_to_drop = max(0, rows_in_chunk - 1)
+                # Qwen3.5 keeps one feedback-token step at the external-data
                 # boundary, drops that codec from user-visible output, then
                 # consumes the incoming text rows on following decode steps.
                 # Keeping the dropped boundary step preserves the talker state
@@ -676,9 +677,9 @@ class QwenTalkerModelRunner(ModelRunner):
         data = sched_req.data
         if (
             getattr(data, "talker_decode_input_mode", "sum")
-            == _QWEN35_VLLM_DECODE_INPUT_MODE
+            == _QWEN35_EXTERNAL_DECODE_INPUT_MODE
         ):
-            return QwenTalkerModelRunner._take_next_qwen35_vllm_decode_input_embed(
+            return QwenTalkerModelRunner._take_next_qwen35_external_decode_input_embed(
                 data=data,
                 device=device,
                 dtype=dtype,

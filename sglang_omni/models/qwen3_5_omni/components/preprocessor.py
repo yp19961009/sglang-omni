@@ -4,11 +4,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import logging
 import math
 import re
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
@@ -101,20 +100,6 @@ _REQUEST_PARAM_INPUT_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("dependent_audio", ("dependent_audio", "video_dependent_audio")),
     *_AUDIO_PROCESSOR_OPTION_ALIASES,
 )
-_VLLM_MM_DATA_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("images", _IMAGE_REQUEST_INPUT_ALIASES),
-    ("videos", _VIDEO_REQUEST_INPUT_ALIASES),
-    ("audios", _AUDIO_REQUEST_INPUT_ALIASES),
-)
-_VLLM_VIDEO_EXTRA_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("video_metadata", ("video_metadata", "videos_metadata")),
-    ("return_video_metadata", ("return_video_metadata", "return_metadata")),
-)
-_VLLM_UUID_ALIASES = {
-    "image": _IMAGE_REQUEST_INPUT_ALIASES,
-    "video": _VIDEO_REQUEST_INPUT_ALIASES,
-    "audio": _AUDIO_REQUEST_INPUT_ALIASES,
-}
 _REQUEST_BOOL_TRUE = {"1", "true", "yes", "on"}
 _REQUEST_BOOL_FALSE = {"0", "false", "no", "off"}
 _REQUEST_BOOL_WORD_TRUE = {"true", "yes", "on"}
@@ -556,20 +541,6 @@ def _qwen35_feat_extract_output_lengths(
     )
 
 
-def _qwen35_feat_extract_output_lengths(
-    input_lengths,
-    *,
-    downsample_times: int = DEFAULT_DOWNSAMPLE_TIMES,
-    chunk_size: int = DEFAULT_DOWNSAMPLE_CHUNK_SIZE,
-):
-    input_lengths_leave = input_lengths % chunk_size
-    for _ in range(downsample_times):
-        input_lengths_leave = (input_lengths_leave - 1) // 2 + 1
-    return input_lengths_leave + (input_lengths // chunk_size) * math.ceil(
-        100 / 2**downsample_times
-    )
-
-
 def _load_qwen3_omni_next_processor():
     try:
         from transformers.models.qwen3_omni_next.processing_qwen3_omni_next import (
@@ -628,7 +599,6 @@ class Qwen35OmniPreprocessor(Qwen3OmniPreprocessor):
             payload.request.inputs,
             payload.request.params,
         )
-        request_inputs = _normalize_vllm_multimodal_inputs(request_inputs)
         normalized_inputs = _normalize_openai_multimodal_inputs(request_inputs)
         normalized_inputs = _normalize_request_level_media_aliases(normalized_inputs)
         self._validate_limit_mm_per_prompt(
@@ -700,7 +670,7 @@ class Qwen35OmniPreprocessor(Qwen3OmniPreprocessor):
             value = _first_config_value(audio_config, aliases)
             if value is not None:
                 # 中文说明：Qwen3OmniNextProcessor 会直接 pop 这三个键；
-                # 即使模型 config 暂时缺字段，也保留 vLLM 默认值，
+                # 即使模型 config 暂时缺字段，也保留 Qwen reference 默认值，
                 # 避免真实调用时报错。
                 defaults[key] = int(value)
         return defaults
@@ -741,19 +711,18 @@ class Qwen35OmniPreprocessor(Qwen3OmniPreprocessor):
                 or _use_audio_in_video_enabled(video_kwargs)
             )
             if video_audio_requested:
-                # 中文说明：vLLM perf_v2 的 dependent_audio 是 engine 层
-                # mm_processor_kwargs，不是 HF video_processor 的参数。sglang
-                # 当前在 CPU preprocessor 里直接完成 token 展开，因此这里仅把
-                # 它当作“视频使用内置音轨”的语义信号，不传给 HF processor。
+                # 中文说明：dependent_audio 是请求层语义信号，不是 HF
+                # video_processor 参数。SGLang 当前在 CPU preprocessor 里直接
+                # 完成 token 展开，因此这里只把它当作“视频使用内置音轨”的
+                # 信号，不传给 HF processor。
                 video_kwargs.setdefault("use_audio_in_video", True)
             video_kwargs.setdefault("return_metadata", True)
             processor_kwargs["videos_kwargs"] = video_kwargs
 
         audio_kwargs = {
             "sampling_rate": int(audio_target_sr),
-            # 中文说明：对齐 vLLM perf_v2 Qwen3OmniNextProcessorKwargs 默认值。
-            # 即使未来 remote processor 的默认合并逻辑有差异，SGLang 也会
-            # 稳定产出 attention mask，并避免音频被 feature_extractor 截断。
+            # 中文说明：显式固定 Qwen3.5 音频 processor 默认值，避免不同
+            # remote processor 版本的默认合并逻辑影响 attention mask 和截断。
             "padding": True,
             "return_attention_mask": True,
             "truncation": False,
@@ -795,7 +764,7 @@ class Qwen35OmniPreprocessor(Qwen3OmniPreprocessor):
     ) -> Any:
         # 中文说明：Qwen3OmniNextProcessor 默认 use_audio_in_video=False。
         # 保持“请求显式开启才抽取视频音轨”的语义；dependent_audio 也是
-        # vLLM Qwen3.5 显式入口，因此可作为开启信号。
+        # Qwen reference Qwen3.5 显式入口，因此可作为开启信号。
         value = super()._resolve_use_audio_in_video(request_inputs, raw_videos)
         if value is not None:
             return _request_bool_value_or_list(value)
@@ -888,30 +857,6 @@ class Qwen35OmniPreprocessor(Qwen3OmniPreprocessor):
             return [_request_bool_value(item) for item in use_audio_in_video]
         return _request_bool_value(use_audio_in_video)
 
-    def _media_cache_key_for_request(
-        self,
-        *,
-        request_inputs: dict[str, Any],
-        modality: str,
-        raw_value: Any,
-        compute_cache_key: Callable[[Any], str | None],
-    ) -> str | None:
-        media_count = _media_item_count(raw_value)
-        uuid_key = _vllm_uuid_cache_key(
-            request_inputs,
-            modality,
-            expected_count=media_count,
-        )
-        if uuid_key is not None and _media_value_is_present(raw_value):
-            return uuid_key
-        return super()._media_cache_key_for_request(
-            request_inputs=request_inputs,
-            modality=modality,
-            raw_value=raw_value,
-            compute_cache_key=compute_cache_key,
-        )
-
-
 def _first_config_value(config: Any, aliases: tuple[str, ...]) -> Any | None:
     for name in aliases:
         value = getattr(config, name, None)
@@ -984,160 +929,6 @@ def _apply_audio_processor_default_overrides(
         defaults["downsample_chunk_size"] = int(downsample_chunk_size)
 
 
-def _normalize_vllm_multimodal_inputs(inputs: Any) -> Any:
-    """Lift vLLM TextPrompt fields into sglang-omni's request shape."""
-
-    if not isinstance(inputs, dict):
-        return inputs
-    multi_modal_data = inputs.get("multi_modal_data")
-    mm_processor_kwargs = inputs.get("mm_processor_kwargs")
-    mm_data_items = _vllm_mapping_sequence(multi_modal_data)
-    mm_kwargs_items = _vllm_mapping_sequence(mm_processor_kwargs)
-    if not mm_data_items and not mm_kwargs_items:
-        return inputs
-
-    normalized = dict(inputs)
-    changed = False
-
-    if mm_data_items:
-        for target_key, aliases in _VLLM_MM_DATA_ALIASES:
-            value = _first_present_vllm_media_input(mm_data_items, aliases)
-            if not _media_value_is_present(value):
-                continue
-            if _has_request_media_input_value(normalized, target_key, aliases):
-                continue
-            # 中文说明：vLLM TextPrompt 使用 multi_modal_data 承载已经加载/
-            # 解码过的媒体；提升到 sglang 顶层后，复用现有 tensor-safe
-            # 媒体加载和 HF processor 路径。list[dict] 形态来自 vLLM
-            # 通用 PromptType，这里按请求内顺序展开，避免外部复用时丢输入。
-            normalized[target_key] = value
-            changed = True
-
-    for kwargs_item in mm_kwargs_items:
-        changed = (
-            _merge_mm_processor_kwargs_into_inputs(normalized, kwargs_item)
-            or changed
-        )
-
-    return normalized if changed else inputs
-
-
-def _vllm_mapping_sequence(value: Any) -> list[dict[str, Any]]:
-    if isinstance(value, dict):
-        return [value]
-    if isinstance(value, (list, tuple)) and all(
-        isinstance(item, dict) for item in value
-    ):
-        return list(value)
-    return []
-
-
-def _vllm_uuid_cache_key(
-    inputs: dict[str, Any],
-    modality: str,
-    *,
-    expected_count: int | None = None,
-) -> str | None:
-    aliases = _VLLM_UUID_ALIASES.get(modality)
-    if aliases is None:
-        return None
-    uuid_items = _vllm_mapping_sequence(inputs.get("multi_modal_uuids"))
-    if not uuid_items:
-        return None
-
-    values: list[Any] = []
-    for item in uuid_items:
-        value = _first_present_media_input(item, aliases)
-        if _media_value_is_present(value):
-            values.extend(_as_uuid_list(value))
-    if not values:
-        return None
-    if expected_count is not None and len(values) != expected_count:
-        # 中文说明：partial uuid 不能安全代表完整媒体集合，否则两个请求只要
-        # 共享第一个 uuid，就可能错误复用后续不同视频/音频的 encoder 输出。
-        return None
-
-    # 中文说明：vLLM 的 multi_modal_uuids 是外部资源缓存标识。这里把它
-    # 转成 encoder cache key 的稳定前缀，后续仍会叠加 fps/max_pixels 等
-    # processor 参数，避免同一 uuid 在不同采样配置下误复用。
-    encoded = json.dumps(
-        [_json_cache_value(value) for value in values],
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return f"vllm_uuid:{modality}:{encoded}"
-
-
-def _as_uuid_list(value: Any) -> list[Any]:
-    if isinstance(value, (list, tuple)):
-        return list(value)
-    return [value]
-
-
-def _json_cache_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            str(key): _json_cache_value(value[key])
-            for key in sorted(value, key=lambda item: str(item))
-        }
-    if isinstance(value, (list, tuple)):
-        return [_json_cache_value(item) for item in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return str(value)
-
-
-def _first_present_vllm_media_input(
-    sources: list[dict[str, Any]],
-    aliases: tuple[str, ...],
-) -> Any | None:
-    if len(sources) == 1:
-        return _first_present_media_input(sources[0], aliases)
-
-    values: list[Any] = []
-    for source in sources:
-        value = _first_present_media_input(source, aliases)
-        if _media_value_is_present(value):
-            values.extend(_as_media_list(value))
-    return values or None
-
-
-def _merge_mm_processor_kwargs_into_inputs(
-    inputs: dict[str, Any],
-    mm_processor_kwargs: dict[str, Any],
-) -> bool:
-    changed = False
-    # 中文说明：vLLM perf_v2 的 mm_processor_kwargs 多数是平铺字段，
-    # 例如 fps/use_audio_in_video/dependent_audio；同时兼容 HF 风格的
-    # videos_kwargs/images_kwargs/audio_kwargs 嵌套写法。
-    changed = (
-        _merge_processor_aliases(
-            inputs,
-            mm_processor_kwargs,
-            _REQUEST_PARAM_INPUT_ALIASES,
-        )
-        or changed
-    )
-    changed = (
-        _merge_processor_aliases(
-            inputs,
-            mm_processor_kwargs,
-            _VLLM_VIDEO_EXTRA_ALIASES,
-        )
-        or changed
-    )
-    for nested_key, aliases in (
-        ("videos_kwargs", (*_OPENAI_VIDEO_OPTION_ALIASES, *_VLLM_VIDEO_EXTRA_ALIASES)),
-        ("images_kwargs", _OPENAI_IMAGE_OPTION_ALIASES),
-        ("audio_kwargs", _AUDIO_PROCESSOR_OPTION_ALIASES),
-    ):
-        nested = mm_processor_kwargs.get(nested_key)
-        if isinstance(nested, dict):
-            changed = _merge_processor_aliases(inputs, nested, aliases) or changed
-    return changed
-
-
 def _merge_processor_aliases(
     inputs: dict[str, Any],
     source: dict[str, Any],
@@ -1179,7 +970,7 @@ def _merge_request_params_into_inputs(inputs: Any, params: Any) -> Any:
     for target_key, aliases, value in extracted:
         if _has_request_input_value(merged, (target_key, *aliases)):
             continue
-        # 中文说明：vLLM Qwen3.5 OpenAI server 把 use_audio_in_video
+        # 中文说明：Qwen reference Qwen3.5 OpenAI server 把 use_audio_in_video
         # 暴露为请求顶层字段；进入 sglang serve 后可能落在 params。
         # 这里只提升白名单 multimodal 预处理参数，避免污染采样参数。
         merged[target_key] = value
@@ -1510,7 +1301,7 @@ def _normalize_request_level_media_aliases(inputs: Any) -> Any:
         if normalized is None:
             normalized = dict(inputs)
         # 中文说明：Qwen3 基类只读取 images/videos/audios。这里把
-        # Qwen3.5/vLLM 常见的 input_*/*_url 统一成复数字段，避免直连
+        # Qwen3.5 常见的 input_*/*_url 统一成复数字段，避免直连
         # client 或自定义压测脚本漏输入。
         normalized[target_key] = value
     return normalized if normalized is not None else inputs
@@ -1755,7 +1546,7 @@ def _collect_openai_image_options(
         )
         if value is not None:
             # 中文说明：当前 HF processor 接受 request 级 images_kwargs。
-            # 先对齐 vLLM 示例里的 image min/max pixels；多图逐项尺寸未来
+            # 先对齐 Qwen reference 示例里的 image min/max pixels；多图逐项尺寸未来
             # 如果底层支持，再扩展成 per-image 参数。
             image_options[target_key] = value
 

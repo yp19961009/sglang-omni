@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import importlib
-import json
 from types import SimpleNamespace
 from typing import get_args, get_type_hints
 
@@ -16,12 +15,7 @@ from sglang_omni.cli.serve import (
     _run_qwen35_preflight_or_raise,
     _resolve_toggle_alias_flags,
     _validate_colocate_config,
-    _validate_qwen35_disable_mtp_request,
-    _validate_qwen35_kv_transfer_request,
-    _validate_qwen35_mamba_cache_mode_request,
-    _validate_qwen35_max_seq_len_to_capture_request,
-    _validate_qwen35_speculative_config_request,
-    _validate_qwen35_vllm_engine_profile_request,
+    apply_ar_server_args_cli_overrides,
     apply_code2wav_cli_overrides,
     apply_limit_mm_per_prompt_cli_override,
     apply_max_running_requests_cli_overrides,
@@ -32,7 +26,6 @@ from sglang_omni.cli.serve import (
     apply_qwen35_max_model_len_cli_override,
     apply_talker_server_args_cli_overrides,
     apply_talker_model_path_cli_override,
-    apply_vllm_ar_server_args_cli_overrides,
     serve,
 )
 from sglang_omni.config.runtime import resolve_stage_factory_args
@@ -114,183 +107,10 @@ def test_qwen35_cli_colocate_accepts_colocated_config():
     _validate_colocate_config(config)
 
 
-def test_qwen35_cli_disable_mtp_accepts_qwen35_config():
-    _validate_qwen35_disable_mtp_request(
-        Qwen35OmniSpeechPipelineConfig(model_path="dummy"),
-        disable_mtp=True,
-    )
-
-
-def test_qwen35_cli_disable_mtp_rejects_non_qwen35_config():
-    class OtherConfig(Qwen35OmniSpeechPipelineConfig):
-        pass
-
-    with pytest.raises(typer.BadParameter, match="disable-mtp"):
-        _validate_qwen35_disable_mtp_request(
-            OtherConfig(model_path="dummy"),
-            disable_mtp=True,
-        )
-
-
-def test_qwen35_cli_max_seq_len_to_capture_accepts_qwen35_config():
-    _validate_qwen35_max_seq_len_to_capture_request(
-        Qwen35OmniSpeechPipelineConfig(model_path="dummy"),
-        max_seq_len_to_capture=262144,
-    )
-
-
-def test_qwen35_cli_max_seq_len_to_capture_rejects_bad_value():
-    with pytest.raises(typer.BadParameter, match="max-seq-len-to-capture"):
-        _validate_qwen35_max_seq_len_to_capture_request(
-            Qwen35OmniSpeechPipelineConfig(model_path="dummy"),
-            max_seq_len_to_capture=0,
-        )
-
-
-def test_qwen35_cli_max_seq_len_to_capture_rejects_non_qwen35_config():
-    class OtherConfig(Qwen35OmniSpeechPipelineConfig):
-        pass
-
-    with pytest.raises(typer.BadParameter, match="max-seq-len-to-capture"):
-        _validate_qwen35_max_seq_len_to_capture_request(
-            OtherConfig(model_path="dummy"),
-            max_seq_len_to_capture=262144,
-        )
-
-
-def test_qwen35_cli_mamba_cache_mode_accepts_none():
-    _validate_qwen35_mamba_cache_mode_request(
-        Qwen35OmniSpeechPipelineConfig(model_path="dummy"),
-        mamba_cache_mode="none",
-    )
-
-
-def test_qwen35_cli_mamba_cache_mode_rejects_light():
-    with pytest.raises(typer.BadParameter, match="mamba-cache-mode"):
-        _validate_qwen35_mamba_cache_mode_request(
-            Qwen35OmniSpeechPipelineConfig(model_path="dummy"),
-            mamba_cache_mode="light",
-        )
-
-
-def test_qwen35_cli_mamba_cache_mode_rejects_non_qwen35_config():
-    class OtherConfig(Qwen35OmniSpeechPipelineConfig):
-        pass
-
-    with pytest.raises(typer.BadParameter, match="mamba-cache-mode"):
-        _validate_qwen35_mamba_cache_mode_request(
-            OtherConfig(model_path="dummy"),
-            mamba_cache_mode="none",
-        )
-
-
-def test_qwen35_cli_kv_transfer_accepts_noop_values():
-    _validate_qwen35_kv_transfer_request(
-        Qwen35OmniSpeechPipelineConfig(model_path="dummy"),
-        enable_disaggregated_prefilling="0",
-        kv_transfer_config="{}",
-    )
-
-
-def test_qwen35_cli_kv_transfer_rejects_nonempty_config():
-    with pytest.raises(typer.BadParameter, match="kv-transfer-config"):
-        _validate_qwen35_kv_transfer_request(
-            Qwen35OmniSpeechPipelineConfig(model_path="dummy"),
-            enable_disaggregated_prefilling=None,
-            kv_transfer_config='{"kv_connector":"HybridConnector"}',
-        )
-
-
-def test_qwen35_cli_kv_transfer_rejects_disaggregated_prefill():
-    with pytest.raises(typer.BadParameter, match="disaggregated-prefilling"):
-        _validate_qwen35_kv_transfer_request(
-            Qwen35OmniSpeechPipelineConfig(model_path="dummy"),
-            enable_disaggregated_prefilling="1",
-            kv_transfer_config=None,
-        )
-
-
-def test_qwen35_cli_vllm_engine_profile_accepts_noops():
-    _validate_qwen35_vllm_engine_profile_request(
-        Qwen35OmniSpeechPipelineConfig(model_path="dummy"),
-        distributed_executor_backend="mp",
-        kv_cache_dtype="auto",
-        enable_expert_parallel="0",
-        mm_processor_cache_gb=0,
-        max_mm_len=None,
-        use_omni_engine="1",
-        use_omni_rpc_engine=None,
-        use_zero_shot="true",
-        skip_mm_profiling="true",
-        override_video_max_pixels="false",
-        is_thinker="true",
-        thinker_only_marker="false",
-        text_only=False,
-    )
-
-
-def test_qwen35_cli_vllm_engine_profile_rejects_kv_cache_dtype():
-    with pytest.raises(typer.BadParameter, match="kv-cache-dtype"):
-        _validate_qwen35_vllm_engine_profile_request(
-            Qwen35OmniSpeechPipelineConfig(model_path="dummy"),
-            distributed_executor_backend=None,
-            kv_cache_dtype="tq4",
-            enable_expert_parallel=None,
-            mm_processor_cache_gb=None,
-            max_mm_len=None,
-            use_omni_engine=None,
-            use_omni_rpc_engine=None,
-            use_zero_shot=None,
-            skip_mm_profiling=None,
-            override_video_max_pixels=None,
-            is_thinker=None,
-            thinker_only_marker=None,
-            text_only=False,
-        )
-
-
-def test_qwen35_cli_vllm_engine_profile_accepts_max_mm_len():
-    _validate_qwen35_vllm_engine_profile_request(
-        Qwen35OmniSpeechPipelineConfig(model_path="dummy"),
-        distributed_executor_backend=None,
-        kv_cache_dtype=None,
-        enable_expert_parallel=None,
-        mm_processor_cache_gb=None,
-        max_mm_len=256000,
-        use_omni_engine=None,
-        use_omni_rpc_engine=None,
-        use_zero_shot=None,
-        skip_mm_profiling=None,
-        override_video_max_pixels=None,
-        is_thinker=None,
-        thinker_only_marker=None,
-        text_only=False,
-    )
-
-
-def test_qwen35_cli_empty_speculative_config_is_noop():
-    _validate_qwen35_speculative_config_request(
-        Qwen35OmniSpeechPipelineConfig(model_path="dummy"),
-        speculative_config="{}",
-    )
-
-
-def test_qwen35_cli_speculative_config_rejects_mtp():
-    with pytest.raises(typer.BadParameter, match="speculative-config"):
-        _validate_qwen35_speculative_config_request(
-            Qwen35OmniSpeechPipelineConfig(model_path="dummy"),
-            speculative_config=(
-                '{"method":"qwen3_omni_next_thinker_mtp",'
-                '"num_speculative_tokens":4}'
-            ),
-        )
-
-
 def test_qwen35_cli_split_path_aliases_match_example_launcher():
     assert "--model" in _serve_option_names("model_path")
     assert "--thinker-model" in _serve_option_names("thinker_model_path")
     assert "--thinker-model-path" in _serve_option_names("thinker_model_path")
-    assert "--vllm-profile" in _serve_option_names("vllm_profile")
     assert "--preflight" in _serve_option_names("preflight")
     assert "--serve-port" in _serve_option_names("port")
     assert "--serve_port" in _serve_option_names("port")
@@ -310,7 +130,6 @@ def test_qwen35_cli_split_path_aliases_match_example_launcher():
     assert "--xvector-info-path" in _serve_option_names("xvector_info_path")
     assert "--voice-clone-info-path" in _serve_option_names("xvector_info_path")
     assert "--voice-clone-path" in _serve_option_names("xvector_info_path")
-    assert "--disable-mtp" in _serve_option_names("disable_mtp")
     assert "--code2wav-frequency" in _serve_option_names("code2wav_frequency")
     assert "--code2wav-dit-quantization" in _serve_option_names(
         "code2wav_dit_quant"
@@ -332,8 +151,8 @@ def test_qwen35_cli_split_path_aliases_match_example_launcher():
     assert "--enable-text-normalization" in _serve_option_names("enable_tn")
     assert "--disable-tn" in _serve_option_names("disable_tn")
     assert "--no-enable-tn" in _serve_option_names("disable_tn")
-    assert "--gpu-memory-utilization" in _serve_option_names("mem_fraction_static")
-    assert "--talker-gpu-memory-utilization" in _serve_option_names(
+    assert "--mem-fraction-static" in _serve_option_names("mem_fraction_static")
+    assert "--talker-mem-fraction-static" in _serve_option_names(
         "talker_mem_fraction_static"
     )
     assert "--talker-quantization" in _serve_option_names("talker_quantization")
@@ -349,66 +168,6 @@ def test_qwen35_cli_split_path_aliases_match_example_launcher():
         "code2wav_visible_devices"
     )
     assert "--code2wav-devices" in _serve_option_names("code2wav_visible_devices")
-
-
-def test_qwen35_cli_vllm_direct_aliases_parse_as_profile_defaults():
-    defaults = serve_module._parse_qwen35_vllm_profile_defaults(
-        (
-            "--model",
-            "/models/qwen35",
-            "--thinker-model",
-            "/models/qwen35/thinker",
-            "--talker-model",
-            "/models/qwen35/talker_lm",
-            "--code2wav-model",
-            "code2wav",
-            "--thinker-devices",
-            "[0,1]",
-            "--talker-devices",
-            "[2]",
-            "--code2wav-devices",
-            "[3]",
-            "--thinker-tensor-parallel-size",
-            "2",
-            "--host",
-            "127.0.0.1",
-            "--serve-port",
-            "29000",
-            "--video-fps",
-            "2",
-            "--sample-rate",
-            "24000",
-            "--max-tokens",
-            "512",
-            "--seed",
-            "0",
-            "--voice-type",
-            "Cherry",
-            "--talker-quantization",
-            "fp8",
-            "--enable-tn",
-        )
-    )
-
-    assert defaults == {
-        "model_path": "/models/qwen35",
-        "thinker_model_path": "/models/qwen35/thinker",
-        "talker_model_path": "/models/qwen35/talker_lm",
-        "code2wav_model_folder": "code2wav",
-        "thinker_visible_devices": "[0,1]",
-        "talker_visible_devices": "[2]",
-        "code2wav_visible_devices": "[3]",
-        "thinker_tp_size": 2,
-        "host": "127.0.0.1",
-        "port": 29000,
-        "video_fps": 2.0,
-        "code2wav_sample_rate": 24000,
-        "max_tokens": 512,
-        "seed": 0,
-        "voice_type": "Cherry",
-        "talker_quantization": "fp8",
-        "enable_tn": True,
-    }
 
 
 def test_qwen35_cli_thinker_model_alias_is_noop_with_root_model(monkeypatch):
@@ -481,258 +240,6 @@ def test_qwen35_cli_thinker_model_alias_rejects_ambiguous_paths(
 
     with pytest.raises(typer.BadParameter, match="thinker-model"):
         serve_module.serve(SimpleNamespace(args=[]), **kwargs)
-
-
-def test_qwen35_cli_vllm_profile_defaults_apply_to_speech(
-    monkeypatch,
-    tmp_path,
-):
-    profile = tmp_path / "h20.config"
-    profile.write_text(
-        json.dumps(
-            {
-                "engine_args": {
-                    "model": "/models/qwen35",
-                    "host": "127.0.0.1",
-                    "dtype": "bfloat16",
-                    "max_model_len": 192000,
-                    "max_num_batched_tokens": 512,
-                    "max_num_seqs": 24,
-                    "max_tokens": 768,
-                    "seed": 3,
-                    "gpu_memory_utilization": 0.6,
-                    "talker_gpu_memory_utilization": 0.8,
-                    "talker_quantization": "fp8",
-                    "talker_visible_devices": [1],
-                    "code2wav_visible_devices": [1],
-                    "code2wav_model_folder": "code2wav",
-                    "send_chunk_size": 8,
-                    "omni_video_fps": 2,
-                    "enable_prefix_caching": True,
-                    "enable_chunked_prefill": True,
-                    "limit_mm_per_prompt": {
-                        "audio": 960,
-                        "image": 960,
-                        "video": 960,
-                    },
-                }
-            }
-        )
-    )
-    config = Qwen35OmniSpeechPipelineConfig(model_path="/models/from-config")
-    _patch_serve_model_path_config_manager(monkeypatch, config)
-    captured = {}
-
-    def fake_launch_server(pipeline_config, **kwargs):
-        captured["pipeline_config"] = pipeline_config
-        captured.update(kwargs)
-
-    monkeypatch.setattr(serve_module, "launch_server", fake_launch_server)
-
-    serve_module.serve(
-        SimpleNamespace(args=[]),
-        vllm_profile=str(profile),
-    )
-
-    merged = captured["pipeline_config"]
-    assert merged.model_path == "/models/qwen35"
-    assert _stage(merged, "talker_ar").gpu == 1
-    assert _stage(merged, "code2wav").gpu == 1
-    assert _stage(merged, "thinker").runtime.max_seq_len == 192000
-    assert (
-        _stage(merged, "thinker").runtime.sglang_server_args.max_running_requests
-        == 24
-    )
-    assert (
-        _stage(merged, "talker_ar").runtime.sglang_server_args.max_running_requests
-        == 24
-    )
-    thinker_args = _stage(merged, "thinker").factory_args["server_args_overrides"]
-    talker_args = _stage(merged, "talker_ar").factory_args["server_args_overrides"]
-    assert thinker_args["dtype"] == "bfloat16"
-    assert talker_args["dtype"] == "bfloat16"
-    assert talker_args["quantization"] == "fp8"
-    assert _stage(merged, "thinker").runtime.sglang_server_args.mem_fraction_static == 0.6
-    assert _stage(merged, "talker_ar").runtime.sglang_server_args.mem_fraction_static == 0.8
-    assert thinker_args["disable_radix_cache"] is False
-    assert talker_args["disable_radix_cache"] is False
-    assert thinker_args["max_prefill_tokens"] == 512
-    assert talker_args["max_prefill_tokens"] == 512
-    assert _stage(merged, "code2wav").factory_args["code2wav_model_path"] == (
-        "/models/qwen35/code2wav"
-    )
-    assert resolve_stage_factory_args(_stage(merged, "code2wav"), merged)[
-        "stream_chunk_size"
-    ] == 8
-    assert _stage(merged, "preprocessing").factory_args[
-        "limit_mm_per_prompt"
-    ] == {
-        "audio": 960,
-        "image": 960,
-        "video": 960,
-    }
-    assert _stage(merged, "preprocessing").runtime.video_fps == 2.0
-    assert captured["host"] == "127.0.0.1"
-    assert captured["default_generation_params"]["max_tokens"] == 768
-    assert captured["default_generation_params"]["seed"] == 3
-
-
-def test_qwen35_cli_vllm_profile_disable_mtp_override_allows_mtp_profile(
-    monkeypatch,
-    tmp_path,
-):
-    profile = tmp_path / "mtp.config"
-    profile.write_text(
-        json.dumps(
-            {
-                "engine_args": {
-                    "model": "/models/qwen35",
-                    "speculative_config": {
-                        "method": "qwen3_omni_next_thinker_mtp",
-                        "num_speculative_tokens": 4,
-                    },
-                }
-            }
-        )
-    )
-    config = Qwen35OmniSpeechPipelineConfig(model_path="/models/from-config")
-    _patch_serve_model_path_config_manager(monkeypatch, config)
-    captured = {}
-    monkeypatch.setattr(
-        serve_module,
-        "launch_server",
-        lambda pipeline_config, **kwargs: captured.update(
-            {"pipeline_config": pipeline_config, **kwargs}
-        ),
-    )
-
-    serve_module.serve(
-        SimpleNamespace(args=[]),
-        vllm_profile=str(profile),
-        disable_mtp=True,
-    )
-
-    assert captured["pipeline_config"].model_path == "/models/qwen35"
-
-
-def test_qwen35_cli_vllm_profile_allows_cli_overrides(monkeypatch, tmp_path):
-    profile = tmp_path / "h20.config"
-    profile.write_text(
-        json.dumps(
-            {
-                "engine_args": {
-                    "model": "/models/from-profile",
-                    "talker_visible_devices": [1],
-                    "code2wav_model_folder": "code2wav",
-                    "send_chunk_size": 8,
-                }
-            }
-        )
-    )
-    config = Qwen35OmniSpeechPipelineConfig(model_path="/models/from-config")
-    _patch_serve_model_path_config_manager(
-        monkeypatch,
-        config,
-        expected_model_path="/models/from-cli",
-    )
-    captured = {}
-    monkeypatch.setattr(
-        serve_module,
-        "launch_server",
-        lambda pipeline_config, **kwargs: captured.update(
-            {"pipeline_config": pipeline_config, **kwargs}
-        ),
-    )
-
-    serve_module.serve(
-        SimpleNamespace(args=[]),
-        vllm_profile=str(profile),
-        model_path="/models/from-cli",
-        talker_gpu=2,
-        code2wav_stream_chunk_size=16,
-    )
-
-    merged = captured["pipeline_config"]
-    assert merged.model_path == "/models/from-cli"
-    assert _stage(merged, "talker_ar").gpu == 2
-    assert _stage(merged, "code2wav").factory_args["code2wav_model_path"] == (
-        "/models/from-cli/code2wav"
-    )
-    assert resolve_stage_factory_args(_stage(merged, "code2wav"), merged)[
-        "stream_chunk_size"
-    ] == 16
-
-
-def test_qwen35_cli_vllm_profile_can_select_text_only(monkeypatch, tmp_path):
-    profile = tmp_path / "thinker.config"
-    profile.write_text(
-        json.dumps(
-            {
-                "engine_args": {
-                    "model": "/models/qwen35",
-                    "thinker_only": True,
-                    "dtype": "bfloat16",
-                    "max_model_len": 192000,
-                    "talker_visible_devices": [1],
-                    "code2wav_model_folder": "code2wav",
-                }
-            }
-        )
-    )
-    config = Qwen35OmniPipelineConfig(model_path="/models/from-config")
-    _patch_serve_model_path_config_manager(
-        monkeypatch,
-        config,
-        expected_variant="text",
-    )
-    captured = {}
-    monkeypatch.setattr(
-        serve_module,
-        "launch_server",
-        lambda pipeline_config, **kwargs: captured.update(
-            {"pipeline_config": pipeline_config, **kwargs}
-        ),
-    )
-
-    serve_module.serve(
-        SimpleNamespace(args=[]),
-        vllm_profile=str(profile),
-    )
-
-    merged = captured["pipeline_config"]
-    assert isinstance(merged, Qwen35OmniPipelineConfig)
-    assert merged.model_path == "/models/qwen35"
-    assert _stage(merged, "thinker").runtime.max_seq_len == 192000
-    assert (
-        _stage(merged, "thinker")
-        .factory_args["server_args_overrides"]["dtype"]
-        == "bfloat16"
-    )
-
-
-def test_qwen35_cli_vllm_profile_rejects_unsupported(monkeypatch, tmp_path):
-    profile = tmp_path / "bad.config"
-    profile.write_text(
-        json.dumps(
-            {
-                "engine_args": {
-                    "mamba_cache_mode": "light",
-                }
-            }
-        )
-    )
-    monkeypatch.setattr(
-        serve_module,
-        "launch_server",
-        lambda *args, **kwargs: pytest.fail("launch_server should not run"),
-    )
-
-    with pytest.raises(typer.BadParameter, match="profile preflight FAIL"):
-        serve_module.serve(
-            SimpleNamespace(args=[]),
-            vllm_profile=str(profile),
-            model_path="/models/qwen35",
-        )
 
 
 def test_qwen35_cli_forwards_default_generation_params(monkeypatch):
@@ -891,61 +398,19 @@ def test_qwen35_cli_rejects_bad_default_generation_params(
         )
 
 
-def test_qwen35_cli_video_preprocessing_aliases_are_available():
+def test_qwen35_cli_server_and_preprocessing_aliases_are_available():
     assert "--max-running-requests" in _serve_option_names("max_running_requests")
     assert "--max_running_requests" in _serve_option_names("max_running_requests")
-    assert "--max-num-seqs" in _serve_option_names("max_running_requests")
-    assert "--max_num_seqs" in _serve_option_names("max_running_requests")
     assert "--max-model-len" in _serve_option_names("max_model_len")
     assert "--max_model_len" in _serve_option_names("max_model_len")
-    assert "--max-seq-len-to-capture" in _serve_option_names(
-        "max_seq_len_to_capture"
-    )
-    assert "--max_seq_len_to_capture" in _serve_option_names(
-        "max_seq_len_to_capture"
-    )
-    assert "--compilation-config" in _serve_option_names("compilation_config")
-    assert "--compilation_config" in _serve_option_names("compilation_config")
-    assert "--mamba-cache-mode" in _serve_option_names("mamba_cache_mode")
-    assert "--mamba_cache_mode" in _serve_option_names("mamba_cache_mode")
-    assert "--kv-transfer-config" in _serve_option_names("kv_transfer_config")
-    assert "--kv_transfer_config" in _serve_option_names("kv_transfer_config")
-    assert "--enable-disaggregated-prefilling" in _serve_option_names(
-        "enable_disaggregated_prefilling"
-    )
-    assert "--enable_disaggregated_prefilling" in _serve_option_names(
-        "enable_disaggregated_prefilling"
-    )
-    assert "--tensor-parallel-size" in _serve_option_names("tensor_parallel_size")
-    assert "--tensor_parallel_size" in _serve_option_names("tensor_parallel_size")
     assert "--thinker-tensor-parallel-size" in _serve_option_names(
         "thinker_tp_size"
     )
     assert "--thinker_tensor_parallel_size" in _serve_option_names(
         "thinker_tp_size"
     )
-    assert "--distributed-executor-backend" in _serve_option_names(
-        "distributed_executor_backend"
-    )
-    assert "--kv-cache-dtype" in _serve_option_names("kv_cache_dtype")
-    assert "--enable-expert-parallel" in _serve_option_names(
-        "enable_expert_parallel"
-    )
     assert "--max-mm-len" in _serve_option_names("max_mm_len")
-    assert "--speculative-config" in _serve_option_names("speculative_config")
-    assert "--mm-processor-cache-gb" in _serve_option_names(
-        "mm_processor_cache_gb"
-    )
-    assert "--use-omni-rpc-engine" in _serve_option_names("use_omni_rpc_engine")
-    assert "--thinker-only" in _serve_option_names("thinker_only_marker")
-    assert "--video-needs-metadata" in _serve_option_names("video_needs_metadata")
-    assert "--override-video-max-pixels" in _serve_option_names(
-        "override_video_max_pixels"
-    )
-    assert "--max-num-batched-tokens" in _serve_option_names(
-        "max_num_batched_tokens"
-    )
-    assert "--block-size" in _serve_option_names("page_size")
+    assert "--max-prefill-tokens" in _serve_option_names("max_prefill_tokens")
     assert "--page-size" in _serve_option_names("page_size")
     assert "--thinker-max-seq-len" in _serve_option_names("thinker_max_seq_len")
     assert (
@@ -999,26 +464,16 @@ def test_qwen35_cli_video_preprocessing_aliases_are_available():
     )
 
 
-def test_qwen35_cli_vllm_ar_aliases_are_available():
+def test_qwen35_cli_ar_aliases_are_available():
     assert "--thinker-quantization" in _serve_option_names("quantization")
     assert "--dtype" in _serve_option_names("dtype")
     assert "--thinker-dtype" in _serve_option_names("thinker_dtype")
     assert "--talker-dtype" in _serve_option_names("talker_dtype")
-    assert "--mamba-cache-dtype" in _serve_option_names("mamba_ssm_dtype")
     assert "--mamba-ssm-dtype" in _serve_option_names("mamba_ssm_dtype")
-    assert "--enforce-eager" in _serve_option_names("enforce_eager")
-    assert "--thinker-enforce-eager" in _serve_option_names("thinker_enforce_eager")
-    assert "--talker-enforce-eager" in _serve_option_names("talker_enforce_eager")
-    assert "--enable-prefix-caching" in _serve_option_names("enable_prefix_caching")
-    assert "--no-enable-prefix-caching" in _serve_option_names(
-        "disable_prefix_caching"
-    )
-    assert "--enable-chunked-prefill" in _serve_option_names(
-        "enable_chunked_prefill"
-    )
-    assert "--no-enable-chunked-prefill" in _serve_option_names(
-        "disable_chunked_prefill"
-    )
+    assert "--thinker-cuda-graph" in _serve_option_names("thinker_cuda_graph")
+    assert "--talker-cuda-graph" in _serve_option_names("talker_cuda_graph")
+    assert "--prefix-caching" in _serve_option_names("prefix_caching")
+    assert "--chunked-prefill" in _serve_option_names("chunked_prefill")
 
 
 def test_qwen35_cli_code2wav_boolean_aliases_match_example_launcher():
@@ -1385,22 +840,18 @@ def test_qwen35_cli_max_model_len_rejects_non_qwen35_config():
         )
 
 
-def test_qwen35_cli_applies_vllm_ar_server_args_to_speech_stages():
+def test_qwen35_cli_applies_ar_server_args_to_speech_stages():
     config = Qwen35OmniSpeechPipelineConfig(model_path="dummy")
 
-    apply_vllm_ar_server_args_cli_overrides(
+    apply_ar_server_args_cli_overrides(
         config,
         prefix_caching="off",
         chunked_prefill="off",
-        enforce_eager=True,
-        thinker_enforce_eager=False,
-        talker_enforce_eager=False,
         dtype="bfloat16",
         talker_dtype="float16",
         mamba_ssm_dtype="float32",
-        max_num_batched_tokens=512,
+        max_prefill_tokens=512,
         page_size=16,
-        compilation_config='{"cudagraph_mode":"FULL_DECODE_ONLY"}',
     )
 
     thinker_args = _stage(config, "thinker").factory_args["server_args_overrides"]
@@ -1411,14 +862,42 @@ def test_qwen35_cli_applies_vllm_ar_server_args_to_speech_stages():
     assert talker_args["chunked_prefill_size"] is None
     assert thinker_args["max_prefill_tokens"] == 512
     assert talker_args["max_prefill_tokens"] == 512
-    assert thinker_args["disable_cuda_graph"] is True
-    assert talker_args["disable_cuda_graph"] is True
     assert thinker_args["dtype"] == "bfloat16"
     assert talker_args["dtype"] == "float16"
     assert thinker_args["mamba_ssm_dtype"] == "float32"
     assert talker_args["mamba_ssm_dtype"] == "float32"
     assert thinker_args["page_size"] == 16
     assert talker_args["page_size"] == 16
+
+
+def test_qwen35_cli_keeps_speech_prefix_cache_default():
+    config = Qwen35OmniSpeechPipelineConfig(model_path="dummy")
+
+    apply_ar_server_args_cli_overrides(
+        config,
+        prefix_caching="default",
+        chunked_prefill="default",
+    )
+
+    thinker_args = _stage(config, "thinker").factory_args["server_args_overrides"]
+    talker_args = _stage(config, "talker_ar").factory_args["server_args_overrides"]
+    assert "disable_radix_cache" not in thinker_args
+    assert "disable_radix_cache" not in talker_args
+
+
+def test_qwen35_cli_can_enable_prefix_cache_explicitly_for_speech():
+    config = Qwen35OmniSpeechPipelineConfig(model_path="dummy")
+
+    apply_ar_server_args_cli_overrides(
+        config,
+        prefix_caching="on",
+        chunked_prefill="default",
+    )
+
+    thinker_args = _stage(config, "thinker").factory_args["server_args_overrides"]
+    talker_args = _stage(config, "talker_ar").factory_args["server_args_overrides"]
+    assert thinker_args["disable_radix_cache"] is False
+    assert talker_args["disable_radix_cache"] is False
 
 
 def test_qwen35_cli_applies_talker_quantization_to_speech_stage():
@@ -1445,124 +924,39 @@ def test_qwen35_cli_talker_quantization_rejects_text_pipeline():
         )
 
 
-def test_qwen35_cli_applies_vllm_ar_server_args_to_text_stage():
+def test_qwen35_cli_applies_ar_server_args_to_text_stage():
     config = Qwen35OmniPipelineConfig(model_path="dummy")
 
-    apply_vllm_ar_server_args_cli_overrides(
+    apply_ar_server_args_cli_overrides(
         config,
         prefix_caching="on",
         chunked_prefill="on",
-        enforce_eager=False,
-        thinker_enforce_eager=True,
-        talker_enforce_eager=False,
         dtype="bfloat16",
         mamba_ssm_dtype="float32",
-        max_num_batched_tokens=512,
+        max_prefill_tokens=512,
         page_size=16,
-        compilation_config=None,
     )
 
     thinker_args = _stage(config, "thinker").factory_args["server_args_overrides"]
     assert thinker_args["disable_radix_cache"] is False
     assert thinker_args["chunked_prefill_size"] == 512
     assert thinker_args["max_prefill_tokens"] == 512
-    assert thinker_args["disable_cuda_graph"] is True
     assert thinker_args["dtype"] == "bfloat16"
     assert thinker_args["mamba_ssm_dtype"] == "float32"
     assert thinker_args["page_size"] == 16
 
 
-def test_qwen35_cli_compilation_config_can_disable_cuda_graph():
-    config = Qwen35OmniSpeechPipelineConfig(model_path="dummy")
+def test_qwen35_cli_keeps_text_prefix_cache_default():
+    config = Qwen35OmniPipelineConfig(model_path="dummy")
 
-    apply_vllm_ar_server_args_cli_overrides(
+    apply_ar_server_args_cli_overrides(
         config,
         prefix_caching="default",
         chunked_prefill="default",
-        enforce_eager=False,
-        thinker_enforce_eager=False,
-        talker_enforce_eager=False,
-        compilation_config='{"cudagraph_mode":"none"}',
     )
 
     thinker_args = _stage(config, "thinker").factory_args["server_args_overrides"]
-    talker_args = _stage(config, "talker_ar").factory_args["server_args_overrides"]
-    assert thinker_args["disable_cuda_graph"] is True
-    assert talker_args["disable_cuda_graph"] is True
-
-
-def test_qwen35_cli_compilation_config_rejects_unsupported_inductor():
-    config = Qwen35OmniPipelineConfig(model_path="dummy")
-
-    with pytest.raises(typer.BadParameter, match="use_inductor"):
-        apply_vllm_ar_server_args_cli_overrides(
-            config,
-            prefix_caching="default",
-            chunked_prefill="default",
-            enforce_eager=False,
-            thinker_enforce_eager=False,
-            talker_enforce_eager=False,
-            compilation_config='{"use_inductor":true}',
-        )
-
-
-def test_qwen35_cli_rejects_unsupported_mamba_cache_mode():
-    config = Qwen35OmniPipelineConfig(model_path="dummy")
-
-    with pytest.raises(typer.BadParameter, match="mamba-cache-mode"):
-        apply_vllm_ar_server_args_cli_overrides(
-            config,
-            prefix_caching="default",
-            chunked_prefill="default",
-            enforce_eager=False,
-            thinker_enforce_eager=False,
-            talker_enforce_eager=False,
-            mamba_cache_mode="all",
-        )
-
-
-def test_qwen35_cli_rejects_unsupported_kv_transfer_config():
-    config = Qwen35OmniPipelineConfig(model_path="dummy")
-
-    with pytest.raises(typer.BadParameter, match="kv-transfer-config"):
-        apply_vllm_ar_server_args_cli_overrides(
-            config,
-            prefix_caching="default",
-            chunked_prefill="default",
-            enforce_eager=False,
-            thinker_enforce_eager=False,
-            talker_enforce_eager=False,
-            kv_transfer_config='{"kv_connector":"HybridConnector"}',
-        )
-
-
-def test_qwen35_cli_rejects_disaggregated_prefilling():
-    config = Qwen35OmniPipelineConfig(model_path="dummy")
-
-    with pytest.raises(typer.BadParameter, match="disaggregated-prefilling"):
-        apply_vllm_ar_server_args_cli_overrides(
-            config,
-            prefix_caching="default",
-            chunked_prefill="default",
-            enforce_eager=False,
-            thinker_enforce_eager=False,
-            talker_enforce_eager=False,
-            enable_disaggregated_prefilling="true",
-        )
-
-
-def test_qwen35_cli_vllm_talker_eager_rejects_text_pipeline():
-    config = Qwen35OmniPipelineConfig(model_path="dummy")
-
-    with pytest.raises(typer.BadParameter, match="talker-enforce-eager"):
-        apply_vllm_ar_server_args_cli_overrides(
-            config,
-            prefix_caching="default",
-            chunked_prefill="default",
-            enforce_eager=False,
-            thinker_enforce_eager=False,
-            talker_enforce_eager=True,
-        )
+    assert "disable_radix_cache" not in thinker_args
 
 
 def test_qwen35_cli_applies_talker_model_path_override():

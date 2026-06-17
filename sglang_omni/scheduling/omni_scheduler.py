@@ -285,10 +285,14 @@ class OmniScheduler:
 
         # Disaggregation / hybrid (disabled)
         from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
         self.disaggregation_mode = DisaggregationMode.NULL
         self.is_hybrid_swa = False
-        self.is_hybrid_ssm = False
+        self.is_hybrid_ssm = isinstance(tree_cache, MambaRadixCache) or hasattr(
+            req_to_token_pool,
+            "mamba_pool",
+        )
         self.offload_tags: set = set()
         self.is_initializing = False
         self.truncation_align_size = None

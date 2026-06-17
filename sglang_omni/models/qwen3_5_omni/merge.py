@@ -27,7 +27,7 @@ def merge_for_thinker(payloads: dict[str, StagePayload]) -> StagePayload:
     thinker_inputs = dict(state.thinker_inputs or {})
     model_inputs = dict(thinker_inputs.get("model_inputs", {}))
     if audio_is_dependent is not None:
-        # 中文说明：对齐 vLLM perf_v2 的 audio_is_dependent 语义：
+        # 中文说明：对齐 reference 的 audio_is_dependent 语义：
         # audio feature 列表中 True 表示该槽位来自 video 内置音轨。
         model_inputs["audio_is_dependent"] = _to_bool_tensor(audio_is_dependent)
     if use_audio_in_video is not None:

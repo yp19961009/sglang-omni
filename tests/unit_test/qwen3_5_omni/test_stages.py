@@ -331,8 +331,53 @@ def test_qwen35_thinker_executor_uses_thinker_subdir(monkeypatch, tmp_path):
     assert seen["scheduler_kwargs"]["root_model_path"] == str(root)
 
 
+def test_qwen35_thinker_executor_reads_mamba_strategy_env(monkeypatch):
+    seen = {}
+
+    def fake_build_sglang_server_args(model_path, context_length, **overrides):
+        seen["model_path"] = model_path
+        seen["context_length"] = context_length
+        seen["overrides"] = overrides
+        return SimpleNamespace(mem_fraction_static=None)
+
+    monkeypatch.setenv("QWEN35_THINKER_MAMBA_SCHEDULER_STRATEGY", "extra_buffer")
+    monkeypatch.setattr(
+        stages,
+        "build_sglang_server_args",
+        fake_build_sglang_server_args,
+    )
+    monkeypatch.setattr(
+        stages,
+        "_apply_colocated_ar_memory_contract",
+        lambda *_, **__: SimpleNamespace(
+            mem_fraction_static_pinned=False,
+            effective_total_gpu_memory_fraction=None,
+            applied_encoder_mem_reserve=0.0,
+        ),
+    )
+    monkeypatch.setattr(
+        stages,
+        "_apply_qwen_thinker_encoder_reserve",
+        lambda *_, **__: False,
+    )
+    monkeypatch.setattr(stages, "avail_gpu_mem", lambda *_: 0)
+    monkeypatch.setattr(stages, "get_process_gpu_memory_bytes", lambda *_: 0)
+    monkeypatch.setattr(
+        stages,
+        "create_thinker_scheduler",
+        lambda *_, **__: "scheduler",
+    )
+
+    result = stages.create_sglang_thinker_executor_from_config("/models/qwen35")
+
+    assert result == "scheduler"
+    assert seen["model_path"] == "/models/qwen35"
+    assert seen["overrides"]["mamba_scheduler_strategy"] == "extra_buffer"
+
+
 def test_qwen35_thinker_colocated_reserves_encoder_memory(monkeypatch):
     seen = {}
+    monkeypatch.delenv("QWEN35_THINKER_MAMBA_SCHEDULER_STRATEGY", raising=False)
 
     def fake_apply_colocated_contract(overrides, **kwargs):
         seen["contract_overrides_before"] = dict(overrides)
@@ -386,6 +431,7 @@ def test_qwen35_thinker_colocated_reserves_encoder_memory(monkeypatch):
     assert seen["contract_kwargs"]["stage_name"] == "thinker"
     assert seen["contract_kwargs"]["total_gpu_memory_fraction"] == pytest.approx(0.75)
     assert seen["contract_kwargs"]["encoder_mem_reserve"] == pytest.approx(0.05)
+    assert seen["overrides"]["mamba_scheduler_strategy"] == "extra_buffer"
     assert seen["overrides"]["mem_fraction_static"] == pytest.approx(0.70)
     assert seen["scheduler_kwargs"]["total_gpu_memory_fraction"] == pytest.approx(0.70)
 

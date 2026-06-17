@@ -82,7 +82,7 @@ def test_qwen35_omni_stage_factories_are_model_specific():
     )
 
 
-def test_qwen35_omni_defaults_match_vllm_context_envelope():
+def test_qwen35_omni_defaults_match_native_context_envelope():
     config = Qwen35OmniSpeechPipelineConfig(model_path="dummy")
 
     assert QWEN3_5_OMNI_THINKER_MAX_SEQ_LEN == 192000

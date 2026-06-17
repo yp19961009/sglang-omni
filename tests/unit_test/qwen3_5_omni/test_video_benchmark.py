@@ -122,15 +122,15 @@ def test_qwen35_video_benchmark_passes_audio_request_config():
     assert "videos" not in session.payload
     assert "audios" not in session.payload
     assert session.payload["modalities"] == ["text", "audio"]
-    assert session.payload["enable_audio_output"] is True
-    assert session.payload["do_wave"] is True
     assert session.payload["metadata"] == {"sample_id": "sample-1"}
-    assert session.payload["voice_type"] == "Cherry"
     assert session.payload["audio"] == {
         "format": "wav",
         "voice": "Cherry",
         "language": "zh",
     }
+    assert "enable_audio_output" not in session.payload
+    assert "do_wave" not in session.payload
+    assert "voice_type" not in session.payload
 
 
 def test_qwen35_video_benchmark_rejects_non_wav_audio_metrics():
@@ -179,11 +179,17 @@ def test_qwen35_video_benchmark_text_only_omits_audio_output_flag():
     assert "audio" not in session.payload
 
 
-def test_qwen35_video_benchmark_accepts_vllm_top_level_audio(tmp_path):
+def test_qwen35_video_benchmark_accepts_message_audio(tmp_path):
     result = RequestResult(request_id="sample-top")
     body = {
-        "choices": [{"message": {"content": "Answer: A"}}],
-        "audio": {"data": _wav_b64(), "format": "wav"},
+        "choices": [
+            {
+                "message": {
+                    "content": "Answer: A",
+                    "audio": {"data": _wav_b64(), "format": "wav"},
+                }
+            }
+        ],
         "usage": {"prompt_tokens": 11, "completion_tokens": 3},
     }
 
@@ -250,7 +256,8 @@ def test_qwen35_video_benchmark_stream_records_audio_ttfp(tmp_path):
     result = asyncio.run(send_fn(session, sample))
 
     assert session.payload["stream"] is True
-    assert session.payload["enable_audio_output"] is True
+    assert "enable_audio_output" not in session.payload
+    assert "do_wave" not in session.payload
     assert result.is_success
     assert result.text == "Answer: A"
     assert result.prompt_tokens == 11

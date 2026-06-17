@@ -149,7 +149,7 @@ def ensure_sglang_qwen3_next_text_config(config: Any) -> Any:
         ]
         setattr(config, "layers_block_type", sglang_layer_types)
         if getattr(config, "layer_types", None) is None:
-            # 中文说明：SGLang core 读 layers_block_type，HF/vLLM 新
+            # 中文说明：SGLang core 读 layers_block_type，HF 新
             # subtalker 代码会读 layer_types；raw 配置若只带前者，这里
             # 回填 HF 命名，避免 code predictor 初始化时访问缺失字段。
             setattr(
@@ -163,7 +163,7 @@ def ensure_sglang_qwen3_next_text_config(config: Any) -> Any:
     if layer_types is None and _looks_like_qwen3_next_text_config(config):
         num_hidden_layers = getattr(config, "num_hidden_layers", None)
         if num_hidden_layers is not None:
-            # 中文说明：vLLM/transformers Qwen3NextConfig 的默认 layer_types
+            # 中文说明：transformers Qwen3NextConfig 的默认 layer_types
             # 是前三层 linear_attention、每第四层 full_attention。当前
             # SGLang core 使用字段名 layers_block_type，且把 full_attention
             # 叫作 attention；这里补齐别名，避免真实模型加载到第一层时报
@@ -200,7 +200,7 @@ def _ensure_sglang_qwen3_next_runtime_defaults(config: Any) -> None:
         rope_source.update(rope_scaling)
 
     if rope_scaling is None and rope_parameters is not None:
-        # 中文说明：vLLM/transformers 新 config 用 rope_parameters；当前
+        # 中文说明：transformers 新 config 用 rope_parameters；当前
         # SGLang core 仍读取 rope_scaling。这里保留原字段，同时补一个
         # SGLang 可消费的别名，避免真实模型用错默认 RoPE。
         setattr(config, "rope_scaling", dict(rope_parameters))

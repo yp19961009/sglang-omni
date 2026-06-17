@@ -155,7 +155,7 @@ def _split_packed_deepstack_output(
     if embeds.shape[-1] != expected:
         return embeds, multiscale
 
-    # 中文说明：SGLang/vLLM 的 Qwen3_VisionTransformer 会把主视觉特征
+    # 中文说明：SGLang/HF 的 Qwen3_VisionTransformer 会把主视觉特征
     # 和 deepstack 多尺度特征拼在最后一维返回。分离后，主特征继续作为
     # image/video_embeds，deepstack 层按 request builder 需要的 list 透传。
     chunks = torch.split(embeds, base_hidden_size, dim=-1)
@@ -220,7 +220,7 @@ def _load_visual_weights(
 ) -> nn.Module:
     load_weights = getattr(visual, "load_weights", None)
     if callable(load_weights):
-        # 中文说明：SGLang/vLLM vision tower 会把 HF 的 attn.q/k/v 权重
+        # 中文说明：SGLang/HF vision tower 会把 HF 的 attn.q/k/v 权重
         # 映射到 packed attn.qkv 参数。直接 load_state_dict 会绕过这个映射。
         state_dict = load_weights_by_prefix(model_path, prefix=VISUAL_PREFIX)
         load_weights(state_dict.items())

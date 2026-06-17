@@ -18,7 +18,7 @@ from sglang_omni.config import (
 _PKG = "sglang_omni.models.qwen3_5_omni"
 _PLACEMENT_POLICY = "sglang_omni.models.qwen3_omni.placement.Qwen3OmniPlacementPolicy"
 MIN_PARTIAL_START_CHUNKS = 3
-# 中文说明：vLLM dev/qwenc_perf_v2 的在线 Qwen3.5-Omni speech runner
+# 中文说明：reference implementation 的在线 Qwen3.5-Omni speech runner
 # 默认使用 max_model_len=192000。更长的 262144 主要出现在 thinker-only
 # eval/长上下文脚本；SGLang 默认先对齐在线 speech profile，降低首轮真实
 # 权重 smoke 的显存压力，需要 256k 时显式传 --thinker-max-seq-len。
@@ -31,7 +31,7 @@ QWEN3_5_OMNI_LIMIT_MM_PER_PROMPT = {
     "image": 960,
     "video": 960,
 }
-# 中文说明：vLLM dev/qwenc_perf_v2 的 H20 profile 使用 max_num_seqs=32。
+# 中文说明：reference implementation 的 H20 profile 使用 max_num_seqs=32。
 # SGLang 对应字段是 max_running_requests；talker 内部 buffer 会读取它。
 QWEN3_5_OMNI_MAX_RUNNING_REQUESTS = 32
 QWEN3_5_OMNI_CODE2WAV_ENABLE_TORCH_COMPILE = True
@@ -49,7 +49,7 @@ QWEN3_5_OMNI_MODEL_NAME_ALIASES = (
 # while Qwen3.5-Omni reuses the same AR scheduling envelope.
 _DEEPGEMM_PRECOMPILE_ENV_DEFAULTS = {"SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0"}
 
-# 中文说明：架构名对齐 vLLM dev/qwenc_perf_v2 的 registry。主模型用
+# 中文说明：架构名对齐 reference implementation 的 registry。主模型用
 # root architecture，thinker-only / thinker-MTP 名称作为 alias 进入配置
 # 注册表；MTP runtime 当前仍在 preflight 中提示未接入。
 QWEN3_5_OMNI_ARCH = "Qwen3OmniNextForConditionalGeneration"
@@ -97,14 +97,14 @@ def _preprocessing_stage(*, process: str) -> StageConfig:
         name="preprocessing",
         process=process,
         factory=f"{_PKG}.stages.create_preprocessing_executor",
-        # 中文说明：Qwen3.5 vLLM perf_v2 在线 speech profile 的 thinker
+        # 中文说明：Qwen3.5 reference 在线 speech profile 的 thinker
         # max_model_len 是 192000，长视频/长音频默认需要比 Qwen3 的 8192
         # 更大的 guard；256k eval 可通过 runtime/CLI 显式覆盖。
         factory_args={
             "thinker_max_seq_len": QWEN3_5_OMNI_THINKER_MAX_SEQ_LEN,
             "limit_mm_per_prompt": dict(QWEN3_5_OMNI_LIMIT_MM_PER_PROMPT),
         },
-        runtime_arg_map={
+        runtime_arg_map={ # runtime_arg_map = 通用 StageRuntimeConfig 字段 到 当前 stage factory kwargs 的翻译表
             "max_seq_len": "thinker_max_seq_len",
             # 中文说明：benchmark 常用的视觉默认参数可以从 runtime/YAML
             # 直接落到 preprocessor，避免每个请求都重复塞 videos_kwargs。
@@ -122,7 +122,7 @@ def _preprocessing_stage(*, process: str) -> StageConfig:
             "audio_target_sr": "audio_target_sr",
             "audio_sampling_rate": "audio_target_sr",
             "sampling_rate": "audio_target_sr",
-            # 中文说明：兼容 vLLM/Qwen3.5 配置里的短名，统一落到
+            # 中文说明：兼容 Qwen3.5 配置里的短名，统一落到
             # SGLang-Omni preprocessing executor 的 audio_* 参数。
             "audio_timestamp_interval": "audio_timestamp_interval",
             "timestamp_interval": "audio_timestamp_interval",
@@ -281,7 +281,7 @@ def _code2wav_stage(*, gpu: int, process: str) -> StageConfig:
         name="code2wav",
         process=process,
         factory=f"{_PKG}.components.code2wav_scheduler.create_code2wav_scheduler",
-        # 中文说明：vLLM perf_v2 的 Qwen3.5-Omni profile 默认打开
+        # 中文说明：reference 的 Qwen3.5-Omni profile 默认打开
         # code2wav torch.compile；这里保持同样的音频热路径性能默认，CLI/YAML
         # 仍可显式传 --no-code2wav-torch-compile 关闭。
         factory_args={
@@ -289,7 +289,7 @@ def _code2wav_stage(*, gpu: int, process: str) -> StageConfig:
             "enable_torch_compile": QWEN3_5_OMNI_CODE2WAV_ENABLE_TORCH_COMPILE,
         },
         runtime_arg_map={
-            # 中文说明：vLLM perf_v2 的 send_chunk_size 对应 code2wav
+            # 中文说明：reference 的 send_chunk_size 对应 code2wav
             # scheduler 的 stream_chunk_size，影响首音频分块和流式吞吐。
             "code2wav_stream_chunk_size": "stream_chunk_size",
             "send_chunk_size": "stream_chunk_size",
@@ -297,7 +297,7 @@ def _code2wav_stage(*, gpu: int, process: str) -> StageConfig:
             "code2wav_sample_rate": "sample_rate",
             "code2wav_left_context_size": "left_context_size",
             "code2wav_enable_dynamic_chunk": "enable_dynamic_chunk",
-            # 中文说明：vLLM perf_v2 的 code2wav_dynamic_batch 当前是
+            # 中文说明：reference 的 code2wav_dynamic_batch 当前是
             # 引擎侧动态解码策略开关；SGLang 对应到已有动态 chunk 调度。
             "enable_dynamic_chunk": "enable_dynamic_chunk",
             "code2wav_dynamic_batch": "enable_dynamic_chunk",

@@ -46,7 +46,6 @@ from sglang_omni.client.audio import (
 )
 from sglang_omni.http.favicon import register_favicon
 from sglang_omni.models.tts_streaming import INITIAL_CODEC_CHUNK_FRAMES_PARAM
-from sglang_omni.models.qwen3_5_omni.config import normalize_qwen35_omni_model_name
 from sglang_omni.serve.protocol import (
     ChatCompletionAudio,
     ChatCompletionChoice,
@@ -71,209 +70,11 @@ _BAD_REQUEST_MARKERS = (
     "longer than the model's context length",
     "Requested token count exceeds the model's maximum context length",
 )
-_CHAT_PARAMETERS_ALIASES: dict[str, tuple[str, ...]] = {
-    "audios": ("input_audio", "input_audios", "audio_url", "audio_urls"),
-    "images": ("image", "input_image", "input_images", "image_url", "image_urls"),
-    "videos": ("video", "input_video", "input_videos", "video_url", "video_urls"),
-    "image_min_pixels": ("min_pixels",),
-    "image_max_pixels": ("max_pixels",),
-    "video_fps": ("fps",),
-    "video_min_frames": ("min_frames",),
-    "video_max_frames": ("max_frames",),
-    "video_min_pixels": ("min_pixels",),
-    "video_max_pixels": ("max_pixels",),
-    "video_total_pixels": ("total_pixels",),
-    "video_seconds_per_chunk": ("seconds_per_chunk",),
-    "video_position_id_per_seconds": ("position_id_per_seconds",),
-    "return_video_metadata": ("return_metadata",),
-    "video_metadata": ("videos_metadata",),
-    "audio_target_sr": ("audio_sampling_rate", "sampling_rate"),
-    "audio_timestamp_interval": ("timestamp_interval",),
-    "audio_downsample_times": ("downsample_times",),
-    "audio_downsample_chunk_size": ("downsample_chunk_size",),
-    "stage_params": ("stage_parameters",),
-    "stage_sampling": ("stage_sampling_params", "stage_sampling_parameters"),
-    "enable_tn": (
-        "enable_text_normalization",
-        "text_normalization",
-    ),
-}
-_TALKER_EXTRA_FIELD_NAMES = (
-    "talker_temperature",
-    "talker_top_p",
-    "talker_top_k",
-    "talker_min_p",
-    "talker_repetition_penalty",
-    "talker_seed",
-    "talker_sampling_seed",
-    "talker_max_tokens",
-    "talker_max_completion_tokens",
-    "talker_max_new_tokens",
-    "talker_params",
-    "subtalker_temperature",
-    "subtalker_top_p",
-    "subtalker_top_k",
-    "subtalker_min_p",
-    "subtalker_repetition_penalty",
-    "subtalker_seed",
-    "subtalker_sampling_seed",
-    "subtalker_max_tokens",
-    "subtalker_max_completion_tokens",
-    "subtalker_max_new_tokens",
-    "subtalker_params",
-    "voice_type",
-    "voice",
-    "speaker",
-    "speaker_id",
-    "language",
-    "lang",
-    "language_type",
-    "target_language",
-    "target_lang",
-    "source_lang",
-    "source_language",
-    "language_id",
-    "voice_style",
-    "style",
-    "instruction",
-    "talker_instruction",
-    "assistant_instruct_ids",
-    "talker_assistant_prompt_ids",
-    "voice_style_ids",
-    "instruct_ids",
-    "system_instruct_ids",
-    "talker_system_instruct_ids",
-    "speaker_system_instruct_ids",
-    "talker_system_instruct",
-    "system_instruct",
-    "voice_clone_system_instruct",
-    "prompt_speaker_codes",
-    "speaker_codec_codes",
-    "voice_clone_codes",
-    "tts_generate_mode",
-    "qwen_tts_generate_mode",
-    "enable_tn",
-    "do_wave",
-)
 
 
 def _is_bad_request_error(exc: Exception) -> bool:
     message = str(exc)
     return any(marker in message for marker in _BAD_REQUEST_MARKERS)
-
-
-def _normalize_openai_model_name(model_name: str | None) -> str | None:
-    # 中文说明：Qwen3.5-Omni 用户命令里常混用 qwen3.5/qwen3_5/qwen3-5。
-    # serve 层只归一已知 Qwen3.5 别名，其他模型名保持原样。
-    return normalize_qwen35_omni_model_name(model_name)
-
-
-def _coerce_modalities(value: Any) -> list[str] | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        # 中文说明：OpenAI 正式字段通常是 list，但 curl/压测脚本常把
-        # modalities 写成 "text,audio" 或 "text audio"。serve 层先统一
-        # 切成 token，避免 Qwen3.5 talker gating 把它当作单个模态。
-        values = value.replace(",", " ").split()
-    elif isinstance(value, (list, tuple, set)):
-        values = []
-        for item in value:
-            if isinstance(item, str):
-                values.extend(item.replace(",", " ").split())
-            else:
-                values.append(item)
-    else:
-        return None
-    modalities = [str(item).lower() for item in values if str(item).strip()]
-    return modalities or None
-
-
-def _media_payload_value(value: Any, *, media_prefix: str) -> Any:
-    if isinstance(value, dict):
-        path = value.get("path")
-        if path is not None:
-            # 中文说明：vLLM Qwen3.5 OpenAI demo 会把本地临时文件作为
-            # {"path": ...} 或等价裸字符串传入；serve 层先归一成路径，
-            # 后续 preprocessor/resource connector 才能复用同一套加载逻辑。
-            return path
-        url = value.get("url")
-        if url is not None:
-            return url
-        data = value.get("data")
-        if data is not None:
-            media_format = str(value.get("format") or "octet-stream")
-            return f"data:{media_prefix}/{media_format};base64,{data}"
-    return value
-
-
-def _coerce_media_list(value: Any, *, media_prefix: str) -> list[Any] | None:
-    if value is None:
-        return None
-    if isinstance(value, (str, bytes)):
-        return [value] if value else None
-    if isinstance(value, (list, tuple, set)):
-        values = [
-            _media_payload_value(item, media_prefix=media_prefix)
-            for item in value
-            if item is not None
-        ]
-        return values or None
-    # 中文说明：兼容直接传 PIL/ndarray/tensor 这类媒体对象；不要在 serve 层
-    # 强行 bool(value)，避免多元素数组/张量报错。OpenAI-style {"url": ...}
-    # / {"data": ...} 则先转成 resource connector 能加载的路径或 data URL。
-    return [_media_payload_value(value, media_prefix=media_prefix)]
-
-
-def _coerce_audio_output_flag(value: Any) -> bool | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        return bool(value)
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"1", "true", "yes", "on", "audio"}:
-            return True
-        if normalized in {"0", "false", "no", "off", "text", "none"}:
-            return False
-    return None
-
-
-def _nested_parameters(req: Any) -> dict[str, Any]:
-    parameters = getattr(req, "parameters", None)
-    return parameters if isinstance(parameters, dict) else {}
-
-
-def _chat_nested_parameters(req: ChatCompletionRequest) -> dict[str, Any]:
-    return _nested_parameters(req)
-
-
-def _request_or_parameters_value(req: Any, key: str) -> Any:
-    fields_set = getattr(req, "model_fields_set", None)
-    field_is_explicit = fields_set is None or key in fields_set
-    if field_is_explicit:
-        value = getattr(req, key, None)
-        if value is not None:
-            return value
-    parameters = _nested_parameters(req)
-    value = parameters.get(key)
-    if value is not None:
-        return value
-    for alias in _CHAT_PARAMETERS_ALIASES.get(key, ()):
-        value = parameters.get(alias)
-        if value is not None:
-            # 中文说明：Pydantic 只会处理顶层 OpenAI body 的 alias；
-            # DashScope/vLLM-style parameters 是普通 dict，需要这里补齐
-            # fps/max_pixels/timestamp_interval 等常用短名。
-            return value
-    if not field_is_explicit:
-        # 中文说明：Pydantic 默认值不是用户意图。尤其 /v1/audio/speech
-        # 的 voice 默认是 "default"，不能抢在 parameters.voice_type 前面，
-        # 否则 Qwen3.5 request builder 会按 voice 优先级选错音色。
-        return None
-    return None
 
 
 def _default_generation_value(
@@ -290,7 +91,7 @@ def _request_or_default_generation_value(
     key: str,
     default_generation_params: dict[str, Any] | None = None,
 ) -> Any:
-    value = _request_or_parameters_value(req, key)
+    value = getattr(req, key, None)
     if value is not None:
         return value
     return _default_generation_value(default_generation_params, key)
@@ -300,15 +101,10 @@ def _chat_effective_max_tokens(
     req: ChatCompletionRequest,
     default_generation_params: dict[str, Any] | None = None,
 ) -> Any:
-    max_completion_tokens = _request_or_parameters_value(
-        req,
-        "max_completion_tokens",
-    )
-    if max_completion_tokens is not None:
-        return max_completion_tokens
-    max_tokens = _request_or_parameters_value(req, "max_tokens")
-    if max_tokens is not None:
-        return max_tokens
+    if req.max_completion_tokens is not None:
+        return req.max_completion_tokens
+    if req.max_tokens is not None:
+        return req.max_tokens
     default_max_completion_tokens = _default_generation_value(
         default_generation_params,
         "max_completion_tokens",
@@ -318,8 +114,7 @@ def _chat_effective_max_tokens(
     return _default_generation_value(default_generation_params, "max_tokens")
 
 
-def _stage_sampling_overrides(req: Any) -> dict[str, SamplingParams] | None:
-    raw = _request_or_parameters_value(req, "stage_sampling")
+def _stage_sampling_overrides(raw: Any) -> dict[str, SamplingParams] | None:
     if raw is None:
         return None
     if not isinstance(raw, dict):
@@ -334,14 +129,11 @@ def _stage_sampling_overrides(req: Any) -> dict[str, SamplingParams] | None:
             raise ValueError(
                 "stage_sampling values must be SamplingParams or mappings"
             )
-        # 中文说明：兼容 parameters.stage_sampling，保证 Qwen3.5 压测时
-        # thinker/talker/subtalker 等 stage 级采样参数能进入调度层。
         stage_sampling[str(stage_name)] = SamplingParams(**params_dict)
     return stage_sampling or None
 
 
-def _stage_param_overrides(req: Any) -> dict[str, dict[str, Any]] | None:
-    raw = _request_or_parameters_value(req, "stage_params")
+def _stage_param_overrides(raw: Any) -> dict[str, dict[str, Any]] | None:
     if raw is None:
         return None
     if not isinstance(raw, dict):
@@ -351,8 +143,6 @@ def _stage_param_overrides(req: Any) -> dict[str, dict[str, Any]] | None:
     for stage_name, params in raw.items():
         if not isinstance(params, dict):
             raise ValueError("stage_params values must be mappings")
-        # 中文说明：复制一层，避免后续 pipeline 侧合并/补默认值时修改
-        # FastAPI/Pydantic 保存的原始请求对象。
         stage_params[str(stage_name)] = dict(params)
     return stage_params or None
 
@@ -360,24 +150,16 @@ def _stage_param_overrides(req: Any) -> dict[str, dict[str, Any]] | None:
 def _chat_audio_config(req: ChatCompletionRequest) -> dict[str, Any] | None:
     if isinstance(req.audio, dict):
         return req.audio
-    audio_config = _chat_nested_parameters(req).get("audio")
-    return audio_config if isinstance(audio_config, dict) else None
+    return None
 
 
 def _request_metadata(req: ChatCompletionRequest) -> dict[str, Any]:
     metadata = req.metadata if isinstance(req.metadata, dict) else None
-    if metadata is None:
-        nested_metadata = _chat_nested_parameters(req).get("metadata")
-        metadata = nested_metadata if isinstance(nested_metadata, dict) else None
     metadata = dict(metadata or {})
     for key in ("request_id", "user"):
         value = getattr(req, key, None)
         if value is not None:
-            # 中文说明：这些字段只用于请求追踪/压测归因；放进 metadata 后
-            # coordinator、stage profile 和下游日志都能拿到同一个业务标识。
             metadata[key] = value
-    # 中文说明：metadata 是请求追踪/压测标签，不直接执行；复制一份避免
-    # 后续内部字段合并时修改用户传入的原始对象。
     return metadata
 
 
@@ -398,170 +180,101 @@ def _legacy_functions_as_tools(value: Any) -> list[dict[str, Any]] | None:
 
 
 def _requested_modalities(req: ChatCompletionRequest) -> list[str]:
-    for key in ("modalities", "output_modalities", "response_modalities"):
-        modalities = _coerce_modalities(_request_or_parameters_value(req, key))
-        if modalities is not None:
-            return modalities
-
-    for key in ("enable_audio_output", "audio_output", "return_audio", "do_wave"):
-        enabled = _coerce_audio_output_flag(_request_or_parameters_value(req, key))
-        if enabled is not None:
-            # 中文说明：兼容 vLLM/Qwen3.5 内部压测常用的布尔音频开关；
-            # do_wave=True 在 vLLM 脚本里表示最终需要合成 waveform。
-            # 显式 modalities 仍优先，避免布尔开关覆盖用户的精确模态列表。
-            return ["text", "audio"] if enabled else ["text"]
-
-    return ["text"]
+    return list(req.modalities) if req.modalities else ["text"]
 
 
 def _stream_include_usage(req: ChatCompletionRequest) -> bool:
-    stream_options = _request_or_parameters_value(req, "stream_options")
+    stream_options = req.stream_options
     if not isinstance(stream_options, dict):
         return False
-    enabled = _coerce_audio_output_flag(stream_options.get("include_usage"))
-    # 中文说明：OpenAI/vLLM streaming 客户端常用
-    # stream_options.include_usage 请求一个 usage-only SSE chunk。默认仍保持
-    # sglang-omni 旧行为，避免影响现有流式消费者。
-    return bool(enabled)
+    return bool(stream_options.get("include_usage"))
 
 
-def _normalize_voice_clone_value(value: Any) -> Any:
-    if isinstance(value, dict) and len(value) == 1:
-        for path_key in ("path", "xvector_info_path", "voice_clone_path"):
-            if value.get(path_key) is not None:
-                return value[path_key]
-    return value
-
-
-def _translation_target_language(options: Any) -> Any:
-    if not isinstance(options, dict):
-        return None
-    for key in (
-        "target_language",
-        "target_lang",
-        "targetLanguage",
-        "language",
-        "lang",
-    ):
-        value = options.get(key)
-        if value is not None:
-            return value
-    return None
-
-
-def _talker_extra_params(req: Any) -> dict[str, Any]:
-    params: dict[str, Any] = {}
-    for field_name in _TALKER_EXTRA_FIELD_NAMES:
-        value = _request_or_parameters_value(req, field_name)
-        if value is not None:
-            params[field_name] = value
-
-    translation_options = _request_or_parameters_value(req, "translation_options")
-    if translation_options is not None:
-        # 中文说明：vLLM Qwen3.5 perf_v2 的翻译请求把目标语言放在
-        # translation_options.target_lang。serve 层先保留原结构，再补一份
-        # target_language 给 talker/request builder 走统一语言控制路径。
-        params["translation_options"] = translation_options
-        target_language = _translation_target_language(translation_options)
-        if target_language is not None and not any(
-            params.get(key) is not None
-            for key in (
-                "language_id",
-                "language",
-                "lang",
-                "language_type",
-                "target_language",
-                "target_lang",
-            )
-        ):
-            params["target_language"] = target_language
-
-    xvector_info = _request_or_parameters_value(req, "xvector_info")
-    if xvector_info is None:
-        xvector_info = _request_or_parameters_value(req, "xvector_info_path")
-    if xvector_info is not None:
-        # 中文说明：Qwen3.5 talker 统一从 params 读取 xvector_info。
-        # 顶层 path alias 在 serve 层归一，避免 request builder 再分支。
-        params["xvector_info"] = _normalize_voice_clone_value(xvector_info)
-
-    voice_clone_info = _request_or_parameters_value(req, "voice_clone_info")
-    if voice_clone_info is None:
-        voice_clone_info = _request_or_parameters_value(req, "voice_clone_path")
-    if voice_clone_info is None:
-        voice_clone_info = _request_or_parameters_value(req, "voice_clone")
-    if voice_clone_info is not None:
-        params["voice_clone_info"] = _normalize_voice_clone_value(voice_clone_info)
-
-    return params
-
-
-def _merge_default_talker_params(
+def _default_talker_extra_params(
     default_talker_params: dict[str, Any] | None,
-    request_talker_params: dict[str, Any],
 ) -> dict[str, Any]:
     if not default_talker_params:
-        return request_talker_params
-    # 中文说明：server 默认参数只负责补缺省值，请求显式传入的
-    # voice/voice_type/enable_tn 等控制项永远覆盖默认值。
-    merged = {
-        key: value
-        for key, value in default_talker_params.items()
-        if value is not None
+        return {}
+    return {
+        key: value for key, value in default_talker_params.items() if value is not None
     }
-    merged.update(request_talker_params)
-    return merged
 
 
-def _chat_talker_extra_params(
+def _chat_default_talker_extra_params(
     req: ChatCompletionRequest,
     default_talker_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    params = _talker_extra_params(req)
+    params = _default_talker_extra_params(default_talker_params)
     audio_config = _chat_audio_config(req)
-    if isinstance(audio_config, dict) and not any(
-        params.get(key) is not None for key in ("voice_type", "voice", "speaker")
-    ):
-        for key in ("voice_type", "voice", "speaker"):
-            value = audio_config.get(key)
-            if value is not None:
-                # 中文说明：audio.voice 是请求级 OpenAI 字段，应覆盖服务启动
-                # 默认 voice_type；显式 parameters.voice_type 仍保持优先。
-                params["voice_type"] = value
-                break
-    return _merge_default_talker_params(
-        default_talker_params,
-        params,
+    if not isinstance(audio_config, dict):
+        return params
+
+    override_groups = (
+        (("voice_type", "voice", "speaker"), ("voice_type", "voice", "speaker")),
+        (
+            (
+                "language",
+                "lang",
+                "language_id",
+                "language_type",
+                "target_language",
+                "target_lang",
+            ),
+            (
+                "language",
+                "lang",
+                "language_id",
+                "language_type",
+                "target_language",
+                "target_lang",
+            ),
+        ),
+        (("voice_style", "style"), ("voice_style", "style")),
+        (
+            (
+                "instruction",
+                "talker_instruction",
+                "assistant_instruct_ids",
+                "talker_assistant_prompt_ids",
+                "voice_style_ids",
+                "instruct_ids",
+            ),
+            ("instruction", "talker_instruction"),
+        ),
+        (
+            (
+                "xvector_info",
+                "voice_clone_info",
+                "xvector_info_path",
+                "voice_clone_path",
+                "voice_clone",
+            ),
+            (
+                "xvector_info",
+                "voice_clone_info",
+                "xvector_info_path",
+                "voice_clone_path",
+                "voice_clone",
+            ),
+        ),
     )
-
-
-def _speech_talker_extra_params(
-    req: CreateSpeechRequest,
-    default_talker_params: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    params = _talker_extra_params(req)
-    if req.instructions is not None and params.get("instruction") is None:
-        # 中文说明：OpenAI speech 的 instructions 对 Qwen3.5 talker 等价于
-        # voice/style instruction，放进 params 才能被 request builder 读取。
-        params["instruction"] = req.instructions
-    return _merge_default_talker_params(default_talker_params, params)
+    for default_keys, audio_keys in override_groups:
+        if any(audio_config.get(key) is not None for key in audio_keys):
+            for key in default_keys:
+                params.pop(key, None)
+    return params
 
 
 def _speech_effective_max_new_tokens(
     req: CreateSpeechRequest,
     default_generation_params: dict[str, Any] | None = None,
 ) -> Any:
-    max_new_tokens = _request_or_parameters_value(req, "max_new_tokens")
-    if max_new_tokens is not None:
-        return max_new_tokens
-    max_completion_tokens = _request_or_parameters_value(
-        req,
-        "max_completion_tokens",
-    )
-    if max_completion_tokens is not None:
-        return max_completion_tokens
-    max_tokens = _request_or_parameters_value(req, "max_tokens")
-    if max_tokens is not None:
-        return max_tokens
+    if req.max_new_tokens is not None:
+        return req.max_new_tokens
+    if req.max_completion_tokens is not None:
+        return req.max_completion_tokens
+    if req.max_tokens is not None:
+        return req.max_tokens
     default_max_new_tokens = _default_generation_value(
         default_generation_params,
         "max_new_tokens",
@@ -611,9 +324,7 @@ def create_app(
 
     # Store references in app state for access from route handlers
     app.state.client = client
-    app.state.model_name = _normalize_openai_model_name(
-        model_name or "sglang-omni"
-    )
+    app.state.model_name = model_name or "sglang-omni"
     app.state.realtime_enabled = enable_realtime
     app.state.default_talker_params = dict(default_talker_params or {})
     app.state.default_generation_params = dict(default_generation_params or {})
@@ -678,7 +389,7 @@ def _register_chat_completions(app: FastAPI) -> None:
         request_id = req.request_id or str(uuid.uuid4())
         response_id = f"chatcmpl-{request_id}"
         created = int(time.time())
-        model = _normalize_openai_model_name(req.model or default_model)
+        model = req.model or default_model
 
         gen_req = _build_chat_generate_request(
             req,
@@ -766,17 +477,6 @@ async def _chat_non_stream(
             # 中文说明：code2wav 返回真实 sample_rate 后，非流式 chat
             # 也把它透给调用方；旧路径没有该字段时保持响应兼容。
             message["audio"]["sample_rate"] = result.audio.sample_rate
-        # 中文说明：vLLM perf_v2 的 Qwen3.5 Omni server 在非流式响应
-        # 顶层额外返回 audio: {data, format}。保留 message.audio 的同时补
-        # 这个兼容字段，方便同一套压测脚本横向对比 vLLM 和 sglang-omni。
-        top_level_audio = {
-            "data": result.audio.data,
-            "format": result.audio.format or audio_format,
-        }
-        if result.audio.sample_rate is not None:
-            top_level_audio["sample_rate"] = result.audio.sample_rate
-    else:
-        top_level_audio = None
 
     if "content" not in message and "audio" not in message:
         message["content"] = result.text
@@ -798,19 +498,13 @@ async def _chat_non_stream(
             ChatCompletionChoice(
                 index=0,
                 message=message,
-                # 中文说明：vLLM/OpenAI 非流式响应在正常结束时通常返回
-                # finish_reason="stop"。部分内部 fake/旧 stage 不带该字段，
-                # serve 层补齐可让压测脚本和 OpenAI SDK 解析更稳定。
                 finish_reason=result.finish_reason or "stop",
             )
         ],
         usage=usage,
     )
 
-    payload = response.model_dump()
-    if top_level_audio is not None:
-        payload["audio"] = top_level_audio
-    return JSONResponse(content=payload)
+    return JSONResponse(content=response.model_dump())
 
 
 async def _chat_stream(
@@ -1038,42 +732,27 @@ def _build_chat_generate_request(
     # Determine output modalities
     output_modalities = _requested_modalities(req)  # e.g. ["text", "audio"]
 
-    # Build per-stage sampling/runtime overrides. 顶层字段和
-    # DashScope/vLLM-style parameters 都走同一套白名单解析。
-    stage_sampling = _stage_sampling_overrides(req)
-    stage_params = _stage_param_overrides(req)
+    stage_sampling = _stage_sampling_overrides(req.stage_sampling)
+    stage_params = _stage_param_overrides(req.stage_params)
 
     # Extract audios, images, and videos from request
-    audios: list[Any] | None = None
-    request_audios = _request_or_parameters_value(req, "audios")
-    if request_audios is not None:
-        audios = _coerce_media_list(request_audios, media_prefix="audio")
-
-    images: list[Any] | None = None
-    request_images = _request_or_parameters_value(req, "images")
-    if request_images is not None:
-        images = _coerce_media_list(request_images, media_prefix="image")
-
-    videos: list[Any] | None = None
-    request_videos = _request_or_parameters_value(req, "videos")
-    if request_videos is not None:
-        videos = _coerce_media_list(request_videos, media_prefix="video")
+    audios = list(req.audios) if req.audios else None
+    images = list(req.images) if req.images else None
+    videos = list(req.videos) if req.videos else None
 
     # Merge audio config, audios, images, and videos into metadata.
-    # 中文说明：这些 request-level 预处理参数必须跟媒体一起进入
-    # GenerateRequest.metadata，client 会再把它们提升到 OmniRequest.inputs。
     metadata: dict[str, Any] = _request_metadata(req)
     audio_config = _chat_audio_config(req)
     if audio_config is not None:
         metadata["audio_config"] = audio_config
-    tools = _request_or_parameters_value(req, "tools")
+    tools = req.tools
     if tools is None:
-        tools = _legacy_functions_as_tools(_request_or_parameters_value(req, "functions"))
+        tools = _legacy_functions_as_tools(req.functions)
     if tools is not None:
         # 中文说明：tools 只用于 chat template 渲染，不在服务端执行。
         metadata["tools"] = tools
     for key in ("tool_choice", "parallel_tool_calls", "function_call"):
-        value = _request_or_parameters_value(req, key)
+        value = getattr(req, key, None)
         if value is not None:
             metadata[key] = value
     if audios:
@@ -1098,22 +777,29 @@ def _build_chat_generate_request(
         "video_position_id_per_seconds",
         "return_video_metadata",
         "video_metadata",
-        "multi_modal_data",
-        "mm_processor_kwargs",
-        "multi_modal_uuids",
         "audio_target_sr",
         "audio_timestamp_interval",
         "audio_downsample_times",
         "audio_downsample_chunk_size",
     ):
-        value = _request_or_parameters_value(req, key)
+        value = getattr(req, key, None)
         if value is not None:
             metadata[key] = value
 
-    extra_params = _chat_talker_extra_params(req, default_talker_params)
+    extra_params = _chat_default_talker_extra_params(req, default_talker_params)
+    for field_name in (
+        "talker_temperature",
+        "talker_top_p",
+        "talker_top_k",
+        "talker_repetition_penalty",
+        "talker_max_new_tokens",
+    ):
+        value = getattr(req, field_name, None)
+        if value is not None:
+            extra_params[field_name] = value
 
     return GenerateRequest(
-        model=_normalize_openai_model_name(req.model or default_model),
+        model=req.model or default_model,
         messages=messages,
         sampling=sampling,
         stage_sampling=stage_sampling,
@@ -1418,7 +1104,7 @@ def build_speech_generate_request(
     explicit_generation_params = sorted(
         field
         for field in generation_fields
-        if _request_or_parameters_value(req, field) is not None
+        if getattr(req, field, None) is not None
     )
     initial_codec_chunk_frames = req.initial_codec_chunk_frames
     if (
@@ -1550,19 +1236,14 @@ def build_speech_generate_request(
     if references:
         prompt = {"text": req.input, "references": references}
 
-    # 中文说明：metadata 保留给 HTTP/TTS 响应层；Qwen3.5 talker/code2wav
-    # request builder 从 OmniRequest.params 读取 voice、clone、subtalker
-    # 采样等控制项，所以这里必须通过 extra_params 进入 client._build_params。
-    extra_params.update(
-        _speech_talker_extra_params(req, default_talker_params)
-    )
+    extra_params.update(_default_talker_extra_params(default_talker_params))
 
     return GenerateRequest(
-        model=_normalize_openai_model_name(req.model or default_model),
+        model=req.model or default_model,
         prompt=prompt,
         sampling=sampling,
-        stage_sampling=_stage_sampling_overrides(req),
-        stage_params=_stage_param_overrides(req),
+        stage_sampling=_stage_sampling_overrides(req.stage_sampling),
+        stage_params=_stage_param_overrides(req.stage_params),
         extra_params=extra_params,
         stream=req.stream,
         output_modalities=["audio"],

@@ -57,131 +57,6 @@ _LIMIT_MM_MODALITIES = frozenset({"audio", "image", "video"})
 _QWEN35_CODE2WAV_ODEINT_METHODS = frozenset({"euler", "rk4"})
 _QWEN35_CODE2WAV_FREQUENCIES = frozenset({"50hz", "25hz"})
 _QWEN35_CODE2WAV_DIT_QUANTS = frozenset({"fp8"})
-_QWEN35_MAMBA_CACHE_MODES = frozenset({"none", "light", "all"})
-_QWEN35_VLLM_EXECUTOR_BACKENDS = frozenset({"mp"})
-_QWEN35_SPECULATIVE_MTP_METHODS = frozenset({"qwen3_omni_next_thinker_mtp"})
-_QWEN35_VLLM_PROFILE_BOOL_FLAGS: dict[str, tuple[str, object]] = {
-    "--text-only": ("text_only", True),
-    "--disable-mtp": ("disable_mtp", True),
-    "--enforce-eager": ("enforce_eager", True),
-    "--enable-prefix-caching": ("enable_prefix_caching", True),
-    "--disable-prefix-caching": ("disable_prefix_caching", True),
-    "--enable-chunked-prefill": ("enable_chunked_prefill", True),
-    "--no-enable-chunked-prefill": ("disable_chunked_prefill", True),
-    "--code2wav-enable-torch-compile": ("code2wav_enable_torch_compile", True),
-    "--no-code2wav-torch-compile": ("code2wav_disable_torch_compile", True),
-    "--no-code2wav-dynamic-chunk": ("code2wav_disable_dynamic_chunk", True),
-    "--code2wav-enable-dynamic-chunk": ("code2wav_enable_dynamic_chunk", True),
-    "--code2wav-enable-torch-compile-first-chunk": (
-        "code2wav_enable_torch_compile_first_chunk",
-        True,
-    ),
-    "--no-code2wav-torch-compile-first-chunk": (
-        "code2wav_disable_torch_compile_first_chunk",
-        True,
-    ),
-    "--code2wav-odeint-method-relaxed": (
-        "code2wav_enable_odeint_method_relaxed",
-        True,
-    ),
-    "--no-code2wav-odeint-method-relaxed": (
-        "code2wav_disable_odeint_method_relaxed",
-        True,
-    ),
-    "--enable-tn": ("enable_tn", True),
-    "--enable-text-normalization": ("enable_tn", True),
-    "--disable-tn": ("disable_tn", True),
-    "--no-enable-tn": ("disable_tn", True),
-    "--disable-text-normalization": ("disable_tn", True),
-}
-_QWEN35_VLLM_PROFILE_VALUE_FLAGS: dict[str, tuple[str, type]] = {
-    "--model": ("model_path", str),
-    "--model-path": ("model_path", str),
-    "--thinker-model": ("thinker_model_path", str),
-    "--thinker-model-path": ("thinker_model_path", str),
-    "--talker-model": ("talker_model_path", str),
-    "--talker-model-path": ("talker_model_path", str),
-    "--code2wav-model": ("code2wav_model_folder", str),
-    "--code2wav-model-path": ("code2wav_model_path", str),
-    "--code2wav-model-folder": ("code2wav_model_folder", str),
-    "--gpu-memory-utilization": ("mem_fraction_static", float),
-    "--thinker-gpu-memory-utilization": ("thinker_mem_fraction_static", float),
-    "--talker-gpu-memory-utilization": ("talker_mem_fraction_static", float),
-    "--dtype": ("dtype", str),
-    "--mamba-cache-dtype": ("mamba_ssm_dtype", str),
-    "--thinker-quantization": ("quantization", str),
-    "--talker-quantization": ("talker_quantization", str),
-    "--max-model-len": ("max_model_len", int),
-    "--max-mm-len": ("max_mm_len", int),
-    "--max-num-batched-tokens": ("max_num_batched_tokens", int),
-    "--max-num-seqs": ("max_running_requests", int),
-    "--max-seq-len-to-capture": ("max_seq_len_to_capture", int),
-    "--max-tokens": ("max_tokens", int),
-    "--seed": ("seed", int),
-    "--send-chunk-size": ("code2wav_stream_chunk_size", int),
-    "--host": ("host", str),
-    "--port": ("port", int),
-    "--serve-port": ("port", int),
-    "--serve_port": ("port", int),
-    "--block-size": ("page_size", int),
-    "--page-size": ("page_size", int),
-    "--thinker-devices": ("thinker_visible_devices", str),
-    "--thinker-visible-devices": ("thinker_visible_devices", str),
-    "--talker-devices": ("talker_visible_devices", str),
-    "--talker-visible-devices": ("talker_visible_devices", str),
-    "--code2wav-devices": ("code2wav_visible_devices", str),
-    "--code2wav-visible-devices": ("code2wav_visible_devices", str),
-    "--thinker-tp-size": ("thinker_tp_size", int),
-    "--thinker-tensor-parallel-size": ("thinker_tp_size", int),
-    "--thinker_tensor_parallel_size": ("thinker_tp_size", int),
-    "--thinker-only": ("thinker_only_marker", str),
-    "--limit-mm-per-prompt": ("limit_mm_per_prompt", str),
-    "--code2wav-codec-eos-token-id": ("code2wav_codec_eos_token_id", int),
-    "--code2wav-left-context-size": ("code2wav_left_context_size", int),
-    "--code2wav-sample-rate": ("code2wav_sample_rate", int),
-    "--code2wav-dynamic-chunk-sizes": ("code2wav_dynamic_chunk_sizes", str),
-    "--code2wav-dynamic-chunk-steps": ("code2wav_dynamic_chunk_steps", str),
-    "--code2wav-odeint-method": ("code2wav_odeint_method", str),
-    "--code2wav-batched-chunk": ("code2wav_batched_chunk", int),
-    "--code2wav-frequency": ("code2wav_frequency", str),
-    "--code2wav-dit-quantization": ("code2wav_dit_quant", str),
-    "--sample-rate": ("code2wav_sample_rate", int),
-    "--video-fps": ("video_fps", float),
-    "--voice-type": ("voice_type", str),
-    "--compilation-config": ("compilation_config", str),
-    "--override-video-max-pixels": ("override_video_max_pixels", str),
-}
-_QWEN35_TEXT_ONLY_PROFILE_SKIP_DEFAULT_KEYS = frozenset(
-    {
-        "talker_mem_fraction_static",
-        "talker_visible_devices",
-        "talker_model_path",
-        "code2wav_visible_devices",
-        "code2wav_model_path",
-        "code2wav_model_folder",
-        "code2wav_enable_torch_compile",
-        "code2wav_disable_torch_compile",
-        "code2wav_enable_torch_compile_first_chunk",
-        "code2wav_disable_torch_compile_first_chunk",
-        "code2wav_sample_rate",
-        "code2wav_stream_chunk_size",
-        "code2wav_left_context_size",
-        "code2wav_codec_eos_token_id",
-        "code2wav_enable_dynamic_chunk",
-        "code2wav_disable_dynamic_chunk",
-        "code2wav_dynamic_chunk_sizes",
-        "code2wav_dynamic_chunk_steps",
-        "code2wav_odeint_method",
-        "code2wav_enable_odeint_method_relaxed",
-        "code2wav_disable_odeint_method_relaxed",
-        "code2wav_batched_chunk",
-        "code2wav_frequency",
-        "code2wav_dit_quant",
-        "voice_type",
-        "enable_tn",
-        "disable_tn",
-    }
-)
 
 
 def launch_server(*args: object, **kwargs: object) -> object:
@@ -251,130 +126,6 @@ def _is_qwen35_config(pipeline_config: PipelineConfig) -> bool:
 
 def _is_qwen35_speech_config(pipeline_config: PipelineConfig) -> bool:
     return type(pipeline_config).__name__ in _QWEN35_SPEECH_CONFIG_CLASSES
-
-
-def _load_qwen35_vllm_profile_defaults(
-    profile_path: str | None,
-    *,
-    disable_mtp_override: bool = False,
-) -> dict[str, object]:
-    if profile_path is None:
-        return {}
-
-    from sglang_omni.models.qwen3_5_omni import preflight as qwen35_preflight
-
-    payload = qwen35_preflight.load_vllm_profile_payload(profile_path)
-    if disable_mtp_override:
-        payload = _qwen35_profile_payload_with_disable_mtp(payload)
-    report = qwen35_preflight.run_vllm_profile_preflight(
-        payload,
-        source=profile_path,
-    )
-    if not report.ok:
-        raise typer.BadParameter(
-            "--vllm-profile contains settings this launcher cannot map yet:\n"
-            + qwen35_preflight.format_vllm_profile_report(report)
-        )
-    return _parse_qwen35_vllm_profile_defaults(
-        qwen35_preflight.suggested_vllm_profile_cli_args(report)
-    )
-
-
-def _qwen35_profile_payload_with_disable_mtp(payload: object) -> object:
-    if not isinstance(payload, dict):
-        return payload
-    if isinstance(payload.get("engine_args"), dict):
-        normalized = dict(payload)
-        engine_args = dict(payload["engine_args"])
-        engine_args["disable_mtp"] = True
-        normalized["engine_args"] = engine_args
-        return normalized
-    for key, value in payload.items():
-        if not isinstance(value, dict) or not isinstance(value.get("engine_args"), dict):
-            continue
-        normalized = dict(payload)
-        nested = dict(value)
-        engine_args = dict(value["engine_args"])
-        engine_args["disable_mtp"] = True
-        nested["engine_args"] = engine_args
-        normalized[key] = nested
-        return normalized
-    # 中文说明：少数 profile 直接就是 engine_args 对象；这里追加
-    # disable_mtp，让通用 serve 和 example launcher 对 MTP profile 行为一致。
-    normalized = dict(payload)
-    normalized["disable_mtp"] = True
-    return normalized
-
-
-def _parse_qwen35_vllm_profile_defaults(args: tuple[str, ...]) -> dict[str, object]:
-    defaults: dict[str, object] = {}
-    idx = 0
-    while idx < len(args):
-        raw_flag = str(args[idx])
-        flag, inline_value = (
-            raw_flag.split("=", 1) if "=" in raw_flag else (raw_flag, None)
-        )
-        bool_target = _QWEN35_VLLM_PROFILE_BOOL_FLAGS.get(flag)
-        if bool_target is not None:
-            key, value = bool_target
-            defaults[key] = value
-            idx += 1
-            continue
-
-        value_target = _QWEN35_VLLM_PROFILE_VALUE_FLAGS.get(flag)
-        if value_target is None:
-            raise typer.BadParameter(
-                f"--vllm-profile suggested unsupported serve arg {flag!r}"
-            )
-        key, caster = value_target
-        if inline_value is not None:
-            raw_value = inline_value
-            idx += 1
-        else:
-            if idx + 1 >= len(args):
-                raise typer.BadParameter(
-                    f"--vllm-profile suggested {flag} without a value"
-                )
-            raw_value = str(args[idx + 1])
-            idx += 2
-        try:
-            defaults[key] = caster(raw_value)
-        except (TypeError, ValueError) as exc:
-            raise typer.BadParameter(
-                f"--vllm-profile suggested invalid value for {flag}: {raw_value!r}"
-            ) from exc
-    return defaults
-
-
-def _ctx_param_was_supplied(ctx: typer.Context, name: str) -> bool:
-    getter = getattr(ctx, "get_parameter_source", None)
-    if getter is None:
-        return False
-    try:
-        source = getter(name)
-    except Exception:
-        return False
-    if source is None:
-        return False
-    # click.core.ParameterSource.DEFAULT is the only source that should lose to
-    # profile defaults. COMMANDLINE/env/default-map values are explicit enough.
-    return not str(source).endswith(".DEFAULT")
-
-
-def _qwen35_profile_default(
-    ctx: typer.Context,
-    defaults: dict[str, object],
-    name: str,
-    current: object,
-    default: object,
-) -> object:
-    if name not in defaults:
-        return current
-    if _ctx_param_was_supplied(ctx, name):
-        return current
-    if current != default:
-        return current
-    return defaults[name]
 
 
 def _resolve_enable_tn_default(enable_tn: bool, disable_tn: bool) -> bool | None:
@@ -452,8 +203,8 @@ def _resolve_code2wav_model_folder(
         raise typer.BadParameter(f"{flag_name} must not be empty")
     if os.path.isabs(folder):
         return folder
-    # 中文说明：vLLM perf_v2 配置常写 root checkpoint 下的 code2wav
-    # 子目录名；SGLang stage factory 需要完整目录，所以这里统一补齐。
+    # 中文说明：Qwen3.5 checkpoint 常把 code2wav 放在 root checkpoint
+    # 子目录里；SGLang stage factory 需要完整目录，所以这里统一补齐。
     return os.path.join(model_path, folder)
 
 
@@ -511,337 +262,6 @@ def _run_qwen35_preflight_or_raise(
     if not report.ok:
         raise typer.BadParameter(message)
     logger.info("%s", message)
-
-
-def _validate_qwen35_disable_mtp_request(
-    pipeline_config: PipelineConfig,
-    *,
-    disable_mtp: bool,
-) -> None:
-    if not disable_mtp:
-        return
-    if not _is_qwen35_config(pipeline_config):
-        raise typer.BadParameter(
-            "--disable-mtp currently applies only to Qwen3.5-Omni configs"
-        )
-    # 中文说明：vLLM Qwen3.5 默认可能启用 thinker MTP；当前 SGLang
-    # Qwen3.5 先跑 base thinker AR 主链路，没有开启 MTP。接受这个 flag
-    # 是为了迁移 vLLM 启动命令时不因未知参数失败。
-    logger.info(
-        "--disable-mtp accepted: Qwen3.5 thinker MTP is not enabled in this "
-        "SGLang path."
-    )
-
-
-def _parse_qwen35_json_object(flag_name: str, value: str) -> dict[str, object]:
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError as exc:
-        raise typer.BadParameter(f"{flag_name} expects a JSON object") from exc
-    if not isinstance(parsed, dict):
-        raise typer.BadParameter(f"{flag_name} expects a JSON object")
-    return parsed
-
-
-def _validate_qwen35_speculative_config_request(
-    pipeline_config: PipelineConfig,
-    *,
-    speculative_config: str | None,
-) -> None:
-    if speculative_config is None:
-        return
-    if not _is_qwen35_config(pipeline_config):
-        raise typer.BadParameter(
-            "--speculative-config currently applies only to Qwen3.5-Omni configs"
-        )
-    config = _parse_qwen35_json_object("--speculative-config", speculative_config)
-    if not config:
-        logger.info(
-            "--speculative-config={} accepted as a Qwen3.5 vLLM-compatible no-op."
-        )
-        return
-    method = str(config.get("method", "")).strip().lower()
-    if method in _QWEN35_SPECULATIVE_MTP_METHODS:
-        raise typer.BadParameter(
-            "--speculative-config method qwen3_omni_next_thinker_mtp requires "
-            "Qwen3.5 thinker MTP/draft decoding, which is not enabled in this "
-            "SGLang path yet; omit the speculative config or pass "
-            "--disable-mtp for the current base thinker AR path"
-        )
-    # 中文说明：非空 speculative_config 会改变解码路径和 KV/worker 形态。
-    # 当前 Qwen3.5 先实现 base thinker AR 主链路，因此必须提前失败。
-    raise typer.BadParameter(
-        "--speculative-config is not mapped in the current SGLang Qwen3.5 path"
-    )
-
-
-def _validate_qwen35_max_seq_len_to_capture_request(
-    pipeline_config: PipelineConfig,
-    *,
-    max_seq_len_to_capture: int | None,
-) -> None:
-    if max_seq_len_to_capture is None:
-        return
-    if max_seq_len_to_capture < 1:
-        raise typer.BadParameter("--max-seq-len-to-capture must be >= 1")
-    if not _is_qwen35_config(pipeline_config):
-        raise typer.BadParameter(
-            "--max-seq-len-to-capture currently applies only to "
-            "Qwen3.5-Omni configs"
-        )
-    # 中文说明：这是 vLLM cudagraph capture 参数。当前 SGLang Qwen3.5
-    # 路径没有单独的 capture length 入口；接受它是为了迁移 vLLM
-    # perf 配置时不因未知参数失败。
-    logger.info(
-        "--max-seq-len-to-capture=%s accepted as a Qwen3.5 vLLM-compatible "
-        "no-op; SGLang uses its own CUDA graph capture settings.",
-        max_seq_len_to_capture,
-    )
-
-
-def _validate_qwen35_mamba_cache_mode_request(
-    pipeline_config: PipelineConfig,
-    *,
-    mamba_cache_mode: str | None,
-) -> None:
-    if mamba_cache_mode is None:
-        return
-    normalized = mamba_cache_mode.strip().lower()
-    if normalized not in _QWEN35_MAMBA_CACHE_MODES:
-        supported = ", ".join(sorted(_QWEN35_MAMBA_CACHE_MODES))
-        raise typer.BadParameter(f"--mamba-cache-mode must be one of: {supported}")
-    if not _is_qwen35_config(pipeline_config):
-        raise typer.BadParameter(
-            "--mamba-cache-mode currently applies only to Qwen3.5-Omni configs"
-        )
-    if normalized == "none":
-        logger.info(
-            "--mamba-cache-mode=none accepted as a Qwen3.5 vLLM-compatible no-op."
-        )
-        return
-    # 中文说明：vLLM 的 light/all 是混合 Mamba cache 策略，常和
-    # disaggregated prefill/decode profile 一起出现。SGLang core 当前没有
-    # 等价 mamba_cache_mode ServerArgs；这里提前失败，避免静默丢失缓存策略。
-    raise typer.BadParameter(
-        "--mamba-cache-mode light/all is a vLLM hybrid Mamba cache setting "
-        "and is not supported by the current SGLang Qwen3.5 path; use "
-        "--mamba-cache-mode none or omit it until an explicit SGLang mapping "
-        "is implemented."
-    )
-
-
-def _parse_qwen35_vllm_bool_value(flag_name: str, value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    normalized = str(value).strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise typer.BadParameter(f"{flag_name} expects a boolean value")
-
-
-def _parse_optional_json_object(flag_name: str, value: str | None) -> dict[str, object]:
-    if value is None:
-        return {}
-    raw = value.strip()
-    if not raw or raw.lower() in {"none", "null"}:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise typer.BadParameter(f"{flag_name} expects a JSON object") from exc
-    if not isinstance(parsed, dict):
-        raise typer.BadParameter(f"{flag_name} expects a JSON object")
-    return parsed
-
-
-def _validate_qwen35_kv_transfer_request(
-    pipeline_config: PipelineConfig,
-    *,
-    enable_disaggregated_prefilling: object | None,
-    kv_transfer_config: str | None,
-) -> None:
-    if enable_disaggregated_prefilling is None and kv_transfer_config is None:
-        return
-    if not _is_qwen35_config(pipeline_config):
-        raise typer.BadParameter(
-            "--kv-transfer-config/--enable-disaggregated-prefilling currently "
-            "apply only to Qwen3.5-Omni configs"
-        )
-    if enable_disaggregated_prefilling is not None:
-        enabled = _parse_qwen35_vllm_bool_value(
-            "--enable-disaggregated-prefilling",
-            enable_disaggregated_prefilling,
-        )
-        if enabled:
-            # 中文说明：vLLM 的 disaggregated prefill/decode profile 需要
-            # KV connector producer/consumer 协议；当前 SGLang-Omni
-            # Qwen3.5 尚未接这个映射，提前报错比静默降级更可靠。
-            raise typer.BadParameter(
-                "--enable-disaggregated-prefilling is a vLLM KV transfer "
-                "setting and is not supported by the current SGLang Qwen3.5 path"
-            )
-        logger.info(
-            "--enable-disaggregated-prefilling=false accepted as a "
-            "Qwen3.5 vLLM-compatible no-op."
-        )
-    kv_config = _parse_optional_json_object("--kv-transfer-config", kv_transfer_config)
-    if kv_config:
-        raise typer.BadParameter(
-            "--kv-transfer-config is a vLLM KV connector setting and is not "
-            "supported by the current SGLang Qwen3.5 path; use the colocated "
-            "or non-disaggregated profile until an explicit SGLang KV transfer "
-            "mapping is implemented"
-        )
-    if kv_transfer_config is not None:
-        logger.info(
-            "--kv-transfer-config={} accepted as a Qwen3.5 vLLM-compatible no-op."
-        )
-
-
-def _validate_qwen35_vllm_engine_profile_request(
-    pipeline_config: PipelineConfig,
-    *,
-    distributed_executor_backend: str | None,
-    kv_cache_dtype: str | None,
-    enable_expert_parallel: object | None,
-    mm_processor_cache_gb: float | None,
-    max_mm_len: int | None,
-    use_omni_engine: object | None,
-    use_omni_rpc_engine: object | None,
-    use_zero_shot: object | None,
-    skip_mm_profiling: object | None,
-    video_needs_metadata: object | None = None,
-    override_video_max_pixels: object | None = None,
-    is_thinker: object | None = None,
-    thinker_only_marker: object | None = None,
-    text_only: bool = False,
-) -> None:
-    requested = any(
-        value is not None
-        for value in (
-            distributed_executor_backend,
-            kv_cache_dtype,
-            enable_expert_parallel,
-            mm_processor_cache_gb,
-            max_mm_len,
-            use_omni_engine,
-            use_omni_rpc_engine,
-            use_zero_shot,
-            skip_mm_profiling,
-            video_needs_metadata,
-            override_video_max_pixels,
-            is_thinker,
-            thinker_only_marker,
-        )
-    )
-    if not requested:
-        return
-    if not _is_qwen35_config(pipeline_config):
-        raise typer.BadParameter(
-            "vLLM Qwen3.5 engine profile flags currently apply only to "
-            "Qwen3.5-Omni configs"
-        )
-    if (
-        distributed_executor_backend is not None
-        and distributed_executor_backend.strip().lower()
-        not in _QWEN35_VLLM_EXECUTOR_BACKENDS
-    ):
-        raise typer.BadParameter(
-            "--distributed-executor-backend currently supports only mp as a "
-            "Qwen3.5 vLLM-compatible no-op"
-        )
-    if kv_cache_dtype is not None and kv_cache_dtype.strip().lower() != "auto":
-        # 中文说明：tq4/fp8 等 KV cache dtype 会改变 KV cache 存储和
-        # attention backend。当前 SGLang Qwen3.5 没有等价入口，必须提前失败。
-        raise typer.BadParameter(
-            "--kv-cache-dtype values other than auto are not supported by the "
-            "current SGLang Qwen3.5 path"
-        )
-    if enable_expert_parallel is not None and _parse_qwen35_vllm_bool_value(
-        "--enable-expert-parallel",
-        enable_expert_parallel,
-    ):
-        raise typer.BadParameter(
-            "--enable-expert-parallel is a vLLM MoE parallelism setting and is "
-            "not mapped in the current SGLang Qwen3.5 path"
-        )
-    if mm_processor_cache_gb not in (None, 0, 0.0):
-        raise typer.BadParameter("--mm-processor-cache-gb currently supports only 0")
-    for flag_name, value in (
-        ("--use-omni-engine", use_omni_engine),
-        ("--use-omni-rpc-engine", use_omni_rpc_engine),
-        ("--use-zero-shot", use_zero_shot),
-        ("--skip-mm-profiling", skip_mm_profiling),
-        ("--video-needs-metadata", video_needs_metadata),
-    ):
-        if value is not None:
-            _parse_qwen35_vllm_bool_value(flag_name, value)
-    if override_video_max_pixels is not None:
-        _parse_qwen35_vllm_bool_value(
-            "--override-video-max-pixels",
-            override_video_max_pixels,
-        )
-    if is_thinker is not None and not _parse_qwen35_vllm_bool_value(
-        "--is-thinker",
-        is_thinker,
-    ):
-        raise typer.BadParameter("--is-thinker=false is not valid here")
-    if thinker_only_marker is not None:
-        marker = _parse_qwen35_vllm_bool_value(
-            "--thinker-only",
-            thinker_only_marker,
-        )
-        if text_only and not marker:
-            raise typer.BadParameter("--thinker-only=false conflicts with --text-only")
-        if not text_only and marker:
-            raise typer.BadParameter("--thinker-only=true requires --text-only")
-
-
-def _server_args_from_vllm_compilation_config(
-    compilation_config: str | None,
-) -> dict[str, object]:
-    if compilation_config is None:
-        return {}
-    try:
-        value = json.loads(compilation_config)
-    except json.JSONDecodeError as exc:
-        raise typer.BadParameter(
-            "--compilation-config expects a JSON object"
-        ) from exc
-    if not isinstance(value, dict):
-        raise typer.BadParameter("--compilation-config expects a JSON object")
-
-    use_inductor = value.get("use_inductor")
-    if use_inductor not in (None, False):
-        raise typer.BadParameter(
-            "--compilation-config use_inductor=true is not supported"
-        )
-    pass_config = value.get("pass_config")
-    if pass_config is not None:
-        if not isinstance(pass_config, dict):
-            raise typer.BadParameter(
-                "--compilation-config pass_config must be an object"
-            )
-        enabled = [key for key, flag in pass_config.items() if bool(flag)]
-        if enabled:
-            raise typer.BadParameter(
-                "--compilation-config fuse pass options are not supported: "
-                + ", ".join(sorted(str(key) for key in enabled))
-            )
-
-    raw_mode = str(value.get("cudagraph_mode", "")).strip().lower()
-    if not raw_mode:
-        return {}
-    normalized = raw_mode.replace("-", "_")
-    if normalized in {"full_decode_only", "full", "decode_only"}:
-        return {}
-    if normalized in {"none", "off", "no_cudagraph", "disable", "disabled"}:
-        return {"disable_cuda_graph": True}
-    raise typer.BadParameter(
-        "--compilation-config cudagraph_mode must be FULL_DECODE_ONLY or none/off"
-    )
 
 
 def _find_matching_stages(
@@ -1372,49 +792,30 @@ def apply_talker_server_args_cli_overrides(
     return pipeline_config
 
 
-def apply_vllm_ar_server_args_cli_overrides(
+def apply_ar_server_args_cli_overrides(
     pipeline_config: PipelineConfig,
     *,
     prefix_caching: str,
     chunked_prefill: str,
-    enforce_eager: bool,
-    thinker_enforce_eager: bool,
-    talker_enforce_eager: bool,
     dtype: str | None = None,
     thinker_dtype: str | None = None,
     talker_dtype: str | None = None,
     mamba_ssm_dtype: str | None = None,
-    mamba_cache_mode: str | None = None,
-    kv_transfer_config: str | None = None,
-    enable_disaggregated_prefilling: object | None = None,
-    max_num_batched_tokens: int | None = None,
+    max_prefill_tokens: int | None = None,
     page_size: int | None = None,
-    compilation_config: str | None = None,
 ) -> PipelineConfig:
-    _validate_qwen35_mamba_cache_mode_request(
-        pipeline_config,
-        mamba_cache_mode=mamba_cache_mode,
-    )
-    _validate_qwen35_kv_transfer_request(
-        pipeline_config,
-        enable_disaggregated_prefilling=enable_disaggregated_prefilling,
-        kv_transfer_config=kv_transfer_config,
-    )
     prefix_mode = _normalize_stage_toggle_mode("prefix_caching", prefix_caching)
     chunked_mode = _normalize_stage_toggle_mode("chunked_prefill", chunked_prefill)
     shared_updates: dict[str, object] = {}
     if prefix_mode != "default":
         shared_updates["disable_radix_cache"] = prefix_mode != "on"
-    max_num_batched_tokens = _validate_positive_int(
-        "--max-num-batched-tokens",
-        max_num_batched_tokens,
+    max_prefill_tokens = _validate_positive_int(
+        "--max-prefill-tokens",
+        max_prefill_tokens,
     )
-    if max_num_batched_tokens is not None:
-        # 中文说明：vLLM 的 max_num_batched_tokens 是 prefill 批处理
-        # token 上限；SGLang 对应 max_prefill_tokens，并复用同一个值
-        # 作为 chunked_prefill_size，除非用户显式关闭 chunked prefill。
-        shared_updates["max_prefill_tokens"] = max_num_batched_tokens
-        shared_updates["chunked_prefill_size"] = max_num_batched_tokens
+    if max_prefill_tokens is not None:
+        shared_updates["max_prefill_tokens"] = max_prefill_tokens
+        shared_updates["chunked_prefill_size"] = max_prefill_tokens
     if chunked_mode != "default":
         if not _is_qwen35_config(pipeline_config):
             raise typer.BadParameter(
@@ -1425,7 +826,7 @@ def apply_vllm_ar_server_args_cli_overrides(
         )
 
         shared_updates["chunked_prefill_size"] = (
-            max_num_batched_tokens or QWEN3_5_OMNI_CHUNKED_PREFILL_SIZE
+            max_prefill_tokens or QWEN3_5_OMNI_CHUNKED_PREFILL_SIZE
             if chunked_mode == "on"
             else None
         )
@@ -1436,21 +837,16 @@ def apply_vllm_ar_server_args_cli_overrides(
             "--mamba-ssm-dtype",
             mamba_ssm_dtype,
         )
-    page_size = _validate_positive_int("--block-size", page_size)
+    page_size = _validate_positive_int("--page-size", page_size)
     if page_size is not None:
-        # 中文说明：vLLM block_size 对应 SGLang page_size，控制 KV cache
-        # 分页大小；保留 --page-size 作为更贴近 SGLang 的名字。
         shared_updates["page_size"] = page_size
-    shared_updates.update(
-        _server_args_from_vllm_compilation_config(compilation_config)
-    )
 
     if shared_updates:
         _apply_stage_server_args_override(
             pipeline_config,
             stage_name="thinker",
             updates=shared_updates,
-            reason="vLLM-compatible AR ServerArgs override",
+            reason="AR ServerArgs override",
         )
         talker_stage = type(pipeline_config).talker_sglang_role_to_stage().get(
             "talker"
@@ -1460,29 +856,9 @@ def apply_vllm_ar_server_args_cli_overrides(
                 pipeline_config,
                 stage_name=talker_stage,
                 updates=shared_updates,
-                reason="vLLM-compatible AR ServerArgs override",
+                reason="AR ServerArgs override",
             )
 
-    if enforce_eager or thinker_enforce_eager:
-        _apply_stage_server_args_override(
-            pipeline_config,
-            stage_name="thinker",
-            updates={"disable_cuda_graph": True},
-            reason="vLLM-compatible enforce eager",
-        )
-    if enforce_eager or talker_enforce_eager:
-        talker_stage = type(pipeline_config).talker_sglang_role_to_stage().get(
-            "talker"
-        )
-        if talker_stage is not None:
-            _apply_stage_server_args_override(
-                pipeline_config,
-                stage_name=talker_stage,
-                updates={"disable_cuda_graph": True},
-                reason="vLLM-compatible talker enforce eager",
-            )
-        elif talker_enforce_eager:
-            _raise_unsupported_flag(pipeline_config, "--talker-enforce-eager")
     if thinker_dtype is not None:
         _apply_stage_server_args_override(
             pipeline_config,
@@ -1493,7 +869,7 @@ def apply_vllm_ar_server_args_cli_overrides(
                     thinker_dtype,
                 )
             },
-            reason="vLLM-compatible thinker dtype",
+            reason="thinker dtype override",
         )
     if talker_dtype is not None:
         talker_stage = type(pipeline_config).talker_sglang_role_to_stage().get(
@@ -1510,7 +886,7 @@ def apply_vllm_ar_server_args_cli_overrides(
                     talker_dtype,
                 )
             },
-            reason="vLLM-compatible talker dtype",
+            reason="talker dtype override",
         )
     return pipeline_config
 
@@ -1997,7 +1373,7 @@ def apply_qwen35_max_model_len_cli_override(
                 raise typer.BadParameter(
                     f"Stage {stage_name!r} cannot accept max_seq_len override"
                 )
-            # 中文说明：vLLM 的 max_model_len 是 thinker 的上下文上限；
+            # 中文说明：max_model_len 表示 thinker 的上下文上限；
             # 预处理阶段也需要相同 guard，否则长视频/长音频会先被挡住。
             stage.runtime.max_seq_len = seq_len
     return pipeline_config
@@ -2046,9 +1422,9 @@ def apply_qwen35_max_mm_len_cli_override(
             raise typer.BadParameter(
                 "Qwen3.5 preprocessing stage cannot accept max_seq_len override"
             )
-        # 中文说明：vLLM max_mm_len 是多模态输入预算/profiling 上限。
-        # SGLang 这里先映射到 preprocessing 的 max_seq_len guard，只限制
-        # 预处理输入预算，不降低 thinker 后端 context length。
+        # 中文说明：max_mm_len 表示多模态输入预算。这里映射到
+        # preprocessing 的 max_seq_len guard，只限制预处理输入预算，
+        # 不降低 thinker 后端 context length。
         stage.runtime.max_seq_len = max_mm_len
     return pipeline_config
 
@@ -2397,25 +1773,11 @@ def serve(
             "--thinker_model",
             "--thinker-model-path",
             "--thinker_model_path",
-            help=(
-                "vLLM-compatible thinker model path. With --model-path it must "
-                "be <model-path>/thinker and is treated as a no-op."
-            ),
+            help="Optional split thinker model path for Qwen3.5 checkpoints.",
         ),
     ] = None,
     config: Annotated[
         str | None, typer.Option(help="Path to a pipeline config file.")
-    ] = None,
-    vllm_profile: Annotated[
-        str | None,
-        typer.Option(
-            "--vllm-profile",
-            "--vllm_profile",
-            help=(
-                "Load a Qwen3.5-Omni vLLM perf_v2 profile as default CLI "
-                "arguments. Explicit CLI values override profile values."
-            ),
-        ),
     ] = None,
     text_only: Annotated[
         bool,
@@ -2567,37 +1929,30 @@ def serve(
         float | None,
         typer.Option(
             "--mem-fraction-static",
-            "--gpu-memory-utilization",
-            "--gpu_memory_utilization",
             help=(
                 "Set SGLang mem_fraction_static for supported SGLang AR stages. "
-                "The gpu-memory-utilization aliases mirror vLLM configs. "
                 "If omitted, SGLang chooses the value automatically."
             ),
         ),
     ] = None,
-    thinker_mem_fraction_static: Annotated[
-        float | None,
-        typer.Option(
-            "--thinker-mem-fraction-static",
-            "--thinker-gpu-memory-utilization",
-            "--thinker_gpu_memory_utilization",
-            help=(
-                "Set SGLang mem_fraction_static for the thinker stage. Overrides "
-                "--mem-fraction-static for thinker."
-            ),
+	    thinker_mem_fraction_static: Annotated[
+	        float | None,
+	        typer.Option(
+	            "--thinker-mem-fraction-static",
+	            help=(
+	                "Set SGLang mem_fraction_static for the thinker stage. Overrides "
+	                "--mem-fraction-static for thinker."
+	            ),
         ),
     ] = None,
-    talker_mem_fraction_static: Annotated[
-        float | None,
-        typer.Option(
-            "--talker-mem-fraction-static",
-            "--talker-gpu-memory-utilization",
-            "--talker_gpu_memory_utilization",
-            help=(
-                "Set SGLang mem_fraction_static for supported talker AR stages. "
-                "Overrides --mem-fraction-static for talker."
-            ),
+	    talker_mem_fraction_static: Annotated[
+	        float | None,
+	        typer.Option(
+	            "--talker-mem-fraction-static",
+	            help=(
+	                "Set SGLang mem_fraction_static for supported talker AR stages. "
+	                "Overrides --mem-fraction-static for talker."
+	            ),
         ),
     ] = None,
     max_running_requests: Annotated[
@@ -2605,8 +1960,6 @@ def serve(
         typer.Option(
             "--max-running-requests",
             "--max_running_requests",
-            "--max-num-seqs",
-            "--max_num_seqs",
             help=(
                 "Set SGLang max_running_requests for supported SGLang AR stages."
             ),
@@ -2639,43 +1992,17 @@ def serve(
         typer.Option(
             "--max-model-len",
             "--max_model_len",
-            help=(
-                "vLLM-compatible Qwen3.5 thinker context length. "
-                "--thinker-max-seq-len overrides it."
-            ),
+            help="Set Qwen3.5 thinker context length. --thinker-max-seq-len overrides it.",
         ),
     ] = None,
-    max_seq_len_to_capture: Annotated[
+    max_prefill_tokens: Annotated[
         int | None,
         typer.Option(
-            "--max-seq-len-to-capture",
-            "--max_seq_len_to_capture",
+            "--max-prefill-tokens",
+            "--max_prefill_tokens",
             help=(
-                "vLLM-compatible Qwen3.5 no-op. SGLang uses its own CUDA "
-                "graph capture settings."
-            ),
-        ),
-    ] = None,
-    compilation_config: Annotated[
-        str | None,
-        typer.Option(
-            "--compilation-config",
-            "--compilation_config",
-            help=(
-                "vLLM-compatible Qwen3.5 compilation_config JSON. "
-                "FULL_DECODE_ONLY is accepted as the SGLang default; "
-                "none/off disables CUDA graph."
-            ),
-        ),
-    ] = None,
-    max_num_batched_tokens: Annotated[
-        int | None,
-        typer.Option(
-            "--max-num-batched-tokens",
-            "--max_num_batched_tokens",
-            help=(
-                "vLLM-compatible prefill batch token limit. Maps to SGLang "
-                "max_prefill_tokens and chunked_prefill_size when applicable."
+                "Set SGLang max_prefill_tokens and chunked_prefill_size for "
+                "supported AR stages."
             ),
         ),
     ] = None,
@@ -2684,12 +2011,7 @@ def serve(
         typer.Option(
             "--page-size",
             "--page_size",
-            "--block-size",
-            "--block_size",
-            help=(
-                "Set SGLang page_size for supported AR stages. The "
-                "block-size aliases mirror vLLM KV cache block_size."
-            ),
+            help="Set SGLang page_size for supported AR stages.",
         ),
     ] = None,
     thinker_max_seq_len: Annotated[
@@ -2740,10 +2062,7 @@ def serve(
         str | None,
         typer.Option(
             "--dtype",
-            help=(
-                "Set SGLang dtype for supported AR stages. This mirrors vLLM "
-                "Qwen3.5 configs such as dtype=bfloat16."
-            ),
+            help="Set SGLang dtype for supported AR stages.",
         ),
     ] = None,
     thinker_dtype: Annotated[
@@ -2767,93 +2086,7 @@ def serve(
         typer.Option(
             "--mamba-ssm-dtype",
             "--mamba_ssm_dtype",
-            "--mamba-cache-dtype",
-            "--mamba_cache_dtype",
-            help=(
-                "Set SGLang mamba_ssm_dtype for supported AR stages. "
-                "The mamba-cache aliases mirror vLLM Qwen3.5 configs."
-            ),
-        ),
-    ] = None,
-    mamba_cache_mode: Annotated[
-        str | None,
-        typer.Option(
-            "--mamba-cache-mode",
-            "--mamba_cache_mode",
-            help=(
-                "vLLM-compatible Qwen3.5 cache mode. Only none is currently "
-                "accepted; light/all fail early because SGLang has no "
-                "equivalent mamba_cache_mode ServerArgs yet."
-            ),
-        ),
-    ] = None,
-    kv_transfer_config: Annotated[
-        str | None,
-        typer.Option(
-            "--kv-transfer-config",
-            "--kv_transfer_config",
-            help=(
-                "vLLM-compatible Qwen3.5 KV connector JSON. Empty JSON is "
-                "accepted as no-op; non-empty configs fail early until "
-                "SGLang KV transfer is mapped explicitly."
-            ),
-        ),
-    ] = None,
-    enable_disaggregated_prefilling: Annotated[
-        str | None,
-        typer.Option(
-            "--enable-disaggregated-prefilling",
-            "--enable_disaggregated_prefilling",
-            help=(
-                "vLLM-compatible disaggregated prefill flag. false/0 is "
-                "accepted as no-op; true/1 fails early."
-            ),
-        ),
-    ] = None,
-    tensor_parallel_size: Annotated[
-        int | None,
-        typer.Option(
-            "--tensor-parallel-size",
-            "--tensor_parallel_size",
-            help=(
-                "vLLM-compatible alias for --thinker-tp-size. Combine with "
-                "--thinker-visible-devices for multi-GPU placement."
-            ),
-        ),
-    ] = None,
-    distributed_executor_backend: Annotated[
-        str | None,
-        typer.Option(
-            "--distributed-executor-backend",
-            "--distributed_executor_backend",
-            help="vLLM-compatible executor backend. Only mp is accepted as no-op.",
-        ),
-    ] = None,
-    kv_cache_dtype: Annotated[
-        str | None,
-        typer.Option(
-            "--kv-cache-dtype",
-            "--kv_cache_dtype",
-            help=(
-                "vLLM-compatible KV cache dtype. Only auto is accepted as "
-                "no-op; quantized KV cache modes fail early."
-            ),
-        ),
-    ] = None,
-    enable_expert_parallel: Annotated[
-        str | None,
-        typer.Option(
-            "--enable-expert-parallel",
-            "--enable_expert_parallel",
-            help="vLLM-compatible expert parallel flag. true/1 fails early.",
-        ),
-    ] = None,
-    mm_processor_cache_gb: Annotated[
-        float | None,
-        typer.Option(
-            "--mm-processor-cache-gb",
-            "--mm_processor_cache_gb",
-            help="vLLM-compatible MM cache size. Only 0 is accepted as no-op.",
+            help="Set SGLang mamba_ssm_dtype for supported AR stages.",
         ),
     ] = None,
     max_mm_len: Annotated[
@@ -2862,90 +2095,7 @@ def serve(
             "--max-mm-len",
             "--max_mm_len",
             help=(
-                "vLLM-compatible multimodal capacity setting. Maps to the "
-                "Qwen3.5 preprocessing max_seq_len guard."
-            ),
-        ),
-    ] = None,
-    speculative_config: Annotated[
-        str | None,
-        typer.Option(
-            "--speculative-config",
-            "--speculative_config",
-            help=(
-                "vLLM-compatible speculative_config JSON. Empty JSON is "
-                "accepted as no-op; Qwen3.5 MTP configs fail early until "
-                "SGLang speculative decoding is mapped."
-            ),
-        ),
-    ] = None,
-    use_omni_engine: Annotated[
-        str | None,
-        typer.Option(
-            "--use-omni-engine",
-            "--use_omni_engine",
-            help="vLLM Qwen3.5 launcher marker accepted as no-op.",
-        ),
-    ] = None,
-    use_omni_rpc_engine: Annotated[
-        str | None,
-        typer.Option(
-            "--use-omni-rpc-engine",
-            "--use_omni_rpc_engine",
-            help="vLLM Qwen3.5 launcher marker accepted as no-op.",
-        ),
-    ] = None,
-    is_thinker: Annotated[
-        str | None,
-        typer.Option(
-            "--is-thinker",
-            "--is_thinker",
-            help="vLLM Qwen3.5 launcher marker; false is rejected.",
-        ),
-    ] = None,
-    thinker_only_marker: Annotated[
-        str | None,
-        typer.Option(
-            "--thinker-only",
-            "--thinker_only",
-            help="vLLM Qwen3.5 launcher marker; must match --text-only.",
-        ),
-    ] = None,
-    use_zero_shot: Annotated[
-        str | None,
-        typer.Option(
-            "--use-zero-shot",
-            "--use_zero_shot",
-            help="vLLM Qwen3.5 launcher marker accepted as no-op.",
-        ),
-    ] = None,
-    skip_mm_profiling: Annotated[
-        str | None,
-        typer.Option(
-            "--skip-mm-profiling",
-            "--skip_mm_profiling",
-            help="vLLM MM profiling marker accepted as no-op.",
-        ),
-    ] = None,
-    video_needs_metadata: Annotated[
-        str | None,
-        typer.Option(
-            "--video-needs-metadata",
-            "--video_needs_metadata",
-            help=(
-                "vLLM video metadata marker accepted as no-op. Qwen3.5 "
-                "preprocessing already requests video metadata."
-            ),
-        ),
-    ] = None,
-    override_video_max_pixels: Annotated[
-        str | None,
-        typer.Option(
-            "--override-video-max-pixels",
-            "--override_video_max_pixels",
-            help=(
-                "Use max-mm-len-derived video total_pixels as the effective "
-                "Qwen3.5 video resize budget."
+                "Set Qwen3.5 preprocessing max_seq_len guard for multimodal inputs."
             ),
         ),
     ] = None,
@@ -3149,17 +2299,6 @@ def serve(
             ),
         ),
     ] = False,
-    disable_mtp: Annotated[
-        bool,
-        typer.Option(
-            "--disable-mtp",
-            "--disable_mtp",
-            help=(
-                "vLLM-compatible no-op for Qwen3.5-Omni. This SGLang path "
-                "does not enable thinker MTP."
-            ),
-        ),
-    ] = False,
     thinker_tp_size: Annotated[
         int | None,
         typer.Option(
@@ -3184,7 +2323,7 @@ def serve(
             "--thinker-visible-devices",
             "--thinker_visible_devices",
             "--thinker-devices",
-            help="vLLM-compatible alias for --thinker-gpus.",
+            help="Alias for --thinker-gpus.",
         ),
     ] = None,
     talker_gpu: Annotated[
@@ -3201,7 +2340,7 @@ def serve(
             "--talker-visible-devices",
             "--talker_visible_devices",
             "--talker-devices",
-            help="vLLM-compatible single-GPU alias for --talker-gpu.",
+            help="Single-GPU alias for --talker-gpu.",
         ),
     ] = None,
     talker_model_path: Annotated[
@@ -3228,7 +2367,7 @@ def serve(
             "--code2wav-visible-devices",
             "--code2wav_visible_devices",
             "--code2wav-devices",
-            help="vLLM-compatible single-GPU alias for --code2wav-gpu.",
+            help="Single-GPU alias for --code2wav-gpu.",
         ),
     ] = None,
     thinker_cuda_graph: Annotated[
@@ -3249,30 +2388,6 @@ def serve(
             help="CUDA graph mode for supported SGLang talker stage: default|on|off.",
         ),
     ] = "default",
-    enforce_eager: Annotated[
-        bool,
-        typer.Option(
-            "--enforce-eager",
-            hidden=True,
-            help="vLLM-compatible alias that disables CUDA graph on thinker/talker.",
-        ),
-    ] = False,
-    thinker_enforce_eager: Annotated[
-        bool,
-        typer.Option(
-            "--thinker-enforce-eager",
-            hidden=True,
-            help="vLLM-compatible alias that disables CUDA graph on thinker.",
-        ),
-    ] = False,
-    talker_enforce_eager: Annotated[
-        bool,
-        typer.Option(
-            "--talker-enforce-eager",
-            hidden=True,
-            help="vLLM-compatible alias that disables CUDA graph on talker.",
-        ),
-    ] = False,
     prefix_caching: Annotated[
         str,
         typer.Option(
@@ -3284,23 +2399,6 @@ def serve(
             ),
         ),
     ] = "default",
-    enable_prefix_caching: Annotated[
-        bool,
-        typer.Option(
-            "--enable-prefix-caching",
-            hidden=True,
-            help="vLLM-compatible alias for '--prefix-caching on'.",
-        ),
-    ] = False,
-    disable_prefix_caching: Annotated[
-        bool,
-        typer.Option(
-            "--disable-prefix-caching",
-            "--no-enable-prefix-caching",
-            hidden=True,
-            help="Alias for '--prefix-caching off'.",
-        ),
-    ] = False,
     chunked_prefill: Annotated[
         str,
         typer.Option(
@@ -3309,23 +2407,6 @@ def serve(
             help="Qwen3.5 chunked prefill mode: default|on|off.",
         ),
     ] = "default",
-    enable_chunked_prefill: Annotated[
-        bool,
-        typer.Option(
-            "--enable-chunked-prefill",
-            hidden=True,
-            help="vLLM-compatible alias for '--chunked-prefill on'.",
-        ),
-    ] = False,
-    disable_chunked_prefill: Annotated[
-        bool,
-        typer.Option(
-            "--disable-chunked-prefill",
-            "--no-enable-chunked-prefill",
-            hidden=True,
-            help="Alias for '--chunked-prefill off'.",
-        ),
-    ] = False,
     talker_partial_start: Annotated[
         str,
         typer.Option(
@@ -3390,8 +2471,8 @@ def serve(
             "--code2wav_model_folder",
             "--code2wav-model",
             help=(
-                "vLLM-compatible relative code2wav folder under the root "
-                "checkpoint. Ignored when --code2wav-model-path is set."
+                "Relative code2wav folder under the root checkpoint. "
+                "Ignored when --code2wav-model-path is set."
             ),
         ),
     ] = None,
@@ -3537,7 +2618,7 @@ def serve(
             "--code2wav-odeint-method",
             "--odeint-method",
             "--code2wav_odeint_method",
-            help="Override vLLM-compatible code2wav ODE solver method: euler|rk4.",
+            help="Override code2wav ODE solver method: euler|rk4.",
         ),
     ] = None,
     code2wav_odeint_method_relaxed: Annotated[
@@ -3572,7 +2653,7 @@ def serve(
             "--code2wav-batched-chunk",
             "--batched-chunk",
             "--code2wav_batched_chunk",
-            help="Override vLLM-compatible code2wav DIT batched chunk count.",
+            help="Override code2wav DIT batched chunk count.",
         ),
     ] = None,
     code2wav_frequency: Annotated[
@@ -3580,7 +2661,7 @@ def serve(
         typer.Option(
             "--code2wav-frequency",
             "--code2wav_frequency",
-            help="Override vLLM-compatible code2wav frequency: 50hz|25hz.",
+            help="Override code2wav frequency: 50hz|25hz.",
         ),
     ] = None,
     code2wav_dit_quant: Annotated[
@@ -3589,7 +2670,7 @@ def serve(
             "--code2wav-dit-quantization",
             "--code2wav-dit-quant",
             "--code2wav_dit_quant",
-            help="Override vLLM-compatible code2wav DIT quantization: fp8.",
+            help="Override code2wav DIT quantization: fp8.",
         ),
     ] = None,
     enable_realtime: Annotated[
@@ -3640,315 +2721,6 @@ def serve(
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    profile_defaults = _load_qwen35_vllm_profile_defaults(
-        vllm_profile,
-        disable_mtp_override=disable_mtp,
-    )
-    text_only = _qwen35_profile_default(
-        ctx, profile_defaults, "text_only", text_only, False
-    )
-    if text_only and profile_defaults:
-        profile_defaults = {
-            key: value
-            for key, value in profile_defaults.items()
-            if key not in _QWEN35_TEXT_ONLY_PROFILE_SKIP_DEFAULT_KEYS
-        }
-    model_path = _qwen35_profile_default(
-        ctx, profile_defaults, "model_path", model_path, None
-    )
-    thinker_model_path = _qwen35_profile_default(
-        ctx, profile_defaults, "thinker_model_path", thinker_model_path, None
-    )
-    host = _qwen35_profile_default(ctx, profile_defaults, "host", host, "0.0.0.0")
-    port = _qwen35_profile_default(ctx, profile_defaults, "port", port, 8000)
-    mem_fraction_static = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "mem_fraction_static",
-        mem_fraction_static,
-        None,
-    )
-    thinker_mem_fraction_static = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "thinker_mem_fraction_static",
-        thinker_mem_fraction_static,
-        None,
-    )
-    talker_mem_fraction_static = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "talker_mem_fraction_static",
-        talker_mem_fraction_static,
-        None,
-    )
-    max_running_requests = _qwen35_profile_default(
-        ctx, profile_defaults, "max_running_requests", max_running_requests, None
-    )
-    max_model_len = _qwen35_profile_default(
-        ctx, profile_defaults, "max_model_len", max_model_len, None
-    )
-    max_seq_len_to_capture = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "max_seq_len_to_capture",
-        max_seq_len_to_capture,
-        None,
-    )
-    compilation_config = _qwen35_profile_default(
-        ctx, profile_defaults, "compilation_config", compilation_config, None
-    )
-    max_num_batched_tokens = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "max_num_batched_tokens",
-        max_num_batched_tokens,
-        None,
-    )
-    page_size = _qwen35_profile_default(
-        ctx, profile_defaults, "page_size", page_size, None
-    )
-    quantization = _qwen35_profile_default(
-        ctx, profile_defaults, "quantization", quantization, None
-    )
-    talker_quantization = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "talker_quantization",
-        talker_quantization,
-        None,
-    )
-    max_tokens = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "max_tokens",
-        max_tokens,
-        None,
-    )
-    seed = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "seed",
-        seed,
-        None,
-    )
-    dtype = _qwen35_profile_default(ctx, profile_defaults, "dtype", dtype, None)
-    mamba_ssm_dtype = _qwen35_profile_default(
-        ctx, profile_defaults, "mamba_ssm_dtype", mamba_ssm_dtype, None
-    )
-    tensor_parallel_size = _qwen35_profile_default(
-        ctx, profile_defaults, "thinker_tp_size", tensor_parallel_size, None
-    )
-    max_mm_len = _qwen35_profile_default(
-        ctx, profile_defaults, "max_mm_len", max_mm_len, None
-    )
-    override_video_max_pixels = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "override_video_max_pixels",
-        override_video_max_pixels,
-        None,
-    )
-    thinker_only_marker = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "thinker_only_marker",
-        thinker_only_marker,
-        None,
-    )
-    limit_mm_per_prompt = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "limit_mm_per_prompt",
-        limit_mm_per_prompt,
-        None,
-    )
-    video_fps = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "video_fps",
-        video_fps,
-        None,
-    )
-    if thinker_gpus is None:
-        thinker_visible_devices = _qwen35_profile_default(
-            ctx,
-            profile_defaults,
-            "thinker_visible_devices",
-            thinker_visible_devices,
-            None,
-        )
-    if talker_gpu is None:
-        talker_visible_devices = _qwen35_profile_default(
-            ctx,
-            profile_defaults,
-            "talker_visible_devices",
-            talker_visible_devices,
-            None,
-        )
-    if code2wav_gpu is None:
-        code2wav_visible_devices = _qwen35_profile_default(
-            ctx,
-            profile_defaults,
-            "code2wav_visible_devices",
-            code2wav_visible_devices,
-            None,
-        )
-    talker_model_path = _qwen35_profile_default(
-        ctx, profile_defaults, "talker_model_path", talker_model_path, None
-    )
-    voice_type = _qwen35_profile_default(
-        ctx, profile_defaults, "voice_type", voice_type, None
-    )
-    enable_tn = _qwen35_profile_default(
-        ctx, profile_defaults, "enable_tn", enable_tn, False
-    )
-    disable_tn = _qwen35_profile_default(
-        ctx, profile_defaults, "disable_tn", disable_tn, False
-    )
-    disable_mtp = _qwen35_profile_default(
-        ctx, profile_defaults, "disable_mtp", disable_mtp, False
-    )
-    enable_prefix_caching = _qwen35_profile_default(
-        ctx, profile_defaults, "enable_prefix_caching", enable_prefix_caching, False
-    )
-    disable_prefix_caching = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "disable_prefix_caching",
-        disable_prefix_caching,
-        False,
-    )
-    enable_chunked_prefill = _qwen35_profile_default(
-        ctx, profile_defaults, "enable_chunked_prefill", enable_chunked_prefill, False
-    )
-    disable_chunked_prefill = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "disable_chunked_prefill",
-        disable_chunked_prefill,
-        False,
-    )
-    enforce_eager = _qwen35_profile_default(
-        ctx, profile_defaults, "enforce_eager", enforce_eager, False
-    )
-    code2wav_model_path = _qwen35_profile_default(
-        ctx, profile_defaults, "code2wav_model_path", code2wav_model_path, None
-    )
-    code2wav_model_folder = _qwen35_profile_default(
-        ctx, profile_defaults, "code2wav_model_folder", code2wav_model_folder, None
-    )
-    code2wav_enable_torch_compile = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "code2wav_enable_torch_compile",
-        code2wav_enable_torch_compile,
-        False,
-    )
-    code2wav_disable_torch_compile = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "code2wav_disable_torch_compile",
-        code2wav_disable_torch_compile,
-        False,
-    )
-    code2wav_enable_torch_compile_first_chunk = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "code2wav_enable_torch_compile_first_chunk",
-        code2wav_enable_torch_compile_first_chunk,
-        False,
-    )
-    code2wav_disable_torch_compile_first_chunk = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "code2wav_disable_torch_compile_first_chunk",
-        code2wav_disable_torch_compile_first_chunk,
-        False,
-    )
-    code2wav_sample_rate = _qwen35_profile_default(
-        ctx, profile_defaults, "code2wav_sample_rate", code2wav_sample_rate, None
-    )
-    code2wav_stream_chunk_size = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "code2wav_stream_chunk_size",
-        code2wav_stream_chunk_size,
-        None,
-    )
-    code2wav_left_context_size = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "code2wav_left_context_size",
-        code2wav_left_context_size,
-        None,
-    )
-    code2wav_codec_eos_token_id = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "code2wav_codec_eos_token_id",
-        code2wav_codec_eos_token_id,
-        None,
-    )
-    code2wav_enable_dynamic_chunk = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "code2wav_enable_dynamic_chunk",
-        code2wav_enable_dynamic_chunk,
-        False,
-    )
-    code2wav_disable_dynamic_chunk = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "code2wav_disable_dynamic_chunk",
-        code2wav_disable_dynamic_chunk,
-        False,
-    )
-    code2wav_dynamic_chunk_sizes = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "code2wav_dynamic_chunk_sizes",
-        code2wav_dynamic_chunk_sizes,
-        None,
-    )
-    code2wav_dynamic_chunk_steps = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "code2wav_dynamic_chunk_steps",
-        code2wav_dynamic_chunk_steps,
-        None,
-    )
-    code2wav_odeint_method = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "code2wav_odeint_method",
-        code2wav_odeint_method,
-        None,
-    )
-    code2wav_enable_odeint_method_relaxed = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "code2wav_enable_odeint_method_relaxed",
-        code2wav_enable_odeint_method_relaxed,
-        False,
-    )
-    code2wav_disable_odeint_method_relaxed = _qwen35_profile_default(
-        ctx,
-        profile_defaults,
-        "code2wav_disable_odeint_method_relaxed",
-        code2wav_disable_odeint_method_relaxed,
-        False,
-    )
-    code2wav_batched_chunk = _qwen35_profile_default(
-        ctx, profile_defaults, "code2wav_batched_chunk", code2wav_batched_chunk, None
-    )
-    code2wav_frequency = _qwen35_profile_default(
-        ctx, profile_defaults, "code2wav_frequency", code2wav_frequency, None
-    )
-    code2wav_dit_quant = _qwen35_profile_default(
-        ctx, profile_defaults, "code2wav_dit_quant", code2wav_dit_quant, None
-    )
-
     model_path = _resolve_qwen35_thinker_model_alias(
         config=config,
         model_path=model_path,
@@ -3981,43 +2753,6 @@ def serve(
         merged_config = merged_config.model_copy(update={"model_path": model_path})
     if colocate:
         _validate_colocate_config(merged_config)
-    _validate_qwen35_disable_mtp_request(
-        merged_config,
-        disable_mtp=disable_mtp,
-    )
-    _validate_qwen35_max_seq_len_to_capture_request(
-        merged_config,
-        max_seq_len_to_capture=max_seq_len_to_capture,
-    )
-    _validate_qwen35_speculative_config_request(
-        merged_config,
-        speculative_config=speculative_config,
-    )
-    _validate_qwen35_vllm_engine_profile_request(
-        merged_config,
-        distributed_executor_backend=distributed_executor_backend,
-        kv_cache_dtype=kv_cache_dtype,
-        enable_expert_parallel=enable_expert_parallel,
-        mm_processor_cache_gb=mm_processor_cache_gb,
-        max_mm_len=max_mm_len,
-        use_omni_engine=use_omni_engine,
-        use_omni_rpc_engine=use_omni_rpc_engine,
-        use_zero_shot=use_zero_shot,
-        skip_mm_profiling=skip_mm_profiling,
-        video_needs_metadata=video_needs_metadata,
-        override_video_max_pixels=override_video_max_pixels,
-        is_thinker=is_thinker,
-        thinker_only_marker=thinker_only_marker,
-        text_only=text_only,
-    )
-    if tensor_parallel_size is not None:
-        if tensor_parallel_size < 1:
-            raise typer.BadParameter("--tensor-parallel-size must be >= 1")
-        if thinker_tp_size is not None and thinker_tp_size != tensor_parallel_size:
-            raise typer.BadParameter(
-                "--tensor-parallel-size cannot conflict with --thinker-tp-size"
-            )
-        thinker_tp_size = tensor_parallel_size
     merged_config = apply_mem_fraction_cli_overrides(
         merged_config,
         mem_fraction_static=mem_fraction_static,
@@ -4064,14 +2799,7 @@ def serve(
         video_min_pixels=video_min_pixels,
         video_max_pixels=video_max_pixels,
         video_total_pixels=video_total_pixels,
-        video_override_max_pixels=(
-            _parse_qwen35_vllm_bool_value(
-                "--override-video-max-pixels",
-                override_video_max_pixels,
-            )
-            if override_video_max_pixels is not None
-            else None
-        ),
+        video_override_max_pixels=None,
         video_seconds_per_chunk=video_seconds_per_chunk,
         video_position_id_per_seconds=video_position_id_per_seconds,
         audio_target_sr=audio_target_sr,
@@ -4126,33 +2854,16 @@ def serve(
         thinker_cuda_graph=thinker_cuda_graph,
         talker_cuda_graph=talker_cuda_graph,
     )
-    merged_config = apply_vllm_ar_server_args_cli_overrides(
+    merged_config = apply_ar_server_args_cli_overrides(
         merged_config,
-        prefix_caching=_resolve_toggle_alias_flags(
-            flag_name="prefix_caching",
-            mode=prefix_caching,
-            enable_alias=enable_prefix_caching,
-            disable_alias=disable_prefix_caching,
-        ),
-        chunked_prefill=_resolve_toggle_alias_flags(
-            flag_name="chunked_prefill",
-            mode=chunked_prefill,
-            enable_alias=enable_chunked_prefill,
-            disable_alias=disable_chunked_prefill,
-        ),
-        enforce_eager=enforce_eager,
-        thinker_enforce_eager=thinker_enforce_eager,
-        talker_enforce_eager=talker_enforce_eager,
+        prefix_caching=prefix_caching,
+        chunked_prefill=chunked_prefill,
         dtype=dtype,
         thinker_dtype=thinker_dtype,
         talker_dtype=talker_dtype,
         mamba_ssm_dtype=mamba_ssm_dtype,
-        mamba_cache_mode=mamba_cache_mode,
-        kv_transfer_config=kv_transfer_config,
-        enable_disaggregated_prefilling=enable_disaggregated_prefilling,
-        max_num_batched_tokens=max_num_batched_tokens,
+        max_prefill_tokens=max_prefill_tokens,
         page_size=page_size,
-        compilation_config=compilation_config,
     )
     merged_config = apply_torch_compile_cli_overrides(
         merged_config,
@@ -4223,9 +2934,9 @@ def serve(
 
     default_generation_params: dict[str, object] = {}
     if _is_qwen35_speech_config(merged_config):
-        # 中文说明：通用 serve 的 Qwen3.5 speech/colocated 路径也对齐
-        # vLLM qwen_omni_v35_server.py 和 speech launcher 的服务级默认
-        # 生成参数；OpenAI 请求体中的 sampling 参数仍然优先。
+        # 中文说明：通用 serve 的 Qwen3.5 speech/colocated 路径使用
+        # Qwen3.5 推荐的服务级默认生成参数；OpenAI 请求体中的
+        # sampling 参数仍然优先。
         default_generation_params.update(
             {
                 "temperature": _QWEN35_DEFAULT_TEMPERATURE,
@@ -4273,8 +2984,8 @@ def serve(
     if resolved_voice_type:
         default_talker_params["voice_type"] = resolved_voice_type
     elif _is_qwen35_speech_config(merged_config):
-        # 中文说明：通用 serve 的 colocated/YAML 路径也对齐 vLLM
-        # qwen_omni_v35_server.py 的默认音色；请求里的 audio.voice 仍优先。
+        # 中文说明：通用 serve 的 colocated/YAML 路径使用 Qwen3.5
+        # 默认音色；请求里的 audio.voice 仍优先。
         default_talker_params["voice_type"] = _QWEN35_DEFAULT_VOICE_TYPE
 
     tn_default = _resolve_enable_tn_default(bool(enable_tn), bool(disable_tn))

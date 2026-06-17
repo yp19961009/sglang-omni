@@ -4,9 +4,8 @@
 # The Python pipeline config owns the stage topology; this file only sets the
 # runtime memory budgets needed for colocated launch.
 #
-# 中文说明：Qwen3.5 真实权重尚未落地，先沿用 Qwen3-Omni H20 colocated
-# 的保守初始 profile。AR 并发默认对齐 vLLM perf_v2 H20 profile 的
-# max_num_seqs=32。拿到模型后应根据实际显存峰值重新校准。
+# 中文说明：这是单 H20 colocated 启动的保守初始配置。AR 并发默认使用
+# max_running_requests=32；正式压测时应根据实际显存峰值重新校准。
 
 config_cls: Qwen35OmniSpeechColocatedPipelineConfig
 name: qwen3-5-omni-colocated-h20
@@ -53,8 +52,8 @@ stage_overrides:
         max_running_requests: 32
 
   code2wav:
-    # 中文说明：Qwen3.5 code2wav 默认 stream_chunk_size 已对齐 vLLM
-    # perf_v2 H20 profile 的 send_chunk_size=8；真实压测时可继续用
+    # 中文说明：Qwen3.5 code2wav 代码默认 stream_chunk_size=4；这个 H20
+    # 配置显式覆盖为 8。真实压测时可继续用
     # --code2wav-stream-chunk-size 做 A/B。
     runtime:
       send_chunk_size: 8

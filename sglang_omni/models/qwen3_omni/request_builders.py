@@ -38,6 +38,30 @@ MM_AGGREGATE_STAGE = "mm_aggregate"
 # Note(Chenchen Hong): PyTorch sampling_seed must fit a positive int32.
 MAX_INT32_POSITIVE = 0x7FFFFFFF
 
+_MEDIA_MODEL_INPUT_KEYS = (
+    "audio_embeds",
+    "image_embeds",
+    "video_embeds",
+    "deepstack_input_embeds",
+    "deepstack_visual_embeds",
+    "image_deepstack_visual_embeds",
+    "video_deepstack_visual_embeds",
+)
+
+_MODALITY_MODEL_INPUT_KEYS = {
+    "audio": ("audio_embeds",),
+    "image": (
+        "image_embeds",
+        "deepstack_visual_embeds",
+        "image_deepstack_visual_embeds",
+    ),
+    "video": (
+        "video_embeds",
+        "deepstack_visual_embeds",
+        "video_deepstack_visual_embeds",
+    ),
+}
+
 
 def _resolve_seed(params: dict[str, Any]) -> int | None:
     """Resolve random seed from request params (accepts both ``seed`` and ``sampling_seed``)."""
@@ -58,6 +82,93 @@ def _resolve_max_new_tokens(params: dict[str, Any], default: int = 2048) -> int:
             # 校验保持一致。
             return int(value)
     return int(default)
+
+
+def _has_non_empty_media_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, torch.Tensor):
+        return value.numel() > 0
+    if isinstance(value, dict):
+        return any(_has_non_empty_media_value(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_non_empty_media_value(item) for item in value)
+    return True
+
+
+def _has_multimodal_model_inputs(model_inputs: dict[str, Any]) -> bool:
+    return any(
+        _has_non_empty_media_value(model_inputs.get(key))
+        for key in _MEDIA_MODEL_INPUT_KEYS
+    )
+
+
+def _has_modality_model_inputs(model_inputs: dict[str, Any], modality: str) -> bool:
+    return any(
+        _has_non_empty_media_value(model_inputs.get(key))
+        for key in _MODALITY_MODEL_INPUT_KEYS.get(modality, ())
+    )
+
+
+def _input_embeds_radix_extra_key(prefix: str, request_id: str, embeds: Any) -> str:
+    return f"{prefix}:{request_id}:{id(embeds):x}"
+
+
+def _install_prefix_cache_limit_patch(Req: Any) -> None:
+    if getattr(Req, "_omni_prefix_cache_limit_patched", False):
+        return
+
+    original = Req.init_next_round_input
+
+    def _init_next_round_input_with_omni_limit(self, tree_cache=None):
+        limit = getattr(self, "_omni_max_prefix_cache_len", None)
+        if limit is None or tree_cache is None:
+            result = original(self, tree_cache)
+        else:
+            old_return_logprob = self.return_logprob
+            old_logprob_start_len = self.logprob_start_len
+            try:
+                self.return_logprob = True
+                if old_return_logprob and old_logprob_start_len >= 0:
+                    self.logprob_start_len = min(
+                        int(old_logprob_start_len), int(limit)
+                    )
+                else:
+                    self.logprob_start_len = int(limit)
+                result = original(self, tree_cache)
+            finally:
+                self.return_logprob = old_return_logprob
+                self.logprob_start_len = old_logprob_start_len
+        return result
+
+    Req._omni_original_init_next_round_input = original
+    Req.init_next_round_input = _init_next_round_input_with_omni_limit
+    Req._omni_prefix_cache_limit_patched = True
+
+
+def _first_multimodal_token_index(
+    input_ids: list[int],
+    model_inputs: dict[str, Any],
+    thinker_config: Any,
+    pad_values: dict[str, int],
+) -> int | None:
+    first_index: int | None = None
+    for modality, config_key in [
+        ("image", "image_token_id"),
+        ("video", "video_token_id"),
+        ("audio", "audio_token_id"),
+    ]:
+        if not _has_modality_model_inputs(model_inputs, modality):
+            continue
+        token_id = pad_values.get(modality, getattr(thinker_config, config_key, None))
+        if token_id is None:
+            continue
+        try:
+            index = input_ids.index(int(token_id))
+        except ValueError:
+            continue
+        first_index = index if first_index is None else min(first_index, index)
+    return first_index
 
 
 def output_modalities(request: OmniRequest | None) -> set[str] | None:
@@ -119,7 +230,7 @@ def resolve_terminal_stages(request: OmniRequest) -> list[str]:
     return [DECODE_STAGE]
 
 
-def resolve_preprocessing_next_stages(
+def resolve_preprocessing_next_stages( # 看 state.encoder_inputs 里实际有哪些 encoder 输入，有 image 输入就路由到 image_encoder，有 audio 输入就路由到 audio_encoder，最后一定去 mm_aggregate
     request_id: str, output: StagePayload
 ) -> list[str]:
     del request_id
@@ -524,6 +635,7 @@ def build_sglang_thinker_request(
     mrope_position_builder: Callable[
         [torch.Tensor, dict[str, Any], Any], Any
     ] | None = None,
+    limit_prefix_cache_before_media: bool = False,
 ) -> "SGLangARRequestData":
     """Build SGLangARRequestData from pipeline state.
 
@@ -541,6 +653,7 @@ def build_sglang_thinker_request(
 
     attention_mask = prompt.get("attention_mask")
     thinker_inputs = state.thinker_inputs or {}
+    rid = request_id or "req-0"
 
     model_inputs = dict(thinker_inputs.get("model_inputs", {}))
     if not model_inputs:
@@ -552,17 +665,28 @@ def build_sglang_thinker_request(
     capture_keys = thinker_inputs.get("capture_model_output_keys", ())
     media_cache_keys = thinker_inputs.get("media_cache_keys", {})
     pad_values: dict[str, int] = {}
-    if media_cache_keys and thinker_config is not None:
+    if (
+        thinker_config is not None
+        and (media_cache_keys or _has_multimodal_model_inputs(model_inputs))
+    ):
         token_id_map: dict[int, int] = {}
         for modality, orig_token_id in [
             ("image", thinker_config.image_token_id),
             ("video", thinker_config.video_token_id),
             ("audio", thinker_config.audio_token_id),
         ]:
+            if orig_token_id is None:
+                continue
             cache_key = media_cache_keys.get(modality)
             if cache_key is None:
-                continue
-            h = xxhash.xxh3_64(cache_key.encode()).intdigest()
+                if not _has_modality_model_inputs(model_inputs, modality):
+                    continue
+                pad_key = _input_embeds_radix_extra_key(
+                    f"media-pad:{modality}", rid, model_inputs
+                )
+            else:
+                pad_key = str(cache_key)
+            h = xxhash.xxh3_64(pad_key.encode()).intdigest()
             pad_val = vocab_size + h % (1 << 62)
             pad_values[modality] = pad_val
             token_id_map[orig_token_id] = pad_val
@@ -606,14 +730,24 @@ def build_sglang_thinker_request(
     sampling_params.verify(vocab_size)
 
     # Build SGLang Req
-    rid = request_id or "req-0"
+    extra_key = None
+    if _has_multimodal_model_inputs(model_inputs) and not pad_values:
+        extra_key = _input_embeds_radix_extra_key("media-inputs", rid, model_inputs)
     req = Req(
         rid=rid,
         origin_input_text="",
         origin_input_ids=input_ids_list,
         sampling_params=sampling_params,
+        extra_key=extra_key,
         vocab_size=vocab_size,
     )
+    if limit_prefix_cache_before_media and thinker_config is not None:
+        prefix_cache_limit = _first_multimodal_token_index(
+            input_ids_list, model_inputs, thinker_config, pad_values
+        )
+        if prefix_cache_limit is not None:
+            _install_prefix_cache_limit_patch(Req)
+            req._omni_max_prefix_cache_len = int(prefix_cache_limit)
     req.tokenizer = tokenizer
 
     # Compute M-RoPE positions and attach multimodal_inputs to Req
@@ -733,6 +867,11 @@ def build_sglang_talker_request(
     sampling_params.verify(codec_vocab_size)
 
     rid = request_id or "talker-req-0"
+    input_embeds_extra_key = _input_embeds_radix_extra_key(
+        "projected-input-embeds" if input_embeds_are_projected else "input-embeds",
+        rid,
+        prefill_embeds_tensor,
+    )
     req = Req(
         rid=rid,
         origin_input_text="",
@@ -743,6 +882,7 @@ def build_sglang_talker_request(
             None if input_embeds_are_projected else prefill_embeds_tensor.cpu().tolist()
         ),
         eos_token_ids={int(codec_eos_id)} if codec_eos_id is not None else None,
+        extra_key=input_embeds_extra_key,
         vocab_size=codec_vocab_size,
     )
     req.tokenizer = tokenizer

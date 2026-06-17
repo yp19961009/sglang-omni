@@ -44,7 +44,7 @@ class _FakeStreamClient:
         return _FakeStreamResponse(self._lines)
 
 
-def test_streaming_ttft_detects_delta_and_vllm_top_level_audio_events():
+def test_streaming_ttft_detects_text_and_audio_delta_events():
     assert (
         _event_text_delta(
             {
@@ -73,24 +73,15 @@ def test_streaming_ttft_detects_delta_and_vllm_top_level_audio_events():
         )
         == "delta-audio"
     )
-    assert (
-        _event_audio_data(
-            {
-                "object": "chat.completion.audio",
-                "audio": {"data": "top-level-audio", "format": "wav"},
-            }
-        )
-        == "top-level-audio"
-    )
 
 
-def test_streaming_ttft_payload_works_for_vllm_and_sglang():
+def test_streaming_ttft_payload_uses_native_audio_contract():
     client = _FakeStreamClient(
         [
             'data: {"choices":[{"delta":{"content":"hello"}}]}',
             (
-                'data: {"object":"chat.completion.audio",'
-                '"audio":{"data":"abc","format":"wav"}}'
+                'data: {"choices":[{"delta":'
+                '{"audio":{"data":"abc","format":"wav"}}}]}'
             ),
             "data: [DONE]",
         ]
@@ -117,10 +108,11 @@ def test_streaming_ttft_payload_works_for_vllm_and_sglang():
     assert audio_chunks == 1
     assert status_code == 200
     assert client.payload["modalities"] == ["text", "audio"]
-    assert client.payload["enable_audio_output"] is True
     assert client.payload["max_tokens"] == 128
     assert client.payload["audio"] == {"format": "wav", "voice": "Cherry"}
-    assert client.payload["voice_type"] == "Cherry"
+    assert "enable_audio_output" not in client.payload
+    assert "do_wave" not in client.payload
+    assert "voice_type" not in client.payload
 
 
 def test_streaming_ttft_summary_payload_records_config():

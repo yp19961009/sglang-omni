@@ -43,6 +43,7 @@ def test_model_worker_maps_qwen35_talker_to_text_config():
 
 def test_qwen35_hf_config_registers_auto_config():
     from transformers import AutoConfig
+    from sglang.srt.configs import Qwen3NextConfig
 
     qwen35_hf_config.register_qwen35_hf_config()
 
@@ -58,6 +59,7 @@ def test_qwen35_hf_config_registers_auto_config():
     )
 
     assert isinstance(cfg, qwen35_hf_config.Qwen3OmniNextConfig)
+    assert isinstance(cfg, Qwen3NextConfig)
     assert cfg.thinker_config.text_config.hidden_size == 64
     assert cfg.get_text_config().num_attention_heads == 4
 
@@ -90,6 +92,7 @@ def test_qwen35_hf_config_registers_auto_config():
 
 def test_qwen35_hf_config_loads_root_from_pretrained(tmp_path):
     from transformers import AutoConfig
+    from sglang.srt.configs import Qwen3NextConfig
 
     qwen35_hf_config.register_qwen35_hf_config()
     (tmp_path / "config.json").write_text(
@@ -142,6 +145,7 @@ def test_qwen35_hf_config_loads_root_from_pretrained(tmp_path):
     cfg = AutoConfig.from_pretrained(str(tmp_path), local_files_only=True)
 
     assert isinstance(cfg, qwen35_hf_config.Qwen3OmniNextConfig)
+    assert isinstance(cfg, Qwen3NextConfig)
     assert cfg.thinker_config.text_config.hidden_size == 128
     assert cfg.talker_config.text_config.vocab_size == 256
     assert cfg.get_text_config().num_attention_heads == 8
@@ -189,7 +193,7 @@ def test_qwen35_hf_config_loads_root_from_pretrained(tmp_path):
     assert cfg.talker_config.speaker_system_prompt_id == {"f6009": [70, 71]}
 
 
-def test_qwen35_hf_config_normalizes_vllm_qwen35_text_model_types(tmp_path):
+def test_qwen35_hf_config_normalizes_qwen35_text_model_types(tmp_path):
     from transformers import AutoConfig
 
     qwen35_hf_config.register_qwen35_hf_config()

@@ -7,6 +7,7 @@
 #
 # Useful overrides:
 #   PORT=8161 VOICE_TYPE=m02 bash scripts/launch_qwen35_omni_sglang_server.sh
+#   PREFIX_CACHING=off bash scripts/launch_qwen35_omni_sglang_server.sh
 #   EXTRA_ARGS="--code2wav-stream-chunk-size 4" bash scripts/launch_...
 
 set -euo pipefail
@@ -19,18 +20,21 @@ MODEL_NAME="${MODEL_NAME:-qwen3_5-omni}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8161}"
 VOICE_TYPE="${VOICE_TYPE:-m02}"
-MAX_TOKENS="${MAX_TOKENS:-256}"
+MAX_TOKENS="${MAX_TOKENS:-512}"
 SEED="${SEED:-3408}"
 GPU_THINKER="${GPU_THINKER:-0}"
 GPU_TALKER="${GPU_TALKER:-1}"
 GPU_CODE2WAV="${GPU_CODE2WAV:-1}"
 THINKER_MAX_SEQ_LEN="${THINKER_MAX_SEQ_LEN:-192000}"
+PREFIX_CACHING="${PREFIX_CACHING:-on}"
 NO_CODE2WAV_TORCH_COMPILE="${NO_CODE2WAV_TORCH_COMPILE:-1}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 server_args=(
   python
-  examples/run_qwen3_5_omni_speech_server.py
+  -m
+  sglang_omni.cli
+  serve
   --model-path "$MODEL_PATH"
   --model-name "$MODEL_NAME"
   --host "$HOST"
@@ -38,11 +42,12 @@ server_args=(
   --voice-type "$VOICE_TYPE"
   --max-tokens "$MAX_TOKENS"
   --seed "$SEED"
-  --gpu-thinker "$GPU_THINKER"
-  --gpu-talker "$GPU_TALKER"
-  --gpu-code2wav "$GPU_CODE2WAV"
+  --thinker-gpus "$GPU_THINKER"
+  --talker-gpu "$GPU_TALKER"
+  --code2wav-gpu "$GPU_CODE2WAV"
   --thinker-max-seq-len "$THINKER_MAX_SEQ_LEN"
   --code2wav-model-path "$CODE2WAV_PATH"
+  --prefix-caching "$PREFIX_CACHING"
 )
 
 if [[ "$NO_CODE2WAV_TORCH_COMPILE" == "1" ]]; then
@@ -63,7 +68,7 @@ printf -v quoted_server_cmd "%q " "${server_args[@]}"
 
 echo "[qwen35] launching SGLang server in container=$CONTAINER"
 echo "[qwen35] model=$MODEL_PATH"
-echo "[qwen35] listen=http://$HOST:$PORT voice=$VOICE_TYPE"
+echo "[qwen35] listen=http://$HOST:$PORT voice=$VOICE_TYPE prefix_caching=$PREFIX_CACHING"
 
 docker exec "$CONTAINER" bash -lc \
   "cd $quoted_workdir && \

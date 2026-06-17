@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Residual codec predictor for Qwen3.5-Omni talker.
 
-Qwen3.5 uses a small "subtalker" after the main AR codec token.  vLLM
+Qwen3.5 uses a small "subtalker" after the main AR codec token.  Qwen reference
 dev/qwenc_perf_v2 implements it as a compact decoder that receives
 ``[talker_hidden, layer0_codec_embed]`` and autoregressively predicts the
 remaining RVQ groups.  The current sglang-omni environment may not ship the
@@ -520,7 +520,7 @@ class _NextSelfAttention(nn.Module):
         if use_cache and past_key_values is not None:
             if layer_idx is None:
                 raise ValueError("subtalker KV cache requires layer_idx")
-            # 中文说明：vLLM perf_v2 的 subtalker 会先缓存
+            # 中文说明：reference 的 subtalker 会先缓存
             # [talker_hidden, layer0_embed]，后续 residual 组只喂 1 token。
             # 本地 decoder 同步这个增量路径，避免每个 codec group 重算前缀。
             key_states, value_states = past_key_values.update(
@@ -613,7 +613,7 @@ class _NextDecoderLayer(nn.Module):
 
 
 class _NextPredictorModel(nn.Module):
-    """Local Next-style decoder with HF/vLLM-compatible parameter names."""
+    """Local Next-style decoder with HF-compatible parameter names."""
 
     def __init__(self, config: Any) -> None:
         super().__init__()
@@ -735,7 +735,7 @@ class Qwen35ResidualCodePredictor(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate residual code groups and summed codec embeddings.
 
-        中文说明：这里按 vLLM dev/qwenc_perf_v2 的 subtalker 契约执行：
+        中文说明：这里按 reference implementation 的 subtalker 契约执行：
         第一个输入 token 是 talker hidden，第二个输入 token 是主 AR
         预测出的第 0 组 codec embedding；之后每预测一组 residual codec，
         就把该组 embedding 追加到 decoder 输入里继续预测下一组。

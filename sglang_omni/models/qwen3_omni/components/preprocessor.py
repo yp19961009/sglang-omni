@@ -198,7 +198,7 @@ def _build_audio_mm_inputs_compat(hf_inputs: dict[str, Any]) -> dict[str, Any]:
     audio_inputs = build_audio_mm_inputs(hf_inputs)
     if audio_inputs.get("input_features") is None:
         # 中文说明：Qwen3-Omni 老 processor 输出 input_features；
-        # Qwen3.5-Omni Next / vLLM processor 输出 input_audio_features。
+        # Qwen3.5-Omni Next / Qwen reference processor 输出 input_audio_features。
         # 这里归一成现有 audio_encoder/batch 逻辑使用的字段名。
         audio_inputs["input_features"] = hf_inputs.get("input_audio_features")
     return audio_inputs
@@ -693,11 +693,11 @@ class Qwen3OmniPreprocessor:
             video_audios_for_mask = []
 
         if raw_prompt_text is not None:
-            # 中文说明：vLLM 的 TextPrompt 已经把 chat template 和多模态
+            # 中文说明：Qwen reference 的 TextPrompt 已经把 chat template 和多模态
             # 占位符渲染进 prompt。这里直接复用，避免再次套模板导致占位符重复。
             prompt_text = raw_prompt_text
         elif raw_prompt_token_ids is not None:
-            # 中文说明：vLLM 的 TokensPrompt 已经完成 tokenization。HF
+            # 中文说明：Qwen reference 的 TokensPrompt 已经完成 tokenization。HF
             # processor 仍用于多模态特征抽取，最终 input_ids 由调用侧 token
             # 覆盖，避免把 tokenized prompt 反向转文本再编码。
             prompt_text = ""
@@ -719,7 +719,7 @@ class Qwen3OmniPreprocessor:
                 "tokenize": False,
             }
             if tools is not None:
-                # 中文说明：Qwen3.5 vLLM 离线 function-call 示例会把 tools
+                # 中文说明：Qwen3.5 Qwen reference 离线 function-call 示例会把 tools
                 # 交给 chat template 渲染；这里仅传递 schema，不执行工具。
                 chat_template_kwargs["tools"] = tools
             prompt_text = self.processor.apply_chat_template(

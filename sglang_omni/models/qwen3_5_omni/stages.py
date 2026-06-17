@@ -68,7 +68,7 @@ _STAGE_MODEL_SUBDIRS = {
     IMAGE_STAGE: ("thinker",),
     AUDIO_STAGE: ("thinker",),
     THINKER_STAGE: ("thinker",),
-    # 中文说明：vLLM Qwen3.5 server/RTC 脚本默认 talker_lm，部分
+    # 中文说明：Qwen reference Qwen3.5 server/RTC 脚本默认 talker_lm，部分
     # 离线脚本和旧 checkpoint 用 talker。自动探测时保持这个优先级。
     TALKER_STAGE: ("talker_lm", "talker"),
 }
@@ -80,7 +80,7 @@ def _resolve_qwen35_stage_model_path(model_path: str, stage_name: str) -> str:
         return model_path
     for subdir in subdirs:
         candidate = Path(model_path) / subdir
-        # 中文说明：vLLM Qwen3.5 bring-up 脚本会把 root checkpoint 自动切到
+        # 中文说明：Qwen reference Qwen3.5 bring-up 脚本会把 root checkpoint 自动切到
         # root/thinker 或 root/talker_lm。这里要求子目录里有 config.json，
         # 避免把 HuggingFace repo id 或普通 root checkpoint 误当成本地 split。
         if candidate.is_dir() and (candidate / "config.json").is_file():
@@ -328,48 +328,9 @@ def _ensure_qwen3_omni_next_autoconfig():
     if _hf_config_registered:
         return
     _hf_config_registered = True
-    from transformers import AutoConfig, PretrainedConfig
+    from sglang_omni.models.qwen3_5_omni.hf_config import register_qwen35_hf_config
 
-    from sglang.srt.configs.qwen3_next import Qwen3NextConfig
-
-    def _nested_cfg(d):
-        kw = {}
-        for k, v in d.items():
-            if isinstance(v, dict) and k.endswith("_config"):
-                kw[k] = _nested_cfg(v)
-            else:
-                kw[k] = v
-        return PretrainedConfig(**kw)
-
-    class Qwen3OmniNextConfig(Qwen3NextConfig):
-        model_type = "qwen3_omni_next"
-
-        def __init__(self, **kwargs):
-            for key in list(kwargs):
-                if isinstance(kwargs[key], dict) and key.endswith("_config"):
-                    kwargs[key] = _nested_cfg(kwargs[key])
-            # Extract text_config attributes needed by Qwen3NextConfig
-            thinker = kwargs.get("thinker_config")
-            text_cfg = getattr(thinker, "text_config", None) if thinker else None
-            if text_cfg is not None:
-                # Proxy essential attributes from text_config to top-level
-                for attr in (
-                    "num_hidden_layers", "hidden_size", "intermediate_size",
-                    "num_attention_heads", "num_key_value_heads",
-                    "full_attention_interval", "decoder_sparse_step",
-                    "head_dim", "linear_conv_kernel_dim",
-                    "linear_key_head_dim", "linear_value_head_dim",
-                    "linear_num_key_heads", "linear_num_value_heads",
-                    "num_experts", "num_experts_per_tok",
-                    "moe_intermediate_size", "shared_expert_intermediate_size",
-                    "rms_norm_eps", "rope_theta", "rope_scaling",
-                    "partial_rotary_factor", "vocab_size", "max_position_embeddings",
-                ):
-                    if attr not in kwargs and hasattr(text_cfg, attr):
-                        kwargs[attr] = getattr(text_cfg, attr)
-            super().__init__(**kwargs)
-
-    AutoConfig.register("qwen3_omni_next", Qwen3OmniNextConfig)
+    register_qwen35_hf_config()
 
 
 def create_sglang_thinker_executor_from_config(
@@ -406,6 +367,12 @@ def create_sglang_thinker_executor_from_config(
     )
     if server_args_overrides:
         overrides.update(server_args_overrides)
+    mamba_scheduler_strategy = os.getenv(
+        "QWEN35_THINKER_MAMBA_SCHEDULER_STRATEGY",
+        "extra_buffer",
+    )
+    if mamba_scheduler_strategy:
+        overrides["mamba_scheduler_strategy"] = mamba_scheduler_strategy
     overrides["tp_size"] = tp_size
     has_explicit_colocated_mem_fraction = (
         total_gpu_memory_fraction is not None

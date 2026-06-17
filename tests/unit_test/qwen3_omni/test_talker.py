@@ -127,7 +127,7 @@ def test_qwen_talker_decode_input_preserves_feedback_until_text_arrives() -> Non
 
 
 def test_qwen_talker_qwen35_decode_paces_text_replacement() -> None:
-    """Qwen3.5 mirrors vLLM external-data handoff instead of summing text."""
+    """Qwen3.5 uses external-data handoff instead of summing text."""
     sched_req = _sched_req(
         pending_feedback_queue=deque(
             [
@@ -139,7 +139,7 @@ def test_qwen_talker_qwen35_decode_paces_text_replacement() -> None:
         pending_text_queue=deque([torch.tensor([20.0, 30.0])]),
         thinker_chunks_done=False,
         tts_pad_embed=torch.tensor([7.0, 8.0]),
-        talker_decode_input_mode="qwen35_vllm",
+        talker_decode_input_mode="qwen35_external",
         talker_text_feedback_stride=4,
         talker_text_feedback_countdown=1,
     )
@@ -164,9 +164,60 @@ def test_qwen_talker_qwen35_decode_paces_text_replacement() -> None:
 
     assert torch.equal(_take_decode_input(sched_req), torch.tensor([20.0, 30.0]))
     assert sched_req.data.last_talker_decode_input_kind == "text"
-    assert sched_req.data.last_talker_decode_should_emit is False
+    assert sched_req.data.last_talker_decode_should_emit is True
     assert sched_req.data.talker_text_feedback_countdown == 4
     assert len(sched_req.data.pending_feedback_queue) == 0
+    assert len(sched_req.data.pending_text_queue) == 0
+
+
+def test_qwen_talker_qwen35_decode_emits_last_text_output_in_chunk() -> None:
+    """Match qwen3.5 external-data pacing: drop boundary + first N-1 text steps."""
+    sched_req = _sched_req(
+        pending_feedback_queue=deque(
+            [
+                torch.tensor([1.0, 2.0]),
+                torch.tensor([3.0, 4.0]),
+                torch.tensor([5.0, 6.0]),
+                torch.tensor([7.0, 8.0]),
+                torch.tensor([9.0, 10.0]),
+            ]
+        ),
+        pending_text_queue=deque(
+            [
+                torch.tensor([20.0, 20.0]),
+                torch.tensor([30.0, 30.0]),
+                torch.tensor([40.0, 40.0]),
+                torch.tensor([50.0, 50.0]),
+            ]
+        ),
+        thinker_chunks_done=False,
+        tts_pad_embed=torch.tensor([0.0, 0.0]),
+        talker_decode_input_mode="qwen35_external",
+        talker_text_feedback_stride=3,
+        talker_text_feedback_countdown=0,
+        talker_text_chunk_size=4,
+    )
+
+    assert torch.equal(_take_decode_input(sched_req), torch.tensor([1.0, 2.0]))
+    assert sched_req.data.last_talker_decode_input_kind == "boundary_feedback"
+    assert sched_req.data.last_talker_decode_should_emit is False
+    assert sched_req.data.talker_text_outputs_to_drop == 3
+
+    for expected, remaining_drop in (
+        (torch.tensor([20.0, 20.0]), 2),
+        (torch.tensor([30.0, 30.0]), 1),
+        (torch.tensor([40.0, 40.0]), 0),
+    ):
+        assert torch.equal(_take_decode_input(sched_req), expected)
+        assert sched_req.data.last_talker_decode_input_kind == "text"
+        assert sched_req.data.last_talker_decode_should_emit is False
+        assert sched_req.data.talker_text_outputs_to_drop == remaining_drop
+
+    assert torch.equal(_take_decode_input(sched_req), torch.tensor([50.0, 50.0]))
+    assert sched_req.data.last_talker_decode_input_kind == "text"
+    assert sched_req.data.last_talker_decode_should_emit is True
+    assert sched_req.data.talker_text_feedback_countdown == 3
+    assert sched_req.data.talker_text_chunk_remaining == 0
     assert len(sched_req.data.pending_text_queue) == 0
 
 
@@ -176,7 +227,7 @@ def test_qwen_talker_qwen35_decode_waits_when_countdown_exhausted() -> None:
         pending_text_queue=deque(),
         thinker_chunks_done=False,
         tts_pad_embed=torch.tensor([7.0, 8.0]),
-        talker_decode_input_mode="qwen35_vllm",
+        talker_decode_input_mode="qwen35_external",
         talker_text_feedback_stride=4,
         talker_text_feedback_countdown=0,
     )
@@ -1279,6 +1330,49 @@ def test_qwen_model_runner_and_code_predictor_tensor_contracts() -> None:
     sampled = Qwen3OmniTalker._sample_code_predictor_token(logits)
     assert sampled.shape == (2, 1)
     assert sampled[:, 0].tolist() == [2, 0]
+
+
+def test_qwen_thinker_embed_injection_offsets_cached_media_prefix() -> None:
+    """Prefix-cache hits inside media spans must skip already-cached embed rows."""
+
+    class RecordingEmbed:
+        num_embeddings = 10
+
+        def __call__(self, input_ids: torch.Tensor) -> torch.Tensor:
+            return torch.zeros((input_ids.shape[0], 4), dtype=torch.float32)
+
+    runner = ThinkerModelRunner.__new__(ThinkerModelRunner)
+    runner._embed_tokens = RecordingEmbed()
+    runner._image_token_id = 5
+    runner._video_token_id = 6
+    runner._audio_token_id = 7
+    req = SimpleNamespace(
+        origin_input_ids=[1, 999, 999, 999, 2],
+        prefix_indices=[0, 1, 2],
+        omni_model_inputs={
+            "audio_embeds": torch.tensor(
+                [
+                    [10.0, 0.0, 0.0, 0.0],
+                    [20.0, 0.0, 0.0, 0.0],
+                    [30.0, 0.0, 0.0, 0.0],
+                ]
+            ),
+            "pad_values": {"audio": 999},
+        },
+        _omni_consumed=None,
+        is_chunked=0,
+    )
+
+    input_embeds, _, _ = runner._inject_multimodal_embeds(
+        SimpleNamespace(
+            input_ids=torch.tensor([999, 2]),
+            extend_seq_lens_cpu=[2],
+        ),
+        SimpleNamespace(reqs=[req]),
+    )
+
+    assert torch.equal(input_embeds[0], torch.tensor([30.0, 0.0, 0.0, 0.0]))
+    assert req._omni_consumed is None
 
 
 def test_qwen_talker_keeps_existing_read_only_weight_loader() -> None:

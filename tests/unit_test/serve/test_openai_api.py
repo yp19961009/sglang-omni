@@ -19,7 +19,6 @@ from sglang_omni.client.types import (
     GenerateRequest,
     UsageInfo,
 )
-from sglang_omni.models.qwen3_5_omni.config import QWEN3_5_OMNI_MODEL_NAME
 from sglang_omni.models.qwen3_5_omni import request_builders as qwen35_builders
 from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.proto import CompleteMessage, OmniRequest, StreamMessage
@@ -306,7 +305,7 @@ def test_chat_stream_audio_delta_includes_format() -> None:
         model="qwen3.5-omni",
         messages=[{"role": "user", "content": "say hi"}],
         stream=True,
-        enable_audio_output=True,
+        modalities=["text", "audio"],
     )
 
     async def _drive() -> None:
@@ -599,53 +598,7 @@ def test_speech_request_records_explicit_generation_params() -> None:
     ]
 
 
-def test_speech_request_lifts_nested_generation_params() -> None:
-    req = CreateSpeechRequest.model_validate(
-        {
-            "input": "hello",
-            "parameters": {
-                "max_tokens": 64,
-                "temperature": 0.4,
-                "top_p": 0.7,
-                "top_k": 8,
-                "min_p": 0.05,
-                "repetition_penalty": 1.2,
-                "frequency_penalty": 0.1,
-                "presence_penalty": 0.2,
-                "stop": ["<end>"],
-                "seed": 321,
-            },
-        }
-    )
-
-    gen_req = build_speech_generate_request(req, "qwen3.5-omni")
-
-    assert gen_req.sampling.max_new_tokens == 64
-    assert gen_req.sampling.temperature == 0.4
-    assert gen_req.sampling.top_p == 0.7
-    assert gen_req.sampling.top_k == 8
-    assert gen_req.sampling.min_p == 0.05
-    assert gen_req.sampling.repetition_penalty == 1.2
-    assert gen_req.sampling.frequency_penalty == 0.1
-    assert gen_req.sampling.presence_penalty == 0.2
-    assert gen_req.sampling.stop == ["<end>"]
-    assert gen_req.sampling.seed == 321
-    assert gen_req.metadata["tts_params"]["seed"] == 321
-    assert gen_req.metadata["tts_params"]["explicit_generation_params"] == [
-        "frequency_penalty",
-        "max_tokens",
-        "min_p",
-        "presence_penalty",
-        "repetition_penalty",
-        "seed",
-        "stop",
-        "temperature",
-        "top_k",
-        "top_p",
-    ]
-
-
-def test_chat_request_normalizes_qwen35_model_alias() -> None:
+def test_chat_request_preserves_requested_model_name() -> None:
     req = ChatCompletionRequest(
         model="qwen_3_5_omni",
         messages=[{"role": "user", "content": "hello"}],
@@ -653,10 +606,10 @@ def test_chat_request_normalizes_qwen35_model_alias() -> None:
 
     gen_req = _build_chat_generate_request(req)
 
-    assert gen_req.model == QWEN3_5_OMNI_MODEL_NAME
+    assert gen_req.model == "qwen_3_5_omni"
 
 
-def test_chat_request_uses_default_qwen35_model() -> None:
+def test_chat_request_uses_default_model_name() -> None:
     req = ChatCompletionRequest(
         messages=[{"role": "user", "content": "hello"}],
     )
@@ -666,10 +619,10 @@ def test_chat_request_uses_default_qwen35_model() -> None:
         default_model="qwen3_5_omni",
     )
 
-    assert gen_req.model == QWEN3_5_OMNI_MODEL_NAME
+    assert gen_req.model == "qwen3_5_omni"
 
 
-def test_speech_request_normalizes_qwen35_model_alias() -> None:
+def test_speech_request_preserves_requested_model_name() -> None:
     req = CreateSpeechRequest.model_validate(
         {
             "model": "qwen3_5_omni",
@@ -680,10 +633,10 @@ def test_speech_request_normalizes_qwen35_model_alias() -> None:
 
     gen_req = build_speech_generate_request(req, "qwen3-omni")
 
-    assert gen_req.model == QWEN3_5_OMNI_MODEL_NAME
+    assert gen_req.model == "qwen3_5_omni"
 
 
-def test_http_chat_normalizes_qwen35_model_alias_in_response() -> None:
+def test_http_chat_preserves_model_name_in_response() -> None:
     client = TestClient(
         create_app(SuccessfulChatClient(), model_name="qwen3_5_omni")
     )
@@ -697,8 +650,8 @@ def test_http_chat_normalizes_qwen35_model_alias_in_response() -> None:
         },
     )
 
-    assert models_resp.json()["data"][0]["id"] == QWEN3_5_OMNI_MODEL_NAME
-    assert chat_resp.json()["model"] == QWEN3_5_OMNI_MODEL_NAME
+    assert models_resp.json()["data"][0]["id"] == "qwen3_5_omni"
+    assert chat_resp.json()["model"] == "qwen_3_5_omni"
 
 
 def test_http_chat_uses_default_qwen35_model_when_request_omits_model() -> None:
@@ -710,8 +663,8 @@ def test_http_chat_uses_default_qwen35_model_when_request_omits_model() -> None:
         json={"messages": [{"role": "user", "content": "hello"}]},
     )
 
-    assert chat_resp.json()["model"] == QWEN3_5_OMNI_MODEL_NAME
-    assert recording_client.requests[-1].model == QWEN3_5_OMNI_MODEL_NAME
+    assert chat_resp.json()["model"] == "qwen3_5_omni"
+    assert recording_client.requests[-1].model == "qwen3_5_omni"
 
 
 def test_http_chat_defaults_missing_finish_reason_to_stop() -> None:
@@ -724,81 +677,6 @@ def test_http_chat_defaults_missing_finish_reason_to_stop() -> None:
 
     assert chat_resp.status_code == 200
     assert chat_resp.json()["choices"][0]["finish_reason"] == "stop"
-
-
-def test_speech_request_passes_qwen35_talker_controls() -> None:
-    req = CreateSpeechRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "input": "say hi",
-            "voice": "Cherry",
-            "instructions": "happy",
-            "parameters": {
-                "translation_options": {"target_lang": "zh"},
-                "talker_temperature": 0.7,
-                "talker_max_completion_tokens": 88,
-                "subtalker_params": {"temperature": 0.2, "top_k": 4},
-                "voice_clone": {"path": "/voices/ref.json"},
-                "enable_text_normalization": True,
-            },
-            "subtalker_sampling_seed": 456,
-            "subtalker_max_completion_tokens": 22,
-        }
-    )
-
-    gen_req = build_speech_generate_request(req, "qwen3.5-omni")
-
-    assert gen_req.model == "qwen3.5-omni"
-    assert gen_req.output_modalities == ["audio"]
-    assert gen_req.metadata["tts_params"]["voice"] == "Cherry"
-    assert gen_req.metadata["tts_params"]["instructions"] == "happy"
-    assert gen_req.extra_params["voice"] == "Cherry"
-    assert gen_req.extra_params["instruction"] == "happy"
-    assert gen_req.extra_params["translation_options"] == {"target_lang": "zh"}
-    assert gen_req.extra_params["target_language"] == "zh"
-    assert gen_req.extra_params["talker_temperature"] == 0.7
-    assert gen_req.extra_params["talker_max_completion_tokens"] == 88
-    assert gen_req.extra_params["subtalker_params"] == {
-        "temperature": 0.2,
-        "top_k": 4,
-    }
-    assert gen_req.extra_params["subtalker_sampling_seed"] == 456
-    assert gen_req.extra_params["subtalker_max_completion_tokens"] == 22
-    assert gen_req.extra_params["voice_clone_info"] == "/voices/ref.json"
-    assert gen_req.extra_params["enable_tn"] is True
-
-
-def test_speech_parameters_voice_is_not_shadowed_by_default_voice() -> None:
-    voice_type_req = CreateSpeechRequest.model_validate(
-        {
-            "input": "say hi",
-            "parameters": {
-                "voice_type": "Cherry",
-                "talker_temperature": 0.7,
-            },
-        }
-    )
-
-    gen_req = build_speech_generate_request(voice_type_req, "qwen3.5-omni")
-
-    assert gen_req.metadata["tts_params"]["voice"] == "default"
-    assert gen_req.extra_params["voice_type"] == "Cherry"
-    assert gen_req.extra_params["talker_temperature"] == 0.7
-    assert "voice" not in gen_req.extra_params
-
-    voice_req = CreateSpeechRequest.model_validate(
-        {
-            "input": "say hi",
-            "parameters": {
-                "voice": "Cherry",
-            },
-        }
-    )
-
-    gen_req = build_speech_generate_request(voice_req, "qwen3.5-omni")
-
-    assert gen_req.extra_params["voice"] == "Cherry"
-    assert "voice_type" not in gen_req.extra_params
 
 
 def test_chat_request_merges_default_talker_params() -> None:
@@ -821,8 +699,7 @@ def test_chat_request_merges_default_talker_params() -> None:
         {
             "model": "qwen3.5-omni",
             "messages": [{"role": "user", "content": "say hi"}],
-            "voice_type": "Cherry",
-            "parameters": {"enable_tn": False},
+            "audio": {"voice": "Cherry", "format": "wav"},
         }
     )
 
@@ -831,7 +708,15 @@ def test_chat_request_merges_default_talker_params() -> None:
         default_talker_params={"voice_type": "f245", "enable_tn": True},
     )
 
-    assert gen_req.extra_params == {"voice_type": "Cherry", "enable_tn": False}
+    assert gen_req.extra_params == {"enable_tn": True}
+    omni_request = OmniRequest(
+        inputs={},
+        params=gen_req.extra_params,
+        metadata=gen_req.metadata,
+    )
+    params = qwen35_builders._params_with_openai_audio_config(omni_request)
+    assert params["voice_type"] == "Cherry"
+    assert params["enable_tn"] is True
 
 
 def test_speech_request_merges_default_talker_params() -> None:
@@ -856,11 +741,8 @@ def test_speech_request_merges_default_talker_params() -> None:
         default_talker_params={"voice_type": "f245", "enable_tn": True},
     )
 
-    assert gen_req.extra_params == {
-        "voice_type": "f245",
-        "voice": "Cherry",
-        "enable_tn": True,
-    }
+    assert gen_req.extra_params == {"voice_type": "f245", "enable_tn": True}
+    assert gen_req.metadata["tts_params"]["voice"] == "Cherry"
 
 
 def test_http_chat_applies_default_talker_params() -> None:
@@ -913,11 +795,9 @@ def test_chat_request_merges_default_generation_params() -> None:
             "model": "qwen3.5-omni",
             "messages": [{"role": "user", "content": "say hi"}],
             "temperature": 0.2,
-            "parameters": {
-                "top_k": 4,
-                "max_tokens": 128,
-                "seed": 99,
-            },
+            "top_k": 4,
+            "max_tokens": 128,
+            "seed": 99,
         }
     )
 
@@ -938,40 +818,6 @@ def test_chat_request_merges_default_generation_params() -> None:
     assert gen_req.max_tokens == 128
 
 
-def test_chat_request_lifts_nested_stage_overrides() -> None:
-    req = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "say hi"}],
-            "parameters": {
-                "stage_sampling": {
-                    "talker_ar": {
-                        "temperature": 0.2,
-                        "top_k": 4,
-                        "max_new_tokens": 32,
-                    }
-                },
-                "stage_params": {
-                    "code2wav": {
-                        "chunk_size": 3,
-                        "odeint_method": "rk4",
-                    }
-                },
-            },
-        }
-    )
-
-    gen_req = _build_chat_generate_request(req)
-
-    assert gen_req.stage_sampling is not None
-    assert gen_req.stage_sampling["talker_ar"].temperature == 0.2
-    assert gen_req.stage_sampling["talker_ar"].top_k == 4
-    assert gen_req.stage_sampling["talker_ar"].max_new_tokens == 32
-    assert gen_req.stage_params == {
-        "code2wav": {"chunk_size": 3, "odeint_method": "rk4"}
-    }
-
-
 def test_chat_request_stage_overrides_prefer_top_level_fields() -> None:
     req = ChatCompletionRequest.model_validate(
         {
@@ -983,14 +829,6 @@ def test_chat_request_stage_overrides_prefer_top_level_fields() -> None:
                 }
             },
             "stage_params": {"decode": {"max_prefill_tokens": 64}},
-            "parameters": {
-                "stage_sampling": {
-                    "talker_ar": {
-                        "temperature": 0.8,
-                    }
-                },
-                "stage_params": {"code2wav": {"chunk_size": 8}},
-            },
         }
     )
 
@@ -1028,11 +866,9 @@ def test_speech_request_merges_default_generation_params() -> None:
     override_req = CreateSpeechRequest.model_validate(
         {
             "input": "say hi",
-            "parameters": {
-                "temperature": 0.2,
-                "max_tokens": 128,
-                "seed": 99,
-            },
+            "temperature": 0.2,
+            "max_tokens": 128,
+            "seed": 99,
         }
     )
 
@@ -1055,30 +891,6 @@ def test_speech_request_merges_default_generation_params() -> None:
         "seed",
         "temperature",
     ]
-
-
-def test_speech_request_lifts_nested_stage_overrides() -> None:
-    req = CreateSpeechRequest.model_validate(
-        {
-            "input": "say hi",
-            "parameters": {
-                "stage_sampling": {
-                    "talker_ar": {
-                        "temperature": 0.3,
-                        "top_p": 0.6,
-                    }
-                },
-                "stage_params": {"code2wav": {"chunk_size": 2}},
-            },
-        }
-    )
-
-    gen_req = build_speech_generate_request(req, "qwen3.5-omni")
-
-    assert gen_req.stage_sampling is not None
-    assert gen_req.stage_sampling["talker_ar"].temperature == 0.3
-    assert gen_req.stage_sampling["talker_ar"].top_p == 0.6
-    assert gen_req.stage_params == {"code2wav": {"chunk_size": 2}}
 
 
 def test_speech_request_accepts_top_level_stage_sampling() -> None:
@@ -1179,97 +991,37 @@ def test_chat_request_passes_qwen35_preprocessing_params() -> None:
     }
 
 
-def test_chat_request_accepts_singular_image_video_aliases() -> None:
-    req = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "watch"}],
-            "image_url": {"url": "frame.png"},
-            "input_video": {"data": "AAAA", "format": "mp4"},
-        }
-    )
-
-    gen_req = _build_chat_generate_request(req)
-
-    assert gen_req.metadata["images"] == ["frame.png"]
-    assert gen_req.metadata["videos"] == ["data:video/mp4;base64,AAAA"]
-
-    nested_req = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "watch"}],
-            "parameters": {
-                "input_image": {"data": "BBBB", "format": "png"},
-                "video_url": [{"url": "nested-clip.mp4"}],
-            },
-        }
-    )
-
-    gen_req = _build_chat_generate_request(nested_req)
-
-    assert gen_req.metadata["images"] == ["data:image/png;base64,BBBB"]
-    assert gen_req.metadata["videos"] == ["nested-clip.mp4"]
-
-
-def test_chat_request_accepts_audio_input_aliases_without_shadowing_output_config() -> None:
-    input_audio = {"data": "UklGRg==", "format": "wav"}
+def test_chat_request_keeps_audio_input_separate_from_output_config() -> None:
     req = ChatCompletionRequest.model_validate(
         {
             "model": "qwen3.5-omni",
             "messages": [{"role": "user", "content": "listen"}],
-            "input_audio": input_audio,
-        }
-    )
-
-    gen_req = _build_chat_generate_request(req)
-
-    assert gen_req.metadata["audios"] == ["data:audio/wav;base64,UklGRg=="]
-
-    nested_req = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "listen"}],
-            "parameters": {"audio_url": "speech.wav"},
-        }
-    )
-
-    gen_req = _build_chat_generate_request(nested_req)
-
-    assert gen_req.metadata["audios"] == ["speech.wav"]
-
-    output_audio_req = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "say hi"}],
+            "audios": ["speech.wav"],
             "audio": {"voice": "Cherry", "format": "wav"},
         }
     )
 
-    gen_req = _build_chat_generate_request(output_audio_req)
+    gen_req = _build_chat_generate_request(req)
 
-    assert "audios" not in gen_req.metadata
+    assert gen_req.metadata["audios"] == ["speech.wav"]
     assert gen_req.metadata["audio_config"] == {"voice": "Cherry", "format": "wav"}
 
 
-def test_chat_request_lifts_dashscope_style_sampling_params() -> None:
+def test_chat_request_uses_top_level_sampling_params() -> None:
     req = ChatCompletionRequest.model_validate(
         {
             "model": "qwen3.5-omni",
             "messages": [{"role": "user", "content": "say hi"}],
             "temperature": 0.2,
             "top_p": 0.7,
-            "parameters": {
-                "temperature": 0.9,
-                "top_p": 0.8,
-                "top_k": 5,
-                "min_p": 0.1,
-                "repetition_penalty": 1.05,
-                "frequency_penalty": 0.25,
-                "presence_penalty": 1.5,
-                "max_tokens": 77,
-                "seed": 123,
-                "stop": ["<stop>"],
-            },
+            "top_k": 5,
+            "min_p": 0.1,
+            "repetition_penalty": 1.05,
+            "frequency_penalty": 0.25,
+            "presence_penalty": 1.5,
+            "max_tokens": 77,
+            "seed": 123,
+            "stop": ["<stop>"],
         }
     )
 
@@ -1289,179 +1041,16 @@ def test_chat_request_lifts_dashscope_style_sampling_params() -> None:
     assert gen_req.max_tokens == 77
 
 
-def test_chat_request_accepts_qwen35_preprocessing_aliases() -> None:
+def test_chat_request_uses_modalities_field_for_audio_output() -> None:
     req = ChatCompletionRequest.model_validate(
         {
             "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "watch"}],
-            "videos": ["clip.mp4"],
-            "images": ["frame.png"],
-            "fps": 2,
-            "min_frames": 4,
-            "max_frames": 128,
-            "min_pixels": 100352,
-            "max_pixels": 401408,
-            "total_pixels": 32768 * 768,
-            "seconds_per_chunk": 2.0,
-            "position_id_per_seconds": 25,
-            "return_metadata": True,
-            "videos_metadata": [{"fps": 2.0}],
-            "audio_sampling_rate": 16000,
-            "timestamp_interval": 15,
-            "downsample_times": 4,
-            "downsample_chunk_size": 100,
-        }
-    )
-
-    gen_req = _build_chat_generate_request(req)
-
-    assert gen_req.metadata["video_fps"] == 2
-    assert gen_req.metadata["video_min_frames"] == 4
-    assert gen_req.metadata["video_max_frames"] == 128
-    assert gen_req.metadata["image_min_pixels"] == 100352
-    assert gen_req.metadata["image_max_pixels"] == 401408
-    assert gen_req.metadata["video_min_pixels"] == 100352
-    assert gen_req.metadata["video_max_pixels"] == 401408
-    assert gen_req.metadata["video_total_pixels"] == 32768 * 768
-    assert gen_req.metadata["video_seconds_per_chunk"] == 2.0
-    assert gen_req.metadata["video_position_id_per_seconds"] == 25
-    assert gen_req.metadata["return_video_metadata"] is True
-    assert gen_req.metadata["video_metadata"] == [{"fps": 2.0}]
-    assert gen_req.metadata["audio_target_sr"] == 16000
-    assert gen_req.metadata["audio_timestamp_interval"] == 15
-    assert gen_req.metadata["audio_downsample_times"] == 4
-    assert gen_req.metadata["audio_downsample_chunk_size"] == 100
-
-
-def test_chat_request_accepts_sampling_rate_short_alias() -> None:
-    req = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "listen"}],
-            "sampling_rate": 22050,
-        }
-    )
-
-    gen_req = _build_chat_generate_request(req)
-
-    assert gen_req.metadata["audio_target_sr"] == 22050
-
-
-def test_chat_request_passes_vllm_multimodal_prompt_fields() -> None:
-    req = ChatCompletionRequest(
-        model="qwen3.5-omni",
-        messages=[{"role": "user", "content": "listen"}],
-        multi_modal_data=[{"audio": ["speech.wav"]}],
-        mm_processor_kwargs=[
-            {
-                "audio_kwargs": {
-                    "timestamp_interval": 15,
-                    "downsample_times": 4,
-                }
-            }
-        ],
-    )
-
-    gen_req = _build_chat_generate_request(req)
-
-    assert gen_req.metadata["multi_modal_data"] == [{"audio": ["speech.wav"]}]
-    assert gen_req.metadata["mm_processor_kwargs"] == [
-        {
-            "audio_kwargs": {
-                "timestamp_interval": 15,
-                "downsample_times": 4,
-            }
-        }
-    ]
-
-
-def test_chat_request_accepts_output_modality_aliases() -> None:
-    enabled = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
             "messages": [{"role": "user", "content": "say hi"}],
-            "enable_audio_output": "on",
-        }
-    )
-    response_alias = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "say hi"}],
-            "response_modalities": "audio",
-            "enable_audio_output": False,
-        }
-    )
-    whitespace_alias = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "say hi"}],
-            "output_modalities": "text audio",
-        }
-    )
-    modalities_alias = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "say hi"}],
-            "modalities": "text audio",
-        }
-    )
-    nested_alias = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "say hi"}],
-            "parameters": {"modalities": "text audio"},
-        }
-    )
-    list_item_alias = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "say hi"}],
-            "output_modalities": ["text,audio"],
-        }
-    )
-    do_wave_alias = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "say hi"}],
-            "do_wave": True,
-        }
-    )
-    nested_do_wave_alias = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "say hi"}],
-            "parameters": {"do_wave": 0},
+            "modalities": ["text", "audio"],
         }
     )
 
-    assert _build_chat_generate_request(enabled).output_modalities == [
-        "text",
-        "audio",
-    ]
-    assert _build_chat_generate_request(response_alias).output_modalities == ["audio"]
-    assert _build_chat_generate_request(whitespace_alias).output_modalities == [
-        "text",
-        "audio",
-    ]
-    assert _build_chat_generate_request(modalities_alias).output_modalities == [
-        "text",
-        "audio",
-    ]
-    assert _build_chat_generate_request(nested_alias).output_modalities == [
-        "text",
-        "audio",
-    ]
-    assert _build_chat_generate_request(list_item_alias).output_modalities == [
-        "text",
-        "audio",
-    ]
-    assert _build_chat_generate_request(do_wave_alias).output_modalities == [
-        "text",
-        "audio",
-    ]
-    assert _build_chat_generate_request(nested_do_wave_alias).output_modalities == [
-        "text",
-    ]
+    assert _build_chat_generate_request(req).output_modalities == ["text", "audio"]
 
 
 def test_chat_request_passes_tools_to_preprocessor_metadata() -> None:
@@ -1606,20 +1195,6 @@ def test_chat_request_preserves_user_metadata_without_overriding_internal_fields
     assert gen_req.metadata["audio_config"] == {"voice": "Cherry", "format": "wav"}
 
 
-def test_chat_request_accepts_nested_metadata() -> None:
-    req = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "say hi"}],
-            "parameters": {"metadata": {"client_label": "nested"}},
-        }
-    )
-
-    gen_req = _build_chat_generate_request(req)
-
-    assert gen_req.metadata["client_label"] == "nested"
-
-
 def test_chat_request_preserves_tracking_fields_in_metadata() -> None:
     req = ChatCompletionRequest.model_validate(
         {
@@ -1642,148 +1217,31 @@ def test_chat_request_preserves_tracking_fields_in_metadata() -> None:
     assert gen_req.metadata["client_label"] == "profile-run-0"
 
 
-def test_chat_request_passes_qwen35_talker_controls() -> None:
+def test_chat_request_passes_qwen3_talker_overrides() -> None:
     req = ChatCompletionRequest.model_validate(
         {
             "model": "qwen3.5-omni",
             "messages": [{"role": "user", "content": "say hi"}],
-            "voice_type": "Cherry",
-            "speaker_id": 7,
-            "language": "zh-CN",
-            "language_type": "zh",
-            "voice_style": "happy",
-            "instruction": "Speak softly",
-            "assistant_instruct_ids": [11, 12],
-            "system_instruct_ids": [21, 22],
-            "prompt_speaker_codes": [[1, 2, 3]],
-            "tts_generate_mode": "instructions",
-            "enable_tn": True,
+            "talker_temperature": 0.2,
+            "talker_top_p": 0.7,
+            "talker_top_k": 3,
+            "talker_repetition_penalty": 1.2,
+            "talker_max_new_tokens": 88,
         }
     )
 
     gen_req = _build_chat_generate_request(req)
 
     assert gen_req.extra_params == {
-        "voice_type": "Cherry",
-        "speaker_id": 7,
-        "language": "zh-CN",
-        "language_type": "zh",
-        "voice_style": "happy",
-        "instruction": "Speak softly",
-        "assistant_instruct_ids": [11, 12],
-        "system_instruct_ids": [21, 22],
-        "prompt_speaker_codes": [[1, 2, 3]],
-        "tts_generate_mode": "instructions",
-        "enable_tn": True,
-    }
-
-
-def test_chat_request_passes_qwen35_talker_sampling_controls() -> None:
-    req = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "say hi"}],
-            "talker_params": {
-                "max_tokens": 12,
-                "temperature": 0.2,
-                "top_k": 3,
-                "top_p": 0.7,
-            },
-            "talker_min_p": 0.04,
-            "talker_max_completion_tokens": 88,
-            "talker_seed": 123,
-            "parameters": {
-                "talker_params": {"max_tokens": 99},
-                "talker_repetition_penalty": 1.2,
-                "subtalker_params": {
-                    "temperature": 0.1,
-                    "top_k": 5,
-                },
-                "subtalker_min_p": 0.03,
-                "subtalker_max_completion_tokens": 22,
-                "subtalker_seed": 456,
-            },
-        }
-    )
-
-    gen_req = _build_chat_generate_request(req)
-
-    assert gen_req.extra_params == {
-        "talker_min_p": 0.04,
+        "talker_temperature": 0.2,
+        "talker_top_p": 0.7,
+        "talker_top_k": 3,
         "talker_repetition_penalty": 1.2,
-        "talker_seed": 123,
-        "talker_params": {
-            "max_tokens": 12,
-            "temperature": 0.2,
-            "top_k": 3,
-            "top_p": 0.7,
-        },
-        "subtalker_min_p": 0.03,
-        "subtalker_max_completion_tokens": 22,
-        "subtalker_seed": 456,
-        "subtalker_params": {
-            "temperature": 0.1,
-            "top_k": 5,
-        },
-        "talker_max_completion_tokens": 88,
+        "talker_max_new_tokens": 88,
     }
 
 
-def test_chat_request_accepts_qwen35_enable_tn_alias() -> None:
-    req = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "say hi"}],
-            "enable_text_normalization": True,
-        }
-    )
-
-    gen_req = _build_chat_generate_request(req)
-
-    assert gen_req.extra_params == {"enable_tn": True}
-
-
-def test_chat_request_normalizes_qwen35_voice_clone_aliases() -> None:
-    xvector_req = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "say hi"}],
-            "xvector_info_path": "/voices/ref-a",
-        }
-    )
-    clone_req = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "say hi"}],
-            "voice_clone": {"path": "/voices/ref-b"},
-        }
-    )
-    clone_override_req = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "say hi"}],
-            "voice_clone": {
-                "path": "/voices/ref-c",
-                "language": "en",
-            },
-        }
-    )
-
-    assert _build_chat_generate_request(xvector_req).extra_params == {
-        "xvector_info": "/voices/ref-a",
-    }
-    assert _build_chat_generate_request(clone_req).extra_params == {
-        "voice_clone_info": "/voices/ref-b",
-    }
-    assert _build_chat_generate_request(clone_override_req).extra_params == {
-        "voice_clone_info": {
-            "path": "/voices/ref-c",
-            "language": "en",
-        },
-    }
-
-
-def test_chat_request_talker_controls_override_audio_config() -> None:
+def test_chat_request_audio_config_flows_to_qwen35_talker_params() -> None:
     req = ChatCompletionRequest.model_validate(
         {
             "model": "qwen3.5-omni",
@@ -1795,11 +1253,6 @@ def test_chat_request_talker_controls_override_audio_config() -> None:
                 "instruction": "Speak softly",
                 "xvector_info": "/voices/from-audio",
             },
-            "voice_type": "Tina",
-            "language": "en-US",
-            "voice_style": "calm",
-            "instruction": "Speak directly",
-            "xvector_info_path": "/voices/explicit",
         }
     )
 
@@ -1812,21 +1265,21 @@ def test_chat_request_talker_controls_override_audio_config() -> None:
 
     params = qwen35_builders._params_with_openai_audio_config(omni_request)
 
-    assert params["voice_type"] == "Tina"
-    assert params["language"] == "en-US"
-    assert params["voice_style"] == "calm"
-    assert params["instruction"] == "Speak directly"
-    assert params["xvector_info"] == "/voices/explicit"
+    assert gen_req.extra_params == {}
+    assert params["voice_type"] == "Cherry"
+    assert params["language"] == "zh-CN"
+    assert params["voice_style"] == "happy"
+    assert params["instruction"] == "Speak softly"
+    assert params["xvector_info"] == "/voices/from-audio"
 
 
-def test_chat_request_translation_options_flow_to_talker_language() -> None:
+def test_chat_request_audio_target_language_flows_to_talker_params() -> None:
     req = ChatCompletionRequest.model_validate(
         {
             "model": "qwen3.5-omni",
             "messages": [{"role": "user", "content": "translate this"}],
             "modalities": ["text", "audio"],
-            "audio": {"voice": "Cherry", "language": "zh-CN"},
-            "translation_options": {"target_lang": "en", "source_lang": "fr"},
+            "audio": {"voice": "Cherry", "target_language": "en"},
         }
     )
 
@@ -1838,135 +1291,15 @@ def test_chat_request_translation_options_flow_to_talker_language() -> None:
     )
     params = qwen35_builders._params_with_openai_audio_config(omni_request)
 
-    assert gen_req.extra_params["translation_options"] == {
-        "target_lang": "en",
-        "source_lang": "fr",
-    }
-    assert gen_req.extra_params["target_language"] == "en"
-    assert params["target_language"] == "en"
-    assert "language" not in params
-
-
-def test_chat_request_lifts_dashscope_style_parameters() -> None:
-    req = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "translate this"}],
-            "parameters": {
-                "modalities": ["text", "audio"],
-                "audio": {"voice": "Cherry", "format": "wav"},
-                "videos": ["clip.mp4"],
-                "fps": 2,
-                "max_frames": 128,
-                "max_pixels": 401408,
-                "use_audio_in_video": True,
-                "return_metadata": True,
-                "videos_metadata": [{"fps": 2.0}],
-                "mm_processor_kwargs": {"max_pixels": 401408},
-                "sampling_rate": 16000,
-                "timestamp_interval": 15,
-                "multi_modal_uuids": {"video": ["clip-cache-key"]},
-                "translation_options": {
-                    "target_lang": "en",
-                    "source_lang": "fr",
-                },
-                "enable_text_normalization": True,
-            },
-        }
-    )
-
-    gen_req = _build_chat_generate_request(req)
-    omni_request = OmniRequest(
-        inputs={},
-        params=gen_req.extra_params,
-        metadata=gen_req.metadata,
-    )
-    params = qwen35_builders._params_with_openai_audio_config(omni_request)
-
-    assert gen_req.output_modalities == ["text", "audio"]
-    assert gen_req.metadata["audio_config"] == {
-        "voice": "Cherry",
-        "format": "wav",
-    }
-    assert gen_req.metadata["videos"] == ["clip.mp4"]
-    assert gen_req.metadata["video_fps"] == 2
-    assert gen_req.metadata["video_max_frames"] == 128
-    assert gen_req.metadata["image_max_pixels"] == 401408
-    assert gen_req.metadata["video_max_pixels"] == 401408
-    assert gen_req.metadata["use_audio_in_video"] is True
-    assert gen_req.metadata["return_video_metadata"] is True
-    assert gen_req.metadata["video_metadata"] == [{"fps": 2.0}]
-    assert gen_req.metadata["mm_processor_kwargs"] == {"max_pixels": 401408}
-    assert gen_req.metadata["audio_target_sr"] == 16000
-    assert gen_req.metadata["audio_timestamp_interval"] == 15
-    assert gen_req.metadata["multi_modal_uuids"] == {
-        "video": ["clip-cache-key"]
-    }
-    assert gen_req.extra_params["translation_options"] == {
-        "target_lang": "en",
-        "source_lang": "fr",
-    }
-    assert gen_req.extra_params["target_language"] == "en"
-    assert gen_req.extra_params["enable_tn"] is True
     assert params["voice_type"] == "Cherry"
-    assert params["target_language"] == "en"
+    assert params["language"] == "en"
 
 
-def test_chat_request_normalizes_path_media_payloads() -> None:
-    req = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "inspect media"}],
-            "image": {"path": "/tmp/frame.png"},
-            "input_video": {"path": "/tmp/clip.mp4"},
-            "parameters": {
-                "input_audio": {"path": "/tmp/speech.wav"},
-            },
-        }
-    )
-
-    gen_req = _build_chat_generate_request(req)
-
-    assert gen_req.metadata["audios"] == ["/tmp/speech.wav"]
-    assert gen_req.metadata["images"] == ["/tmp/frame.png"]
-    assert gen_req.metadata["videos"] == ["/tmp/clip.mp4"]
-
-
-def test_chat_request_preserves_vllm_multimodal_uuids() -> None:
-    req = ChatCompletionRequest.model_validate(
-        {
-            "model": "qwen3.5-omni",
-            "messages": [{"role": "user", "content": "describe"}],
-            "multi_modal_data": {"video": ["clip.mp4"]},
-            "mm_processor_kwargs": {
-                "fps": 2,
-                "dependent_audio": [0],
-            },
-            "multi_modal_uuids": {
-                "video": ["video-hash-1"],
-                "audio": ["audio-hash-1"],
-            },
-        }
-    )
-
-    gen_req = _build_chat_generate_request(req)
-
-    assert gen_req.metadata["multi_modal_data"] == {"video": ["clip.mp4"]}
-    assert gen_req.metadata["mm_processor_kwargs"] == {
-        "fps": 2,
-        "dependent_audio": [0],
-    }
-    assert gen_req.metadata["multi_modal_uuids"] == {
-        "video": ["video-hash-1"],
-        "audio": ["audio-hash-1"],
-    }
-
-
-def test_chat_non_stream_enable_audio_output_returns_audio() -> None:
+def test_chat_non_stream_modalities_returns_audio() -> None:
     req = ChatCompletionRequest(
         model="qwen3.5-omni",
         messages=[{"role": "user", "content": "say hi"}],
-        enable_audio_output=True,
+        modalities=["text", "audio"],
     )
 
     response = asyncio.run(
@@ -1991,14 +1324,14 @@ def test_chat_non_stream_enable_audio_output_returns_audio() -> None:
         "format": "wav",
         "transcript": "hello",
     }
-    assert payload["audio"] == {"data": "UklGRg==", "format": "wav"}
+    assert "audio" not in payload
 
 
 def test_chat_non_stream_audio_includes_sample_rate_when_available() -> None:
     req = ChatCompletionRequest(
         model="qwen3.5-omni",
         messages=[{"role": "user", "content": "say hi"}],
-        enable_audio_output=True,
+        modalities=["text", "audio"],
     )
 
     response = asyncio.run(
@@ -2017,7 +1350,7 @@ def test_chat_non_stream_audio_includes_sample_rate_when_available() -> None:
     payload = json.loads(response.body)
     message = payload["choices"][0]["message"]
     assert message["audio"]["sample_rate"] == 48000
-    assert payload["audio"]["sample_rate"] == 48000
+    assert "audio" not in payload
 
 
 def test_transcription_request_builds_asr_generate_request() -> None:

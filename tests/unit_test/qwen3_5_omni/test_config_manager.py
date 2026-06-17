@@ -154,7 +154,7 @@ def test_qwen35_h20_colocated_yaml_loads_stage_memory_budgets():
     assert code2wav_runtime.code2wav_odeint_method_relaxed is True
     assert code2wav_runtime.code2wav_frequency == "50hz"
     assert code2wav_runtime.code2wav_dit_quant == "fp8"
-    assert QWEN35_CODE2WAV_STREAM_CHUNK_SIZE == 8
+    assert QWEN35_CODE2WAV_STREAM_CHUNK_SIZE == 4
     assert (
         Path("examples/configs/qwen3_5_omni_colocated_h20.yaml")
         .read_text()

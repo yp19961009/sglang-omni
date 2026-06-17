@@ -532,7 +532,10 @@ def test_create_code2wav_scheduler_uses_explicit_model_path(tmp_path, monkeypatc
     }
     assert scheduler.kwargs["sample_rate"] == 24000
     assert scheduler.kwargs["codec_eos_token_id"] == 2150
-    assert scheduler.kwargs["stream_chunk_size"] == 8
+    assert (
+        scheduler.kwargs["stream_chunk_size"]
+        == code2wav_scheduler.QWEN35_CODE2WAV_STREAM_CHUNK_SIZE
+    )
 
 
 def test_create_code2wav_scheduler_passes_available_voice_types(tmp_path, monkeypatch):
@@ -996,7 +999,7 @@ def test_create_code2wav_scheduler_applies_compile_first_chunk_flag(monkeypatch)
     assert calls["compile_kwargs"] == {"compile_first_chunk": True}
 
 
-def test_create_code2wav_scheduler_applies_vllm_runtime_options(monkeypatch):
+def test_create_code2wav_scheduler_applies_qwen35_runtime_options(monkeypatch):
     odeint_kwargs = {"method": "euler"}
     model = SimpleNamespace(
         total_upsample=1,
@@ -1099,7 +1102,7 @@ def test_create_code2wav_scheduler_applies_frequency_default_chunk(monkeypatch):
     assert model.chunk_size == 32
 
 
-def test_create_code2wav_scheduler_accepts_vllm_frequency_alias(monkeypatch):
+def test_create_code2wav_scheduler_accepts_numeric_frequency_alias(monkeypatch):
     model = SimpleNamespace(
         total_upsample=1,
         frequency="25hz",

@@ -180,7 +180,7 @@ class Qwen3OmniNextAudioAttention(nn.Module):
         valid_mask = valid_mask < lengths.to(device=hidden_states.device).unsqueeze(1)
 
         # 中文说明：把 packed chunks padding 成一个 batch，一次 SDPA 跑完；
-        # chunk 之间仍然完全隔离，比逐 chunk 循环更接近 vLLM 的 packed attention。
+        # chunk 之间仍然完全隔离，比逐 chunk 循环更接近 Qwen reference 的 packed attention。
         for row, (start, end) in enumerate(
             zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist())
         ):

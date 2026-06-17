@@ -243,7 +243,7 @@ def _load_audio_weights(
     device: str,
 ) -> nn.Module:
     state_dict = load_weights_by_prefix(model_path, prefix=AUDIO_TOWER_PREFIX)
-    # 中文说明：兼容 vLLM native audio tower 保存的 packed qkv 权重；
+    # 中文说明：兼容 Qwen reference native audio tower 保存的 packed qkv 权重；
     # 本地/HF-style tower 使用 q_proj/k_proj/v_proj 三组参数。
     state_dict = _split_packed_audio_qkv(state_dict)
     try:

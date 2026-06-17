@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3.5-Omni Next DAC decoder ported from vLLM dev/qwenc_perf_v2.
+"""Qwen3.5-Omni Next DAC decoder ported from reference implementation.
 
-中文说明：这个文件保留 vLLM 的纯 PyTorch DAC/codec decoder 结构，供
-Qwen3.5-Omni code2wav stage 在本地直接加载，避免运行时依赖 vLLM 包。
+中文说明：这个文件保留 Qwen reference 的纯 PyTorch DAC/codec decoder 结构，供
+Qwen3.5-Omni code2wav stage 在本地直接加载，避免运行时依赖 Qwen reference 包。
 """
 
 import math
@@ -1049,9 +1049,9 @@ class DAC(nn.Module):
     def forward(self, codes: torch.Tensor):
         """Decode sglang scheduler codec chunks.
 
-        中文说明：vLLM 的 Next DAC `decode()` 接收 [B, T, K]，而
+        中文说明：Qwen reference 的 Next DAC `decode()` 接收 [B, T, K]，而
         sglang-omni 现有 Code2WavScheduler 传入 [B, K, T]。这里仅在
-        `model(codes)` 路径做转置适配，保留 `decode()` 的原始 vLLM 语义。
+        `model(codes)` 路径做转置适配，保留 `decode()` 的原始 Qwen reference 语义。
         """
         if codes.ndim != 3:
             raise ValueError(
@@ -1274,7 +1274,7 @@ def _unwrap_checkpoint_state_dict(checkpoint):
         value = checkpoint.get(key)
         if isinstance(value, Mapping):
             # 中文说明：真实导出的 PyTorch checkpoint 常见外层 key 不统一：
-            # vLLM 用 model，也可能来自训练脚本的 state_dict/generator。
+            # Qwen reference 用 model，也可能来自训练脚本的 state_dict/generator。
             # 这里统一解包到 DAC model.load_state_dict 需要的扁平参数表。
             return dict(value)
     return dict(checkpoint)
