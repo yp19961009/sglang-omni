@@ -101,8 +101,8 @@ def _optimize_patch_embed(visual: nn.Module) -> None:
         if conv.bias is not None:
             linear.bias.copy_(conv.bias)
 
-    # 中文说明：不要删除原始 Conv3d。SGLang core vision 的 dtype/device
-    # property 会访问 patch_embed.proj.weight；forward 改走 Linear 即可。
+    # Do not remove the original Conv3d. SGLang core vision dtype/device
+    # properties read patch_embed.proj.weight; only forward needs to use Linear.
     patch_embed.linear = linear
     patch_embed.forward = types.MethodType(_patch_embed_forward, patch_embed)
     logger.info("Qwen3.5 PatchEmbed Conv3d optimized to Linear")
@@ -155,9 +155,10 @@ def _split_packed_deepstack_output(
     if embeds.shape[-1] != expected:
         return embeds, multiscale
 
-    # 中文说明：SGLang/HF 的 Qwen3_VisionTransformer 会把主视觉特征
-    # 和 deepstack 多尺度特征拼在最后一维返回。分离后，主特征继续作为
-    # image/video_embeds，deepstack 层按 request builder 需要的 list 透传。
+    # SGLang/HF Qwen3_VisionTransformer returns main vision features and
+    # deepstack multiscale features concatenated on the last dimension. Split
+    # them so the main features remain image/video_embeds and the deepstack
+    # layers are passed through as the list expected by the request builder.
     chunks = torch.split(embeds, base_hidden_size, dim=-1)
     return chunks[0], list(chunks[1:])
 
@@ -220,8 +221,9 @@ def _load_visual_weights(
 ) -> nn.Module:
     load_weights = getattr(visual, "load_weights", None)
     if callable(load_weights):
-        # 中文说明：SGLang/HF vision tower 会把 HF 的 attn.q/k/v 权重
-        # 映射到 packed attn.qkv 参数。直接 load_state_dict 会绕过这个映射。
+        # The SGLang/HF vision tower maps HF attn.q/k/v weights to packed
+        # attn.qkv parameters. Calling load_state_dict directly would bypass
+        # that mapping.
         state_dict = load_weights_by_prefix(model_path, prefix=VISUAL_PREFIX)
         load_weights(state_dict.items())
         return _move_eval(visual, torch_dtype=torch_dtype, device=device)
@@ -348,8 +350,8 @@ class Qwen35OmniImageEncoder(nn.Module):
                     "image_grid_thw": image_grid_thw.to(self._device),
                     "image_token_counts": token_counts,
                     "image_deepstack_visual_embeds": multiscale,
-                    # 中文说明：保留旧 key 兼容已经接入的 stage/test；
-                    # request builder 会优先读取 canonical key。
+                    # Keep the legacy key for existing stages/tests; the
+                    # request builder prefers the canonical key.
                     "deepstack_visual_embeds_image": multiscale,
                 }
             )
@@ -367,7 +369,7 @@ class Qwen35OmniImageEncoder(nn.Module):
                     "video_grid_thw": video_grid_thw.to(self._device),
                     "video_token_counts": token_counts,
                     "video_deepstack_visual_embeds": multiscale,
-                    # 中文说明：同 image 分支，兼容历史 key。
+                    # Same as the image branch: keep the legacy key.
                     "deepstack_visual_embeds_video": multiscale,
                 }
             )

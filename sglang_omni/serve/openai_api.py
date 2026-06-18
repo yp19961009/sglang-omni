@@ -474,8 +474,9 @@ async def _chat_non_stream(
             "transcript": result.audio.transcript,
         }
         if result.audio.sample_rate is not None:
-            # 中文说明：code2wav 返回真实 sample_rate 后，非流式 chat
-            # 也把它透给调用方；旧路径没有该字段时保持响应兼容。
+            # When code2wav returns the real sample_rate, expose it in
+            # non-streaming chat responses as well. Preserve response
+            # compatibility when older paths do not provide the field.
             message["audio"]["sample_rate"] = result.audio.sample_rate
 
     if "content" not in message and "audio" not in message:
@@ -749,7 +750,8 @@ def _build_chat_generate_request(
     if tools is None:
         tools = _legacy_functions_as_tools(req.functions)
     if tools is not None:
-        # 中文说明：tools 只用于 chat template 渲染，不在服务端执行。
+        # Tools are only rendered into the chat template; the server does not
+        # execute them.
         metadata["tools"] = tools
     for key in ("tool_choice", "parallel_tool_calls", "function_call"):
         value = getattr(req, key, None)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Launch the Qwen3.5-Omni speech server inside the shared development
-# container. This is the SGLang side of the alignment test.
+# container.
 #
 # Common usage:
 #   bash scripts/launch_qwen35_omni_sglang_server.sh
@@ -51,9 +51,8 @@ server_args=(
 )
 
 if [[ "$NO_CODE2WAV_TORCH_COMPILE" == "1" ]]; then
-  # Disabling code2wav torch.compile makes bring-up/debug runs start faster and
-  # avoids compile noise in precision experiments. Set this env var to 0 for a
-  # closer performance run.
+  # Disabling code2wav torch.compile makes bring-up runs start faster. Set this
+  # env var to 0 for a closer performance run.
   server_args+=(--no-code2wav-torch-compile)
 fi
 

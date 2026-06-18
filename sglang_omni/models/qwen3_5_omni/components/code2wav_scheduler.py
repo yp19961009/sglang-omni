@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3.5-Omni Code2Wav scheduler.
 
-Qwen3.5-Omni uses the Qwen3OmniNext DAC/codec decoder path from the Qwen reference
-perf_v2 branch. The decoder is vendored in sglang-omni and plugs into the
+Qwen3.5-Omni uses the Qwen3OmniNext DAC/codec decoder path from the Qwen
+reference implementation. The decoder is vendored in sglang-omni and plugs into the
 existing streaming Code2WavScheduler. If it cannot be imported, the stage
 remains importable and fails clearly when audio output is requested.
 """
@@ -12,7 +12,6 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,8 +31,9 @@ logger = logging.getLogger(__name__)
 
 QWEN35_CODEC_EOS_TOKEN_ID = 2150
 QWEN35_CODE2WAV_SAMPLE_RATE = 24000
-# 中文说明：对齐 Qwen reference Qwen3.5 50Hz code2wav 的 4-codec 增量输出切块；
-# 用户仍可通过 --code2wav-stream-chunk-size 或 YAML factory_args 覆盖。
+# Match the Qwen3.5 reference 50Hz code2wav chunking for 4-codec incremental
+# output; users can still override this through --code2wav-stream-chunk-size or
+# YAML factory_args.
 QWEN35_CODE2WAV_STREAM_CHUNK_SIZE = 4
 QWEN35_CODE2WAV_DYNAMIC_CHUNK_SIZES = (2, 4, 6, 8)
 QWEN35_CODE2WAV_DYNAMIC_CHUNK_STEPS = (8, 4, 2, 1)
@@ -58,8 +58,8 @@ _MISSING_CODE2WAV_MESSAGE = (
 )
 
 _CODE2WAV_DIR_NAMES = (
-    # 中文说明：HF reference 里出现过 0306 和 0226
-    # 两版在线解码器目录名；优先新目录，但保留旧目录兼容。
+    # HF reference assets have used both 0306 and 0226 online decoder directory
+    # names. Prefer the newer directory while keeping the older one compatible.
     "qwen3_5_omni_codec_decode_online_0306",
     "qwen3_5_omni_codec_decode_online_0226",
     "code2wav",
@@ -146,9 +146,10 @@ def _resolve_code2wav_files(model_path: str) -> Code2WavFiles | None:
     if root.is_file() and _is_code2wav_checkpoint_file(root):
         config_path = _first_existing(root.parent, _CODE2WAV_CONFIG_NAMES)
         if config_path is not None:
-            # 中文说明：用户可能直接传 --code2wav-model-path 到
-            # model_weights.pt/model.pth。此时 checkpoint 已经明确，
-            # 只需要在同目录找 DAC config。
+            # Users may point --code2wav-model-path directly at
+            # model_weights.pt/model.pth. In that case the checkpoint is already
+            # explicit and only the DAC config must be found in the same
+            # directory.
             return Code2WavFiles(
                 model_dir=root.parent,
                 config_path=config_path,
@@ -204,16 +205,18 @@ def _missing_code2wav_message(
             "Next DAC loader was not importable from the local Qwen3.5 "
             "implementation or the reference module."
         )
-    # 中文说明：真实 checkpoint 目录不完整时，这条错误会直接列出查找路径和
-    # 期望文件名，避免只看到 Missing scheduler 后还要回源码里反查布局。
+    # When a real checkpoint directory is incomplete, include the searched paths
+    # and expected file names directly instead of forcing the user to inspect
+    # source layout after seeing a generic missing-scheduler error.
     return "\n".join(lines)
 
 
 def _first_existing(directory: Path, names: tuple[str, ...]) -> Path | None:
     for name in names:
         path = directory / name
-        # 中文说明：只接受真实文件。上传中断时可能留下同名目录，
-        # 如果用 exists() 会让 preflight/launcher 误判 code2wav 已完整。
+        # Accept real files only. Interrupted uploads can leave a directory with
+        # the same name; exists() would make preflight/launchers think code2wav
+        # is complete.
         if path.is_file():
             return path
     return None
@@ -222,9 +225,9 @@ def _first_existing(directory: Path, names: tuple[str, ...]) -> Path | None:
 def _iter_codec_eos_config_paths(model_path: str) -> tuple[Path, ...]:
     root = Path(model_path)
     paths = [root / "config.json"]
-    # 中文说明：split checkpoint 场景下 codec_eos_token_id 常在
-    # root/talker_lm 或 root/talker/config.json，root config 未必带完整
-    # talker_config。
+    # In split checkpoints, codec_eos_token_id is often under
+    # root/talker_lm or root/talker/config.json; the root config may not include
+    # a complete talker_config.
     paths.append(root / "talker_lm" / "config.json")
     paths.append(root / "talker" / "config.json")
     return tuple(paths)
@@ -499,9 +502,9 @@ def _load_code2wav_voice_types(model_path: str) -> tuple[str, ...]:
         normalized = str(key).strip()
         if not normalized:
             continue
-        # 中文说明：reference 会把 spk_dict.pt 里的展示名映射成
-        # code2wav 内部 speaker id；这里保留同一规则，避免 Cherry 等
-        # 用户可见音色在 code2wav 阶段被误判为未知。
+        # The reference maps display names from spk_dict.pt to internal code2wav
+        # speaker ids. Preserve the same rule so user-facing voices such as
+        # Cherry are not rejected as unknown by code2wav.
         voice_types.append(_CODE2WAV_VOICE_TYPE_MAPPING.get(normalized.lower(), normalized))
     return tuple(dict.fromkeys(voice_types))
 
@@ -538,9 +541,9 @@ def _metadata_audio_output_config(metadata: Any) -> dict[str, Any] | None:
         return None
     if not keys & _CODE2WAV_AUDIO_OUTPUT_CONFIG_KEYS:
         return None
-    # 中文说明：直连 OmniRequest 时可能只有 metadata.audio={voice,...}。
-    # code2wav 只需要音色来处理 prefix_caching 和 speaker 校验；真正的
-    # 输入音频 payload(data/path/url) 已在上面排除，避免误判。
+    # Direct OmniRequest calls may only have metadata.audio={voice,...}.
+    # code2wav only needs the voice for prefix-caching and speaker validation;
+    # real input-audio payloads (data/path/url) were filtered out above.
     return audio_value
 
 
@@ -701,28 +704,6 @@ class Qwen35Code2WavScheduler(Code2WavScheduler):
         audio_end = code_len * self._total_upsample
         audio = wav.reshape(wav.shape[0], -1)[0, audio_start:audio_end]
         audio_np = audio.detach().cpu().float().numpy().copy()
-        _maybe_dump_code2wav_audio(
-            request_id,
-            {
-                "start": int(start),
-                "end": int(end),
-                "context": int(context),
-                "code_len": int(code_len),
-                "valid_chunk": int(valid_chunk),
-                "padding_to": int(padding_to),
-                "groups": int(code_groups),
-                "samples": int(audio_np.shape[0]),
-                "min": float(audio_np.min()) if audio_np.size else None,
-                "max": float(audio_np.max()) if audio_np.size else None,
-                "mean": float(audio_np.mean()) if audio_np.size else None,
-                "rms": (
-                    float((audio_np.astype("float64") ** 2).mean() ** 0.5)
-                    if audio_np.size
-                    else None
-                ),
-                "first": audio_np[:8].tolist(),
-            },
-        )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "Qwen3.5 Code2Wav decode req=%s code_len=%s valid=%s "
@@ -780,7 +761,6 @@ class Qwen35Code2WavScheduler(Code2WavScheduler):
     ) -> list[OutgoingMessage]:
         if self._qwen35_skip_code2wav.get(request_id, False):
             return []
-        _maybe_dump_code2wav_chunk(request_id, chunk)
         if not self._qwen35_enable_dynamic_chunk:
             return super().on_stream_chunk(request_id, chunk)
 
@@ -794,8 +774,9 @@ class Qwen35Code2WavScheduler(Code2WavScheduler):
 
         after_parts = len(self._audio_chunks.get(request_id, []))
         if after_parts > before_parts:
-            # 中文说明：每完成一次 code2wav decode，就推进到下一档 chunk
-            # size。前几档小 chunk 降首音频延迟，后几档大 chunk 降解码开销。
+            # Advance to the next chunk size after each code2wav decode. Early
+            # small chunks reduce first-audio latency, while later larger chunks
+            # reduce decode overhead.
             self._qwen35_dynamic_chunk_index[request_id] = (
                 self._qwen35_dynamic_chunk_index.get(request_id, 0) + 1
             )
@@ -809,40 +790,6 @@ class Qwen35Code2WavScheduler(Code2WavScheduler):
                 sample_rate=self._sample_rate,
             )
         return super().on_stream_done(request_id)
-
-
-def _maybe_dump_code2wav_chunk(request_id: str, chunk: StreamItem) -> None:
-    path = os.environ.get("QWEN35_DEBUG_CODE2WAV_CODES")
-    if not path:
-        return
-    data = chunk.data.detach().cpu().long().reshape(-1)
-    values = data.tolist()
-    payload = {
-        "request_id": request_id,
-        "shape": list(chunk.data.shape),
-        "min": min(values) if values else None,
-        "max": max(values) if values else None,
-        "first": values[:32],
-        "num_ge_2048": sum(1 for value in values if value >= 2048),
-        "num_negative": sum(1 for value in values if value < 0),
-    }
-    try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        logger.exception("failed to dump Qwen3.5 code2wav debug chunk")
-
-
-def _maybe_dump_code2wav_audio(request_id: str, payload: dict[str, Any]) -> None:
-    path = os.environ.get("QWEN35_DEBUG_CODE2WAV_AUDIO")
-    if not path:
-        return
-    record = {"request_id": request_id, **payload}
-    try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception:
-        logger.exception("failed to dump Qwen3.5 code2wav audio debug")
 
 
 def _call_enable_torch_compile(model: Any, *, compile_first_chunk: bool) -> None:
@@ -895,9 +842,10 @@ def _apply_code2wav_torch_compile(
             "Qwen3.5 code2wav has no known torch.compile entry point; "
             "leaving model unchanged"
         )
-    # 中文说明：对齐 reference 的 compile 优先级。真实模型如果暴露
-    # _decode_inner 就只编译内部热路径；否则优先走模型自带开关，最后才
-    # 编译 decode 方法。Qwen3.5 默认开启，用户可用 CLI/YAML 显式关闭。
+    # Match the reference compile priority. If the real model exposes
+    # _decode_inner, compile only that inner hot path. Otherwise prefer the
+    # model-provided switch and fall back to compiling decode. Qwen3.5 enables
+    # this by default, and users can disable it through CLI/YAML.
     return model
 
 
@@ -1034,9 +982,9 @@ def _apply_code2wav_runtime_options(
             "ignoring requested dit_quant=%s",
             dit_quant,
         )
-    # 中文说明：这些参数来自 reference 的 code2wav DIT 路线。当前内置
-    # Next DAC 如果没有对应属性就安全忽略；后续接入真实 DIT/在线 decoder
-    # 时，同名 setter/属性会自动生效。
+    # These parameters come from the reference code2wav DIT path. The built-in
+    # Next DAC safely ignores them when the corresponding attributes are absent;
+    # future DIT/online decoders will pick up matching setters or attributes.
     return model
 
 
@@ -1214,8 +1162,9 @@ def create_code2wav_scheduler(
         )
     )
 
-    # 中文说明：优先复用 sglang-omni 现有 streaming Code2WavScheduler。
-    # 只要 Next DAC decoder 和权重目录就绪，这里就能进入真实音频解码路径。
+    # Prefer reusing sglang-omni's existing streaming Code2WavScheduler. Once
+    # the Next DAC decoder and weights are available, this enters the real audio
+    # decode path.
     resolved_model_path = code2wav_model_path or model_path
     loader_kwargs = {
         "enable_torch_compile_first_chunk": compile_first_chunk,

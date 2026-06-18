@@ -121,9 +121,9 @@ class ModelWorker:
                 register_qwen35_hf_config,
             )
 
-            # 中文说明：当前 transformers 可能还没有 qwen3_omni_next。
-            # SGLang ModelConfig 会在模型类注册前先 AutoConfig.from_pretrained，
-            # 因此这里必须提前注册一个本地 HF config shim。
+            # The current transformers build may not know qwen3_omni_next yet.
+            # SGLang ModelConfig calls AutoConfig.from_pretrained before model
+            # class registration, so register the local HF config shim first.
             register_qwen35_hf_config()
 
         from sglang.srt.configs.model_config import ModelConfig
@@ -165,8 +165,9 @@ class ModelWorker:
             and text_config_attr is not None
             and hasattr(model_config.hf_config, text_config_attr)
         ):
-            # 中文说明：split checkpoint 的 thinker/talker 子目录可能直接保存
-            # sub-config，而不是 root 下的 thinker_config/talker_config 外壳。
+            # Split-checkpoint thinker/talker subdirectories may store the
+            # sub-config directly, instead of the root thinker_config/talker_config
+            # wrapper.
             sub_cfg = model_config.hf_config
         if sub_cfg is None:
             return
@@ -200,9 +201,10 @@ class ModelWorker:
         if head_dim is None and num_attention_heads > 0:
             head_dim = hidden_size // num_attention_heads
         if head_dim is not None:
-            # 中文说明：Qwen3.5 root config 和 thinker/talker text_config 的
-            # vocab/head 维度可能不同；切 sub-model 后这些 ModelConfig 派生
-            # 字段也要同步，否则 SGLang cache/采样侧可能仍沿用 root 元数据。
+            # Qwen3.5 root config and thinker/talker text_config may have
+            # different vocab/head dimensions. After switching to a submodel,
+            # synchronize these derived ModelConfig fields as well, otherwise
+            # SGLang cache/sampling code may keep using root metadata.
             model_config.head_dim = head_dim
             model_config.v_head_dim = _optional_int_attr(
                 text_cfg,

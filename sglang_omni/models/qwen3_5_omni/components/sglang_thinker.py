@@ -11,11 +11,8 @@ from __future__ import annotations
 
 import functools
 import inspect
-import json
 import logging
-import os
 from collections.abc import Iterable, Iterator
-from pathlib import Path
 from typing import Any, Optional, Tuple
 
 import torch
@@ -156,61 +153,9 @@ def _add_deepstack_for_layer(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    # 中文说明：vLLM Qwen3NextVLModel 在对应层之后把 deepstack visual
-    # features 加回 hidden_states；这里保持同样位置，避免影响 attention 输入。
+    # Qwen3NextVLModel adds deepstack visual features after the matching layer;
+    # keep the same placement so attention inputs remain unchanged.
     return hidden_states + layer_deepstack
-
-
-def _tensor_stats(tensor: torch.Tensor, sample_size: int = 8) -> dict[str, Any]:
-    data = tensor.detach()
-    stats_data = data.float()
-    last = stats_data.reshape(-1, stats_data.shape[-1])[-1]
-    stats = {
-        "shape": list(data.shape),
-        "dtype": str(data.dtype),
-        "mean": float(stats_data.mean().cpu()),
-        "std": float(stats_data.std(unbiased=False).cpu()),
-        "norm": float(torch.linalg.vector_norm(stats_data).cpu()),
-        "last_mean": float(last.mean().cpu()),
-        "last_std": float(last.std(unbiased=False).cpu()),
-        "last_norm": float(torch.linalg.vector_norm(last).cpu()),
-        "last_first_values": [
-            float(x) for x in last[:sample_size].detach().cpu().tolist()
-        ],
-    }
-    if os.getenv("QWEN35_THINKER_HIDDEN_DUMP_LAST_VALUES"):
-        stats["last_values"] = [float(x) for x in last.detach().cpu().tolist()]
-    if os.getenv("QWEN35_THINKER_HIDDEN_DUMP_TOKEN_NORMS"):
-        flat = stats_data.reshape(-1, stats_data.shape[-1])
-        stats["token_norms"] = [
-            float(x) for x in torch.linalg.vector_norm(flat, dim=-1).cpu().tolist()
-        ]
-    return stats
-
-
-def _hidden_dump_layers() -> set[int] | None:
-    raw = os.getenv("QWEN35_THINKER_HIDDEN_DUMP_LAYERS")
-    if not raw:
-        return None
-    layers: set[int] = set()
-    for item in raw.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        try:
-            layers.add(int(item))
-        except ValueError:
-            logger.warning("invalid QWEN35_THINKER_HIDDEN_DUMP_LAYERS item: %s", item)
-    return layers
-
-
-def _write_hidden_dump(path: str, record: dict[str, Any]) -> None:
-    try:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except OSError:
-        logger.exception("failed to write Qwen3.5 thinker hidden dump to %s", path)
 
 
 def _install_layers_to_capture_support(text_model: nn.Module) -> None:
@@ -231,16 +176,8 @@ def _install_layers_to_capture_support(text_model: nn.Module) -> None:
     ):
         capture_layers = list(getattr(text_model, "layers_to_capture", []) or [])
         has_deepstack = _has_real_deepstack(deepstack_input_embeds)
-        hidden_dump_path = os.getenv("QWEN35_THINKER_HIDDEN_DUMP")
-        hidden_dump_prefill_only = os.getenv(
-            "QWEN35_THINKER_HIDDEN_DUMP_DECODE"
-        ) not in {"1", "true", "TRUE", "yes", "YES"}
-        hidden_dump_enabled = bool(hidden_dump_path) and (
-            not hidden_dump_prefill_only or forward_batch.forward_mode.is_extend()
-        )
         if (
-            not hidden_dump_enabled
-            and (not has_deepstack)
+            (not has_deepstack)
             and (not capture_layers or native_capture_supported)
         ):
             return original_forward(
@@ -250,9 +187,10 @@ def _install_layers_to_capture_support(text_model: nn.Module) -> None:
                 inputs_embeds,
             )
 
-        # 中文说明：现有 hidden-capture hook 期望 text_model.forward 在设置
-        # layers_to_capture 后返回 (hidden_states, aux_hidden_states)。SGLang
-        # core 的 Qwen3Next 暂未内建这个返回，所以这里按原 forward 逻辑补齐。
+        # The existing hidden-capture hook expects text_model.forward to return
+        # (hidden_states, aux_hidden_states) after layers_to_capture is set.
+        # SGLang core Qwen3Next does not provide that return value yet, so this
+        # follows the original forward logic and adds the missing capture output.
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
@@ -262,42 +200,6 @@ def _install_layers_to_capture_support(text_model: nn.Module) -> None:
         aux_hidden_by_layer = {}
         if 0 in capture_set:
             aux_hidden_by_layer[0] = hidden_states.clone()
-        dump_layers = _hidden_dump_layers() if hidden_dump_enabled else None
-        dump_base: dict[str, Any] = {}
-        if hidden_dump_enabled:
-            mrope_positions = getattr(forward_batch, "mrope_positions", None)
-            seq_lens = getattr(forward_batch, "seq_lens", None)
-            extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-            dump_base = {
-                "forward_mode": str(getattr(forward_batch, "forward_mode", None)),
-                "input_ids_shape": (
-                    list(input_ids.shape) if isinstance(input_ids, torch.Tensor) else None
-                ),
-                "positions_shape": list(positions.shape),
-                "mrope_positions_shape": (
-                    list(mrope_positions.shape)
-                    if isinstance(mrope_positions, torch.Tensor)
-                    else None
-                ),
-                "seq_lens": (
-                    [int(x) for x in seq_lens.detach().cpu().tolist()]
-                    if isinstance(seq_lens, torch.Tensor)
-                    else None
-                ),
-                "extend_seq_lens_cpu": (
-                    [int(x) for x in extend_lens]
-                    if extend_lens is not None
-                    else None
-                ),
-            }
-            _write_hidden_dump(
-                hidden_dump_path,
-                {
-                    **dump_base,
-                    "stage": "embed",
-                    "hidden": _tensor_stats(hidden_states),
-                },
-            )
         residual = None
         for layer_id, layer in enumerate(text_model.layers):
             with get_global_expert_distribution_recorder().with_current_layer(
@@ -317,37 +219,15 @@ def _install_layers_to_capture_support(text_model: nn.Module) -> None:
                     layer_id,
                 )
             if layer_id != 0 and layer_id in capture_set:
-                # 中文说明：Qwen3.5 vLLM 的 accept_hidden_layer 语义是该层
-                # 输出（并包含 deepstack 注入）后的 hidden；只有 0 保留为
-                # 进入首层前的 text/embed hidden。
+                # Qwen3.5 accept_hidden_layer is the hidden state after the
+                # selected layer, including deepstack injection. Layer 0 keeps
+                # the text/embed hidden state before the first layer.
                 aux_hidden_by_layer[layer_id] = hidden_states.clone()
-            if hidden_dump_enabled and (
-                dump_layers is None or layer_id in dump_layers
-            ):
-                record = {
-                    **dump_base,
-                    "stage": "layer",
-                    "layer_id": layer_id,
-                    "hidden": _tensor_stats(hidden_states),
-                }
-                if isinstance(residual, torch.Tensor):
-                    record["residual"] = _tensor_stats(residual)
-                _write_hidden_dump(hidden_dump_path, record)
-
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = text_model.norm(hidden_states)
             else:
                 hidden_states, _ = text_model.norm(hidden_states, residual)
-        if hidden_dump_enabled:
-            _write_hidden_dump(
-                hidden_dump_path,
-                {
-                    **dump_base,
-                    "stage": "norm",
-                    "hidden": _tensor_stats(hidden_states),
-                },
-            )
 
         aux_hidden_states = [
             aux_hidden_by_layer[layer_id]

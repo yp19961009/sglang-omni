@@ -129,7 +129,8 @@ class SGLModelRunner(ModelRunner):
                 ),
             ),
             (
-                # 中文说明：优先使用 SGLang core；core 暂缺时再走本仓库 port。
+                # Prefer SGLang core and fall back to the local port while core
+                # support is not available.
                 "sglang_omni.models.qwen3_5_omni.components.sglang_thinker",
                 (
                     "Qwen3OmniNextThinkerForConditionalGeneration",
@@ -185,17 +186,17 @@ class SGLModelRunner(ModelRunner):
             ModelRegistry.models["Qwen3OmniNextThinkerForConditionalGeneration"] = (
                 qwen35_thinker_cls
             )
-            # 中文说明：MTP draft path 仍未接入 speculative decoding；
-            # 这里仅把 MTP architecture 降级注册到 base thinker，避免
-            # 带 thinker_mtp config 的 checkpoint 在模型类查找阶段失败。
+            # The MTP draft path is not wired into speculative decoding yet.
+            # Register the MTP architecture to the base thinker so checkpoints
+            # with thinker_mtp configs do not fail during model class lookup.
             ModelRegistry.models["Qwen3OmniNextThinkerMTP"] = qwen35_thinker_cls
         if qwen35_talker_cls is not None:
             ModelRegistry.models["Qwen3OmniNextTalkerModel"] = qwen35_talker_cls
             ModelRegistry.models["Qwen3OmniNextTalkerForConditionalGeneration"] = (
                 qwen35_talker_cls
             )
-            # 中文说明：vLLM perf_v2 的判断逻辑里还保留了 MoeTalker
-            # architecture 名。当前本地 port 与 NextTalker 共用实现。
+            # Some Qwen3.5 checkpoints still use the MoeTalker architecture
+            # name. The local port shares the NextTalker implementation.
             ModelRegistry.models["Qwen3OmniNextMoeTalkerForConditionalGeneration"] = (
                 qwen35_talker_cls
             )

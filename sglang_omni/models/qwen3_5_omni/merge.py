@@ -27,12 +27,13 @@ def merge_for_thinker(payloads: dict[str, StagePayload]) -> StagePayload:
     thinker_inputs = dict(state.thinker_inputs or {})
     model_inputs = dict(thinker_inputs.get("model_inputs", {}))
     if audio_is_dependent is not None:
-        # 中文说明：对齐 reference 的 audio_is_dependent 语义：
-        # audio feature 列表中 True 表示该槽位来自 video 内置音轨。
+        # Match the reference audio_is_dependent semantics: True in the audio
+        # feature list means that slot came from an embedded video audio track.
         model_inputs["audio_is_dependent"] = _to_bool_tensor(audio_is_dependent)
     if use_audio_in_video is not None:
-        # 中文说明：Qwen3.5 支持 per-video audio flags。base Qwen3 merge
-        # 只保留标量 True；这里把 [False, True] 这类细粒度配置继续传下去。
+        # Qwen3.5 supports per-video audio flags. The base Qwen3 merge only
+        # preserves scalar True, so keep finer-grained values such as
+        # [False, True] intact here.
         model_inputs["use_audio_in_video"] = _normalize_use_audio_in_video(
             use_audio_in_video
         )

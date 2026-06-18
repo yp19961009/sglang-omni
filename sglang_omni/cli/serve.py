@@ -203,8 +203,9 @@ def _resolve_code2wav_model_folder(
         raise typer.BadParameter(f"{flag_name} must not be empty")
     if os.path.isabs(folder):
         return folder
-    # 中文说明：Qwen3.5 checkpoint 常把 code2wav 放在 root checkpoint
-    # 子目录里；SGLang stage factory 需要完整目录，所以这里统一补齐。
+    # Qwen3.5 checkpoints commonly place code2wav under a root-checkpoint
+    # subdirectory. SGLang stage factories need the full directory, so resolve it
+    # here.
     return os.path.join(model_path, folder)
 
 
@@ -522,9 +523,9 @@ def apply_max_running_requests_cli_overrides(
             reason=f"SGLang max_running_requests override for {role}",
         )
         for stage in matching_stages:
-            # 中文说明：max_running_requests 属于 typed SGLang runtime
-            # intent。写到 runtime 后，YAML/CLI/example launcher 的语义一致，
-            # 最终由 config.runtime 统一翻译成 ServerArgs。
+            # max_running_requests is typed SGLang runtime intent. Writing it to
+            # runtime keeps YAML/CLI/example launchers consistent; config.runtime
+            # then translates it to ServerArgs uniformly.
             stage.runtime.sglang_server_args.max_running_requests = final_value
     return pipeline_config
 
@@ -1329,8 +1330,9 @@ def apply_preprocessing_video_cli_overrides(
             )
 
     for stage in matching_stages:
-        # 中文说明：这些值是服务级默认多模态预处理参数，放在 runtime
-        # schema 中，再由 runtime_arg_map 转成 preprocessor factory args。
+        # These values are service-level multimodal preprocessing defaults. Put
+        # them in the runtime schema and let runtime_arg_map translate them to
+        # preprocessor factory args.
         for key, value in updates.items():
             if key not in stage.runtime_arg_map:
                 raise typer.BadParameter(
@@ -1373,8 +1375,9 @@ def apply_qwen35_max_model_len_cli_override(
                 raise typer.BadParameter(
                     f"Stage {stage_name!r} cannot accept max_seq_len override"
                 )
-            # 中文说明：max_model_len 表示 thinker 的上下文上限；
-            # 预处理阶段也需要相同 guard，否则长视频/长音频会先被挡住。
+            # max_model_len is the thinker context limit. The preprocessing
+            # stage needs the same guard, otherwise long video/audio inputs are
+            # rejected before they reach the backend.
             stage.runtime.max_seq_len = seq_len
     return pipeline_config
 
@@ -1422,9 +1425,9 @@ def apply_qwen35_max_mm_len_cli_override(
             raise typer.BadParameter(
                 "Qwen3.5 preprocessing stage cannot accept max_seq_len override"
             )
-        # 中文说明：max_mm_len 表示多模态输入预算。这里映射到
-        # preprocessing 的 max_seq_len guard，只限制预处理输入预算，
-        # 不降低 thinker 后端 context length。
+        # max_mm_len is the multimodal input budget. Map it to preprocessing's
+        # max_seq_len guard so it only limits preprocessing input budget and does
+        # not lower the thinker backend context length.
         stage.runtime.max_seq_len = max_mm_len
     return pipeline_config
 
@@ -1507,8 +1510,9 @@ def apply_talker_model_path_cli_override(
                 "--talker-model-path currently supports only Qwen3.5 Omni "
                 f"talker; stage {stage.name!r} uses factory {stage.factory!r}"
             )
-    # 中文说明：显式 talker 子目录通常保存未带 "talker." 前缀的权重；
-    # root_model_path 仍指向 root checkpoint，用于 tokenizer 和 special token。
+    # Explicit talker subdirectories usually store weights without the "talker."
+    # prefix. root_model_path still points at the root checkpoint for tokenizer
+    # and special-token assets.
     _apply_stage_factory_args_override(
         pipeline_config,
         stage_name=stage_name,
@@ -2934,9 +2938,9 @@ def serve(
 
     default_generation_params: dict[str, object] = {}
     if _is_qwen35_speech_config(merged_config):
-        # 中文说明：通用 serve 的 Qwen3.5 speech/colocated 路径使用
-        # Qwen3.5 推荐的服务级默认生成参数；OpenAI 请求体中的
-        # sampling 参数仍然优先。
+        # Generic serve Qwen3.5 speech/colocated paths use Qwen3.5 recommended
+        # service-level generation defaults. Sampling params in the OpenAI
+        # request body still take precedence.
         default_generation_params.update(
             {
                 "temperature": _QWEN35_DEFAULT_TEMPERATURE,
@@ -2984,8 +2988,8 @@ def serve(
     if resolved_voice_type:
         default_talker_params["voice_type"] = resolved_voice_type
     elif _is_qwen35_speech_config(merged_config):
-        # 中文说明：通用 serve 的 colocated/YAML 路径使用 Qwen3.5
-        # 默认音色；请求里的 audio.voice 仍优先。
+        # Generic serve colocated/YAML paths use the Qwen3.5 default voice;
+        # request-level audio.voice still takes precedence.
         default_talker_params["voice_type"] = _QWEN35_DEFAULT_VOICE_TYPE
 
     tn_default = _resolve_enable_tn_default(bool(enable_tn), bool(disable_tn))

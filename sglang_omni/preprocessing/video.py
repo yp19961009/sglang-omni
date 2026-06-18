@@ -507,9 +507,10 @@ def derive_video_total_pixels_from_mm_len(max_mm_len: int) -> int:
 
     if max_mm_len <= 0:
         raise ValueError("max_mm_len must be positive")
-    # 中文说明：Qwen video token 数约等于 3D 像素预算 / IMAGE_FACTOR^2。
-    # vLLM Qwen3-VL 的 effective max pixels 使用同一类 unit^2 换算；
-    # Omni 的 loader 再按帧数和 FRAME_FACTOR 分摊为逐帧 max_pixels。
+    # Qwen video token count is roughly the 3D pixel budget divided by
+    # IMAGE_FACTOR^2. Qwen3-VL effective max pixels uses the same unit^2
+    # conversion, and the Omni loader then spreads it across frames with
+    # FRAME_FACTOR to get per-frame max_pixels.
     return int(max_mm_len) * _qwen_image_factor() ** 2
 
 

@@ -76,10 +76,10 @@ def _resolve_max_new_tokens(params: dict[str, Any], default: int = 2048) -> int:
     for key in ("max_new_tokens", "max_completion_tokens", "max_tokens"):
         value = params.get(key)
         if value is not None:
-            # 中文说明：OpenAI chat 新字段是 max_completion_tokens，
-            # 旧兼容字段是 max_tokens；SGLang SamplingParams 使用
-            # max_new_tokens。这里和 preprocessor 的 context length
-            # 校验保持一致。
+            # OpenAI chat's newer field is max_completion_tokens, while the
+            # legacy-compatible field is max_tokens. SGLang SamplingParams uses
+            # max_new_tokens. Keep this consistent with preprocessor context
+            # length validation.
             return int(value)
     return int(default)
 
@@ -230,9 +230,11 @@ def resolve_terminal_stages(request: OmniRequest) -> list[str]:
     return [DECODE_STAGE]
 
 
-def resolve_preprocessing_next_stages( # 看 state.encoder_inputs 里实际有哪些 encoder 输入，有 image 输入就路由到 image_encoder，有 audio 输入就路由到 audio_encoder，最后一定去 mm_aggregate
+def resolve_preprocessing_next_stages(
     request_id: str, output: StagePayload
 ) -> list[str]:
+    """Route to encoders for present media, then always aggregate."""
+
     del request_id
     state = Qwen3OmniPipelineState.from_dict(output.data)
     return [

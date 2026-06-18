@@ -9,8 +9,9 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
-    # 中文说明：支持从源码树直接执行
-    # `python scripts/qwen35_omni_preflight.py`，不要求先 editable install。
+    # Allow direct execution from a source tree with
+    # `python scripts/qwen35_omni_preflight.py`, without requiring an editable
+    # install first.
     sys.path.insert(0, str(_REPO_ROOT))
 
 from sglang_omni.models.qwen3_5_omni.preflight import (

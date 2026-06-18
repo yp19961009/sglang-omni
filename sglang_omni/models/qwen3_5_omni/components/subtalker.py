@@ -2,7 +2,7 @@
 """Residual codec predictor for Qwen3.5-Omni talker.
 
 Qwen3.5 uses a small "subtalker" after the main AR codec token.  Qwen reference
-dev/qwenc_perf_v2 implements it as a compact decoder that receives
+The Qwen reference implementation exposes it as a compact decoder that receives
 ``[talker_hidden, layer0_codec_embed]`` and autoregressively predicts the
 remaining RVQ groups.  The current sglang-omni environment may not ship the
 new ``transformers.models.qwen3_omni_next`` package yet, so this module keeps
@@ -520,9 +520,10 @@ class _NextSelfAttention(nn.Module):
         if use_cache and past_key_values is not None:
             if layer_idx is None:
                 raise ValueError("subtalker KV cache requires layer_idx")
-            # 中文说明：reference 的 subtalker 会先缓存
-            # [talker_hidden, layer0_embed]，后续 residual 组只喂 1 token。
-            # 本地 decoder 同步这个增量路径，避免每个 codec group 重算前缀。
+            # The reference subtalker caches [talker_hidden, layer0_embed] first
+            # and feeds only one token for later residual groups. Mirror that
+            # incremental path to avoid recomputing the prefix for each codec
+            # group.
             key_states, value_states = past_key_values.update(
                 key_states,
                 value_states,
@@ -735,10 +736,11 @@ class Qwen35ResidualCodePredictor(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate residual code groups and summed codec embeddings.
 
-        中文说明：这里按 reference implementation 的 subtalker 契约执行：
-        第一个输入 token 是 talker hidden，第二个输入 token 是主 AR
-        预测出的第 0 组 codec embedding；之后每预测一组 residual codec，
-        就把该组 embedding 追加到 decoder 输入里继续预测下一组。
+        Follow the subtalker contract from the reference implementation: the
+        first input token is the talker hidden state and the second input token
+        is the group-0 codec embedding predicted by the main AR model. After
+        each residual codec group is predicted, append its embedding to the
+        decoder input before predicting the next group.
         """
         if layer0_codes.ndim == 1:
             layer0_codes = layer0_codes.unsqueeze(1)

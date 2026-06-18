@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import inspect
-import json
-import os
 from typing import Any
 
 import torch
@@ -15,17 +13,6 @@ from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.scheduling.messages import OutgoingMessage
 
 _QWEN35_EXTERNAL_DECODE_INPUT_MODE = "qwen35_external"
-
-
-def _append_debug_jsonl(env_name: str, record: dict[str, Any]) -> None:
-    path = os.environ.get(env_name)
-    if not path:
-        return
-    try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-    except Exception:
-        pass
 
 
 class QwenTalkerModelRunner(ModelRunner):
@@ -399,65 +386,10 @@ class QwenTalkerModelRunner(ModelRunner):
                 None,
             )
             pending_text_queue = getattr(sched_req.data, "pending_text_queue", None)
-            feedback_before = (
-                len(pending_feedback_queue) if pending_feedback_queue is not None else 0
-            )
-            text_before = len(pending_text_queue) if pending_text_queue is not None else 0
-            had_next_text = self._peek_left(pending_text_queue) is not None
             combined = self._take_next_decode_input_embed(
                 sched_req=sched_req,
                 device=feedback_buffer.device,
                 dtype=feedback_buffer.dtype,
-            )
-            _append_debug_jsonl(
-                "QWEN35_DEBUG_TALKER_DECODE",
-                {
-                    "request_id": getattr(sched_req, "request_id", None),
-                    "row_idx": row_idx,
-                    "feedback_before": feedback_before,
-                    "text_before": text_before,
-                    "had_next_text": bool(had_next_text),
-                    "used_pad": bool(not had_next_text),
-                    "input_kind": getattr(
-                        sched_req.data,
-                        "last_talker_decode_input_kind",
-                        None,
-                    ),
-                    "text_feedback_countdown": getattr(
-                        sched_req.data,
-                        "talker_text_feedback_countdown",
-                        None,
-                    ),
-                    "text_chunk_remaining": getattr(
-                        sched_req.data,
-                        "talker_text_chunk_remaining",
-                        None,
-                    ),
-                    "text_outputs_to_drop": getattr(
-                        sched_req.data,
-                        "talker_text_outputs_to_drop",
-                        None,
-                    ),
-                    "should_emit": getattr(
-                        sched_req.data,
-                        "last_talker_decode_should_emit",
-                        True,
-                    ),
-                    "combined_is_none": combined is None,
-                    "combined_norm": (
-                        float(combined.detach().float().norm().item())
-                        if isinstance(combined, torch.Tensor)
-                        else None
-                    ),
-                    "feedback_after": (
-                        len(pending_feedback_queue)
-                        if pending_feedback_queue is not None
-                        else 0
-                    ),
-                    "text_after": (
-                        len(pending_text_queue) if pending_text_queue is not None else 0
-                    ),
-                },
             )
             if combined is None:
                 continue

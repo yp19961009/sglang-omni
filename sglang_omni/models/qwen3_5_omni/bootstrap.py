@@ -79,8 +79,9 @@ def _normalize_hidden_layers(value: Any) -> list[int] | None:
 
 def _ensure_embed_capture_layer(value: Any) -> list[int]:
     hidden_layers = _normalize_hidden_layers(value) or []
-    # 中文说明：talker 既需要 text/embed hidden，也需要 accept_hidden_layer
-    # 指向的中间层 hidden；即使模型配置只写中间层，也要强制补上 0。
+    # The talker needs both text/embed hidden states and the intermediate hidden
+    # states selected by accept_hidden_layer. Always include layer 0 even when
+    # the model config only lists intermediate layers.
     layers = [0]
     for layer in hidden_layers:
         if layer not in layers:
@@ -110,8 +111,9 @@ def _resolve_capture_hidden_layers_from_config(
     hidden_layers = _normalize_hidden_layers(
         getattr(talker_config, "accept_hidden_layer", None)
     )
-    # 中文说明：Qwen3.5 talker 需要 thinker 的中间 hidden state。
-    # 优先读模型配置，读不到时沿用 Qwen3-Omni 当前默认值，保证先能启动。
+    # Qwen3.5 talker consumes intermediate thinker hidden states. Prefer the
+    # model config and fall back to the current Qwen3-Omni defaults when the
+    # field is missing, so the service can still start.
     if hidden_layers:
         return _ensure_embed_capture_layer(hidden_layers)
     return list(QWEN3_5_OMNI_DEFAULT_CAPTURE_HIDDEN_LAYERS)

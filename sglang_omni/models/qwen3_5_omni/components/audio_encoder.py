@@ -4,10 +4,7 @@
 from __future__ import annotations
 
 import importlib
-import json
 import math
-import os
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -27,50 +24,6 @@ _MODELING_MODULE_CANDIDATES = (
 _AUDIO_CLASS_CANDIDATES = ("Qwen3OmniNextAudioEncoder",)
 DEFAULT_DOWNSAMPLE_TIMES = 4
 DEFAULT_DOWNSAMPLE_CHUNK_SIZE = 100
-
-
-def _append_audio_debug_record(path: str, record: dict[str, Any]) -> None:
-    try:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-    except OSError:
-        pass
-
-
-def _audio_tensor_stats(tensor: torch.Tensor | None, sample_size: int = 8) -> dict[str, Any] | None:
-    if not isinstance(tensor, torch.Tensor):
-        return None
-    data = tensor.detach()
-    stats_data = data.float()
-    flat = stats_data.reshape(-1, stats_data.shape[-1])
-    last = flat[-1]
-    stats: dict[str, Any] = {
-        "shape": list(data.shape),
-        "dtype": str(data.dtype),
-        "mean": float(stats_data.mean().cpu()),
-        "std": float(stats_data.std(unbiased=False).cpu()),
-        "norm": float(torch.linalg.vector_norm(stats_data).cpu()),
-        "last_mean": float(last.mean().cpu()),
-        "last_std": float(last.std(unbiased=False).cpu()),
-        "last_norm": float(torch.linalg.vector_norm(last).cpu()),
-        "last_first_values": [
-            float(x) for x in last[:sample_size].detach().cpu().tolist()
-        ],
-    }
-    if os.getenv("QWEN35_AUDIO_EMBED_DUMP_TOKEN_NORMS"):
-        stats["token_norms"] = [
-            float(x) for x in torch.linalg.vector_norm(flat, dim=-1).cpu().tolist()
-        ]
-    if os.getenv("QWEN35_AUDIO_EMBED_DUMP_LAST_VALUES"):
-        stats["last_values"] = [float(x) for x in last.detach().cpu().tolist()]
-    return stats
-
-
-def _audio_tensor_values(tensor: torch.Tensor | None, max_items: int = 512) -> Any | None:
-    if not isinstance(tensor, torch.Tensor) or tensor.numel() > max_items:
-        return None
-    return tensor.detach().cpu().tolist()
 
 
 def _resolve_next_class(class_names: tuple[str, ...]):
@@ -191,8 +144,8 @@ def _pack_audio_features(
     ):
         raise ValueError("audio_feature_lengths contains invalid frame counts")
 
-    # 中文说明：部分 processor/cache 路径只给 lengths，不给 attention mask。
-    # audio tower 需要的是按有效帧拼好的 [num_mel, total_frames]。
+    # Some processor/cache paths provide lengths without an attention mask. The
+    # audio tower needs [num_mel, total_frames] packed over valid frames.
     frame_ids = torch.arange(input_features.shape[2], device=input_features.device)
     keep_frames = frame_ids.unsqueeze(0) < audio_feature_lengths.to(
         input_features.device
@@ -243,8 +196,8 @@ def _load_audio_weights(
     device: str,
 ) -> nn.Module:
     state_dict = load_weights_by_prefix(model_path, prefix=AUDIO_TOWER_PREFIX)
-    # 中文说明：兼容 Qwen reference native audio tower 保存的 packed qkv 权重；
-    # 本地/HF-style tower 使用 q_proj/k_proj/v_proj 三组参数。
+    # Support packed qkv weights saved by the Qwen reference native audio tower;
+    # the local/HF-style tower uses separate q_proj/k_proj/v_proj parameters.
     state_dict = _split_packed_audio_qkv(state_dict)
     try:
         audio_tower.load_state_dict(state_dict, strict=True, assign=True)
@@ -329,8 +282,9 @@ class Qwen35OmniAudioEncoder(nn.Module):
 
         audio_feature_lengths = audio_feature_lengths.to(self._device, dtype=torch.long)
         tower_dtype = getattr(self.audio_tower, "dtype", torch.bfloat16)
-        # 中文说明：这里必须和 Qwen3OmniNextProcessor 的 audio_kwargs 对齐；
-        # 否则 audio placeholder 数量和 audio tower 输出长度会在真实权重下错位。
+        # These values must match Qwen3OmniNextProcessor audio_kwargs; otherwise
+        # audio placeholder counts and audio tower output lengths diverge under
+        # real weights.
         audio_output_lengths = _call_downsample_lengths(
             self._downsample_lengths,
             audio_feature_lengths,
@@ -338,47 +292,12 @@ class Qwen35OmniAudioEncoder(nn.Module):
             chunk_size=self._downsample_chunk_size,
         )
 
-        dump_path = os.environ.get("QWEN35_AUDIO_EMBED_DUMP")
-        should_dump = False
-        if dump_path:
-            try:
-                max_dump_calls = int(os.environ.get("QWEN35_AUDIO_EMBED_DUMP_MAX_CALLS", "1"))
-            except ValueError:
-                max_dump_calls = 1
-            dump_calls = int(getattr(self, "_qwen35_audio_dump_calls", 0))
-            should_dump = dump_calls < max_dump_calls
-            if should_dump:
-                self._qwen35_audio_dump_calls = dump_calls + 1
-                _append_audio_debug_record(
-                    dump_path,
-                    {
-                        "source": "sglang-audio-encoder",
-                        "stage": "audio_input",
-                        "input_features": _audio_tensor_stats(input_features),
-                        "audio_feature_lengths": _audio_tensor_values(
-                            audio_feature_lengths
-                        ),
-                        "audio_output_lengths": _audio_tensor_values(
-                            audio_output_lengths
-                        ),
-                    },
-                )
-
         outputs: Any = self.audio_tower(
             input_features.to(device=self._device, dtype=tower_dtype),
             feature_lens=audio_feature_lengths,
             aftercnn_lens=audio_output_lengths,
         )
         audio_embeds = getattr(outputs, "last_hidden_state", outputs)
-        if should_dump and dump_path:
-            _append_audio_debug_record(
-                dump_path,
-                {
-                    "source": "sglang-audio-encoder",
-                    "stage": "audio_output",
-                    "audio_features": _audio_tensor_stats(audio_embeds),
-                },
-            )
         return {
             "audio_embeds": audio_embeds,
             "audio_feature_lengths": audio_feature_lengths,

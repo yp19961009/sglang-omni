@@ -18,10 +18,11 @@ from sglang_omni.config import (
 _PKG = "sglang_omni.models.qwen3_5_omni"
 _PLACEMENT_POLICY = "sglang_omni.models.qwen3_omni.placement.Qwen3OmniPlacementPolicy"
 MIN_PARTIAL_START_CHUNKS = 3
-# 中文说明：reference implementation 的在线 Qwen3.5-Omni speech runner
-# 默认使用 max_model_len=192000。更长的 262144 主要出现在 thinker-only
-# eval/长上下文脚本；SGLang 默认先对齐在线 speech profile，降低首轮真实
-# 权重 smoke 的显存压力，需要 256k 时显式传 --thinker-max-seq-len。
+# The online Qwen3.5-Omni speech profile uses max_model_len=192000 by
+# default. Longer 262144 contexts mainly show up in thinker-only eval and
+# long-context scripts. Keep SGLang's default aligned with the online speech
+# profile to reduce first-smoke memory pressure; pass --thinker-max-seq-len
+# explicitly when 256k is needed.
 QWEN3_5_OMNI_THINKER_MAX_SEQ_LEN = 192000
 QWEN3_5_OMNI_TALKER_MAX_SEQ_LEN = 32768
 QWEN3_5_OMNI_MAX_PREFILL_TOKENS = 32768
@@ -31,8 +32,8 @@ QWEN3_5_OMNI_LIMIT_MM_PER_PROMPT = {
     "image": 960,
     "video": 960,
 }
-# 中文说明：reference implementation 的 H20 profile 使用 max_num_seqs=32。
-# SGLang 对应字段是 max_running_requests；talker 内部 buffer 会读取它。
+# The reference H20 profile uses max_num_seqs=32. The matching SGLang field is
+# max_running_requests, which the talker also uses for its internal buffers.
 QWEN3_5_OMNI_MAX_RUNNING_REQUESTS = 32
 QWEN3_5_OMNI_CODE2WAV_ENABLE_TORCH_COMPILE = True
 QWEN3_5_OMNI_MODEL_NAME = "qwen3.5-omni"
@@ -49,9 +50,10 @@ QWEN3_5_OMNI_MODEL_NAME_ALIASES = (
 # while Qwen3.5-Omni reuses the same AR scheduling envelope.
 _DEEPGEMM_PRECOMPILE_ENV_DEFAULTS = {"SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0"}
 
-# 中文说明：架构名对齐 reference implementation 的 registry。主模型用
-# root architecture，thinker-only / thinker-MTP 名称作为 alias 进入配置
-# 注册表；MTP runtime 当前仍在 preflight 中提示未接入。
+# Keep architecture names aligned with the reference registry. The root model
+# uses the root architecture, while thinker-only and thinker-MTP names are
+# registered as aliases. MTP runtime support is still reported as unavailable by
+# preflight.
 QWEN3_5_OMNI_ARCH = "Qwen3OmniNextForConditionalGeneration"
 QWEN3_5_OMNI_ARCH_ALIASES = (
     "Qwen3OmniNextThinkerForConditionalGeneration",
@@ -70,9 +72,9 @@ def normalize_qwen35_omni_model_name(model_name: str | None) -> str | None:
         for alias in QWEN3_5_OMNI_MODEL_NAME_ALIASES
     }
     if compact in alias_keys:
-        # 中文说明：用户/benchmark 常混用 qwen3.5-omni、qwen3_5_omni、
-        # qwen3-5-omni。serve 入口统一暴露 canonical 名称，避免
-        # /v1/models、结果 JSON 和压测标签分裂。
+        # Users and benchmarks commonly mix qwen3.5-omni, qwen3_5_omni, and
+        # qwen3-5-omni spellings. Expose one canonical name at the serve entry
+        # point so /v1/models, result JSON, and benchmark labels stay stable.
         return QWEN3_5_OMNI_MODEL_NAME
     return model_name
 
@@ -97,17 +99,19 @@ def _preprocessing_stage(*, process: str) -> StageConfig:
         name="preprocessing",
         process=process,
         factory=f"{_PKG}.stages.create_preprocessing_executor",
-        # 中文说明：Qwen3.5 reference 在线 speech profile 的 thinker
-        # max_model_len 是 192000，长视频/长音频默认需要比 Qwen3 的 8192
-        # 更大的 guard；256k eval 可通过 runtime/CLI 显式覆盖。
+        # The Qwen3.5 online speech profile uses a thinker max_model_len of
+        # 192000. Long video and audio inputs need a larger default guard than
+        # Qwen3's 8192; 256k eval runs can override this via runtime or CLI.
         factory_args={
             "thinker_max_seq_len": QWEN3_5_OMNI_THINKER_MAX_SEQ_LEN,
             "limit_mm_per_prompt": dict(QWEN3_5_OMNI_LIMIT_MM_PER_PROMPT),
         },
-        runtime_arg_map={ # runtime_arg_map = 通用 StageRuntimeConfig 字段 到 当前 stage factory kwargs 的翻译表
+        # Map shared runtime overrides to preprocessing factory kwargs.
+        runtime_arg_map={
             "max_seq_len": "thinker_max_seq_len",
-            # 中文说明：benchmark 常用的视觉默认参数可以从 runtime/YAML
-            # 直接落到 preprocessor，避免每个请求都重复塞 videos_kwargs。
+            # Common benchmark visual defaults can be supplied through
+            # runtime/YAML and forwarded to the preprocessor, instead of being
+            # repeated in each request's videos_kwargs.
             "image_min_pixels": "image_min_pixels",
             "image_max_pixels": "image_max_pixels",
             "video_fps": "video_fps",
@@ -122,8 +126,9 @@ def _preprocessing_stage(*, process: str) -> StageConfig:
             "audio_target_sr": "audio_target_sr",
             "audio_sampling_rate": "audio_target_sr",
             "sampling_rate": "audio_target_sr",
-            # 中文说明：兼容 Qwen3.5 配置里的短名，统一落到
-            # SGLang-Omni preprocessing executor 的 audio_* 参数。
+            # Accept the short names used in some Qwen3.5 configs and map them
+            # to the audio_* arguments consumed by the SGLang-Omni
+            # preprocessing executor.
             "audio_timestamp_interval": "audio_timestamp_interval",
             "timestamp_interval": "audio_timestamp_interval",
             "audio_downsample_times": "audio_downsample_times",
@@ -281,24 +286,26 @@ def _code2wav_stage(*, gpu: int, process: str) -> StageConfig:
         name="code2wav",
         process=process,
         factory=f"{_PKG}.components.code2wav_scheduler.create_code2wav_scheduler",
-        # 中文说明：reference 的 Qwen3.5-Omni profile 默认打开
-        # code2wav torch.compile；这里保持同样的音频热路径性能默认，CLI/YAML
-        # 仍可显式传 --no-code2wav-torch-compile 关闭。
+        # The Qwen3.5-Omni reference profile enables code2wav torch.compile by
+        # default. Keep the same hot-path audio performance default while still
+        # allowing CLI/YAML to disable it with --no-code2wav-torch-compile.
         factory_args={
             "device": "cuda",
             "enable_torch_compile": QWEN3_5_OMNI_CODE2WAV_ENABLE_TORCH_COMPILE,
         },
         runtime_arg_map={
-            # 中文说明：reference 的 send_chunk_size 对应 code2wav
-            # scheduler 的 stream_chunk_size，影响首音频分块和流式吞吐。
+            # The reference send_chunk_size maps to the code2wav scheduler's
+            # stream_chunk_size, which affects first-audio chunking and
+            # streaming throughput.
             "code2wav_stream_chunk_size": "stream_chunk_size",
             "send_chunk_size": "stream_chunk_size",
             "code2wav_codec_eos_token_id": "codec_eos_token_id",
             "code2wav_sample_rate": "sample_rate",
             "code2wav_left_context_size": "left_context_size",
             "code2wav_enable_dynamic_chunk": "enable_dynamic_chunk",
-            # 中文说明：reference 的 code2wav_dynamic_batch 当前是
-            # 引擎侧动态解码策略开关；SGLang 对应到已有动态 chunk 调度。
+            # The reference code2wav_dynamic_batch flag controls an engine-side
+            # dynamic decoding strategy. In SGLang it maps to the existing
+            # dynamic chunk scheduler.
             "enable_dynamic_chunk": "enable_dynamic_chunk",
             "code2wav_dynamic_batch": "enable_dynamic_chunk",
             "dynamic_batch": "enable_dynamic_chunk",

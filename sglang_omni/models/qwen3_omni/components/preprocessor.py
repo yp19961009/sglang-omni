@@ -116,9 +116,10 @@ def _media_value_is_present(value: Any) -> bool:
         return len(value) > 0
     if isinstance(value, (list, tuple, set, dict)):
         return len(value) > 0
-    # 中文说明：预采样音视频常用 torch.Tensor / numpy.ndarray 表达。
-    # 这些对象不能放进 bool(value)、A or B 这类分支，否则多元素输入会
-    # 在真正进入 processor 前就因为 truthiness 报错。
+    # Pre-sampled audio/video is often represented as torch.Tensor or
+    # numpy.ndarray. Do not use bool(value) or "A or B" branches for these
+    # objects, because multi-element inputs can fail truthiness checks before
+    # reaching the real processor.
     return True
 
 
@@ -148,9 +149,9 @@ def _first_present_audio_input(inputs: dict[str, Any]) -> Any | None:
         return value
     value = inputs.get("audio")
     if _looks_like_openai_audio_output_config(value):
-        # 中文说明：OpenAI chat/completions 的顶层 audio 是输出配置
-        # （voice/format/language），不是输入音频。直连 OmniRequest 时也要
-        # 避免把它送进 audio encoder。
+        # Top-level audio in OpenAI chat/completions is output config
+        # (voice/format/language), not input audio. Avoid sending it to the audio
+        # encoder even for direct OmniRequest calls.
         return None
     return value if _media_value_is_present(value) else None
 
@@ -197,9 +198,10 @@ def _request_prompt_token_ids(inputs: Any) -> torch.Tensor | None:
 def _build_audio_mm_inputs_compat(hf_inputs: dict[str, Any]) -> dict[str, Any]:
     audio_inputs = build_audio_mm_inputs(hf_inputs)
     if audio_inputs.get("input_features") is None:
-        # 中文说明：Qwen3-Omni 老 processor 输出 input_features；
-        # Qwen3.5-Omni Next / Qwen reference processor 输出 input_audio_features。
-        # 这里归一成现有 audio_encoder/batch 逻辑使用的字段名。
+        # Older Qwen3-Omni processors output input_features, while Qwen3.5-Omni
+        # Next / Qwen reference processors output input_audio_features. Normalize
+        # both to the field name consumed by the existing audio_encoder/batch
+        # logic.
         audio_inputs["input_features"] = hf_inputs.get("input_audio_features")
     return audio_inputs
 
@@ -214,9 +216,9 @@ def _resolve_request_max_new_tokens(params: Any) -> int:
     for key in ("max_new_tokens", "max_tokens"):
         value = params.get(key)
         if value is not None:
-            # 中文说明：OpenAI-compatible 请求使用 max_tokens，
-            # sglang 内部 SamplingParams 使用 max_new_tokens。预处理阶段的
-            # context length 校验也要与后续采样保持同一语义。
+            # OpenAI-compatible requests use max_tokens, while internal SGLang
+            # SamplingParams uses max_new_tokens. Preprocessing context length
+            # checks must keep the same semantics as later sampling.
             return int(value)
     return DEFAULT_THINKER_MAX_NEW_TOKENS
 
@@ -693,13 +695,15 @@ class Qwen3OmniPreprocessor:
             video_audios_for_mask = []
 
         if raw_prompt_text is not None:
-            # 中文说明：Qwen reference 的 TextPrompt 已经把 chat template 和多模态
-            # 占位符渲染进 prompt。这里直接复用，避免再次套模板导致占位符重复。
+            # Qwen reference TextPrompt already renders the chat template and
+            # multimodal placeholders into prompt. Reuse it directly to avoid
+            # applying the template again and duplicating placeholders.
             prompt_text = raw_prompt_text
         elif raw_prompt_token_ids is not None:
-            # 中文说明：Qwen reference 的 TokensPrompt 已经完成 tokenization。HF
-            # processor 仍用于多模态特征抽取，最终 input_ids 由调用侧 token
-            # 覆盖，避免把 tokenized prompt 反向转文本再编码。
+            # Qwen reference TokensPrompt is already tokenized. The HF processor
+            # is still used for multimodal feature extraction, and final
+            # input_ids are overridden by caller-provided tokens so tokenized
+            # prompts are not converted back to text and re-encoded.
             prompt_text = ""
         else:
             messages_norm = normalize_messages(messages)
@@ -719,8 +723,9 @@ class Qwen3OmniPreprocessor:
                 "tokenize": False,
             }
             if tools is not None:
-                # 中文说明：Qwen3.5 Qwen reference 离线 function-call 示例会把 tools
-                # 交给 chat template 渲染；这里仅传递 schema，不执行工具。
+                # Qwen3.5 reference offline function-call examples pass tools to
+                # the chat template for rendering. Here we only pass schemas and
+                # do not execute tools.
                 chat_template_kwargs["tools"] = tools
             prompt_text = self.processor.apply_chat_template(
                 messages_mm,

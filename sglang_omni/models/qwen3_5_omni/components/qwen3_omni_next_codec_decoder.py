@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3.5-Omni Next DAC decoder ported from reference implementation.
 
-中文说明：这个文件保留 Qwen reference 的纯 PyTorch DAC/codec decoder 结构，供
-Qwen3.5-Omni code2wav stage 在本地直接加载，避免运行时依赖 Qwen reference 包。
+This file keeps the Qwen reference pure-PyTorch DAC/codec decoder structure so
+the Qwen3.5-Omni code2wav stage can load it locally without a runtime
+dependency on the Qwen reference package.
 """
 
 import math
@@ -292,8 +293,8 @@ class Attention(nn.Module):
         )
         relative = relative + self.max_relative_position
         rel_embeddings = self.rel_pos_embeddings.to(dtype=q.dtype)[relative]
-        # 中文说明：F.scaled_dot_product_attention 会缩放 qk 分数；
-        # 这里把相对位置项同样按 head_dim 缩放后作为 additive bias。
+        # F.scaled_dot_product_attention scales qk scores, so scale the relative
+        # position term by head_dim as well before using it as additive bias.
         return torch.einsum("bhtd,btkd->bhtk", q, rel_embeddings) / math.sqrt(
             self.head_dim
         )
@@ -1049,9 +1050,10 @@ class DAC(nn.Module):
     def forward(self, codes: torch.Tensor):
         """Decode sglang scheduler codec chunks.
 
-        中文说明：Qwen reference 的 Next DAC `decode()` 接收 [B, T, K]，而
-        sglang-omni 现有 Code2WavScheduler 传入 [B, K, T]。这里仅在
-        `model(codes)` 路径做转置适配，保留 `decode()` 的原始 Qwen reference 语义。
+        Qwen reference Next DAC `decode()` accepts [B, T, K], while the existing
+        sglang-omni Code2WavScheduler passes [B, K, T]. Transpose only on the
+        `model(codes)` path and keep the original reference semantics for
+        `decode()`.
         """
         if codes.ndim != 3:
             raise ValueError(
@@ -1247,8 +1249,8 @@ def _load_checkpoint_state_dict(checkpoint_path, device):
             checkpoint_path, map_location=device, mmap=True, weights_only=True
         )
     except TypeError:
-        # 中文说明：老版本 torch.load 可能不支持 mmap/weights_only，
-        # 这里退回到基础参数，保证 checkpoint 仍可加载。
+        # Older torch.load versions may not support mmap/weights_only. Fall back
+        # to basic arguments so checkpoints remain loadable.
         checkpoint = torch.load(checkpoint_path, map_location=device)
 
     state_dict = _unwrap_checkpoint_state_dict(checkpoint)
@@ -1273,9 +1275,10 @@ def _unwrap_checkpoint_state_dict(checkpoint):
     for key in ("model", "state_dict", "generator"):
         value = checkpoint.get(key)
         if isinstance(value, Mapping):
-            # 中文说明：真实导出的 PyTorch checkpoint 常见外层 key 不统一：
-            # Qwen reference 用 model，也可能来自训练脚本的 state_dict/generator。
-            # 这里统一解包到 DAC model.load_state_dict 需要的扁平参数表。
+            # Exported PyTorch checkpoints are not consistent about their outer
+            # key: Qwen reference uses model, while training scripts may use
+            # state_dict/generator. Normalize all of them to the flat parameter
+            # table expected by DAC model.load_state_dict.
             return dict(value)
     return dict(checkpoint)
 
@@ -1310,8 +1313,9 @@ def _load_model_state_dict(model, state_dict):
             if "assign" not in str(exc):
                 raise
 
-    # 中文说明：部分旧 torch 或轻量包装模型没有 assign 参数。退回普通
-    # load_state_dict 仍能启动，只是少一点参数替换层面的加载优化。
+    # Some older torch versions or lightweight wrapper models do not support the
+    # assign argument. Plain load_state_dict still starts correctly, with only a
+    # little less parameter-replacement loading optimization.
     return model.load_state_dict(state_dict, strict=False)
 
 

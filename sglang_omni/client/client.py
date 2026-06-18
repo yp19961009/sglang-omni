@@ -143,9 +143,9 @@ def _encode_audio_base64_and_format(
         encode_kwargs["sample_rate"] = sample_rate
     audio_bytes, mime_type = encode_audio(audio, **encode_kwargs)
     actual_format = _format_from_mime_type(mime_type, output_format)
-    # 中文说明：encode_audio 可能在缺少 pydub/soundfile 或未知格式时回退到
-    # WAV。这里同时返回实际 format，避免 OpenAI chat audio 响应声明成
-    # mp3/opus 但 data 实际是 WAV。
+    # encode_audio may fall back to WAV when pydub/soundfile is unavailable or
+    # the format is unknown. Return the actual format as well, so OpenAI chat
+    # audio responses do not claim mp3/opus while carrying WAV data.
     return base64.b64encode(audio_bytes).decode("ascii"), actual_format
 
 
@@ -163,8 +163,9 @@ def _metadata_value_is_present(value: Any) -> bool:
             return True
     if isinstance(value, (list, tuple, set, dict)):
         return len(value) > 0
-    # 中文说明：上层可能直接传 PIL Image、numpy scalar 或其它媒体对象。
-    # 不做 bool(value)，避免多元素数组/张量在进入 preprocessor 前报错。
+    # Callers may pass PIL Images, numpy scalars, or other media objects
+    # directly. Avoid bool(value), which can fail for multi-element arrays/tensors
+    # before they reach the preprocessor.
     return True
 
 
@@ -259,9 +260,10 @@ class Client:
                 combined = audio_chunks[0]
             else:
                 combined = np.concatenate([to_numpy(c) for c in audio_chunks])
-            # 中文说明：code2wav stage 会随音频 chunk 返回真实 sample_rate。
-            # chat completion 也必须用它编码，否则非 24k profile 会出现
-            # 播放速度/时长不对；speech 路径已经做了同样传递。
+            # The code2wav stage returns the real sample_rate with audio chunks.
+            # Chat completion must encode with it as well; otherwise non-24k
+            # profiles play at the wrong speed/duration. The speech path already
+            # passes the same value through.
             audio_b64, actual_format = _encode_audio_base64_and_format(
                 combined,
                 output_format=audio_format,
@@ -456,10 +458,11 @@ class Client:
         if "audio_config" not in metadata and _looks_like_openai_audio_output_config(
             metadata.get("audio")
         ):
-            # 中文说明：内部 Client 也可能直接收到 OpenAI-style
-            # metadata.audio={voice,format,...}。request builder 读取的是
-            # audio_config，这里复制一份，避免音色/语言配置只保存在追踪
-            # metadata 里而没有进入 talker 参数归一化。
+            # The internal Client can also receive OpenAI-style
+            # metadata.audio={voice,format,...}. The request builder reads
+            # audio_config, so copy it there to avoid keeping voice/language
+            # settings only in tracing metadata and missing talker param
+            # normalization.
             metadata["audio_config"] = metadata["audio"]
         if request.model:
             metadata.setdefault("model", request.model)
@@ -615,18 +618,19 @@ def _extract_multimodal_metadata(request: GenerateRequest) -> dict[str, Any]:
     for key in _MEDIA_METADATA_KEYS:
         value = request.metadata.get(key)
         if key == "audio" and _looks_like_openai_audio_output_config(value):
-            # 中文说明：OpenAI chat/completions 的 metadata.audio 是输出音频
-            # 配置（voice/format/language），不能作为 audio encoder 输入。
-            # 真正的输入音频仍然可以通过 audios/input_audio/audio_url 传入。
+            # OpenAI chat/completions metadata.audio is output-audio config
+            # (voice/format/language), not audio encoder input. Real input audio
+            # can still be passed through audios/input_audio/audio_url.
             continue
         if _metadata_value_is_present(value):
             result[key] = value
     for key in _MULTIMODAL_METADATA_OPTION_KEYS:
         value = request.metadata.get(key)
         if value is not None:
-            # 中文说明：prompt/prompt_token_ids 也可能携带多模态输入。
-            # 这些 decode/processor 参数必须跟媒体一起进入 inputs，否则
-            # preprocessor 看不到它们，真实 Qwen3.5 请求会丢帧率/音轨等信息。
+            # prompt/prompt_token_ids may also carry multimodal input. These
+            # decode/processor params must enter inputs with the media; otherwise
+            # the preprocessor cannot see them and real Qwen3.5 requests lose
+            # fps/audio-track details.
             result[key] = value
     return result
 

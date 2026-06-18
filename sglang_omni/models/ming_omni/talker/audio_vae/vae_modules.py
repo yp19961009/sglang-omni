@@ -60,7 +60,7 @@ class StreamingLinearUpsample(nn.Module):
             up = self.upsampler(inp)
             out_last = up[:, :, self.scale_factor :]
             output_chunks.append(out_last.transpose(1, 2))
-            state = None  # 结束
+            state = None  # End of stream.
 
         final_out = torch.cat(output_chunks, dim=1) if output_chunks else None
         return final_out, state
@@ -107,7 +107,7 @@ class Encoder(nn.Module):
         x = x.reshape(-1, self.patch_size, dim)
         x = torch.cat(
             (x, self.cls_embed.expand(x.size(0), -1, -1)), dim=1
-        )  # 每个patch后插入一个cls
+        )  # Insert one cls token after each patch.
         x = x.reshape(bsz, -1, dim)
         return x
 

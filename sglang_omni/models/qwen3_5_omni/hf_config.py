@@ -84,9 +84,10 @@ def _as_config(value: Any, *, key: str | None = None) -> Any:
         return ensure_sglang_qwen3_next_text_config(value)
     if isinstance(value, dict):
         if key in _PRESERVE_DICT_KEYS:
-            # 中文说明：这些字段是运行期映射表或底层框架约定的普通 dict
-            # 配置，不是 HF 子配置；若转成 PretrainedConfig，后续
-            # .items()/dict lookup 或 isinstance(..., dict) 判断会失效。
+            # These fields are runtime maps or framework-level plain dict
+            # configs, not HF sub-configs. Converting them to PretrainedConfig
+            # would break later .items()/dict lookup and isinstance(..., dict)
+            # checks.
             return _as_plain_value(value)
         cfg = PretrainedConfig(
             **{
@@ -266,8 +267,9 @@ def _register_config_if_missing(
 def register_qwen35_hf_config() -> None:
     """Register local config aliases used by Qwen3.5-Omni checkpoints."""
 
-    # 中文说明：如果未来 transformers 已内置官方 qwen3_omni_next config，
-    # 不覆盖官方实现；当前老镜像没有这些 model_type 时才注册轻量 shim。
+    # If future transformers versions include an official qwen3_omni_next
+    # config, do not override it. Register the lightweight shim only for older
+    # images that do not know these model types yet.
     _register_config_if_missing(
         Qwen3OmniNextConfig.model_type,
         Qwen3OmniNextConfig,

@@ -1,93 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Local Qwen3.5-Omni Next encoder components.
 
-中文说明：远端环境当前没有 transformers 的 qwen3_omni_next 模块。
-这里先把 audio tower 以纯 PyTorch 形式放到 sglang-omni 内部，保持
-HF checkpoint 的 q/k/v 拆分参数名，便于 `load_module(strict=True)` 直接加载。
+Some deployment environments do not have transformers.qwen3_omni_next yet.
+Keep a pure-PyTorch audio tower inside sglang-omni with the split q/k/v
+parameter names used by the HF checkpoint, so `load_module(strict=True)` can
+load the weights directly.
 """
 
 from __future__ import annotations
 
 import math
-import json
-import os
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-def _append_audio_debug_record(path: str, record: dict[str, Any]) -> None:
-    try:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-    except OSError:
-        pass
-
-
-def _audio_debug_tensor_stats(
-    tensor: torch.Tensor | None,
-    sample_size: int = 8,
-) -> dict[str, Any] | None:
-    if not isinstance(tensor, torch.Tensor):
-        return None
-    data = tensor.detach()
-    stats_data = data.float()
-    flat = stats_data.reshape(-1, stats_data.shape[-1])
-    last = flat[-1]
-    stats: dict[str, Any] = {
-        "shape": list(data.shape),
-        "dtype": str(data.dtype),
-        "mean": float(stats_data.mean().cpu()),
-        "std": float(stats_data.std(unbiased=False).cpu()),
-        "norm": float(torch.linalg.vector_norm(stats_data).cpu()),
-        "last_mean": float(last.mean().cpu()),
-        "last_std": float(last.std(unbiased=False).cpu()),
-        "last_norm": float(torch.linalg.vector_norm(last).cpu()),
-        "last_first_values": [
-            float(x) for x in last[:sample_size].detach().cpu().tolist()
-        ],
-    }
-    if os.getenv("QWEN35_AUDIO_EMBED_DUMP_TOKEN_NORMS"):
-        stats["token_norms"] = [
-            float(x) for x in torch.linalg.vector_norm(flat, dim=-1).cpu().tolist()
-        ]
-    return stats
-
-
-def _audio_debug_tensor_values(
-    tensor: torch.Tensor | None,
-    max_items: int = 512,
-) -> Any | None:
-    if not isinstance(tensor, torch.Tensor) or tensor.numel() > max_items:
-        return None
-    return tensor.detach().cpu().tolist()
-
-
-def _audio_debug_layer_filter() -> set[int] | None:
-    value = os.getenv("QWEN35_AUDIO_EMBED_DUMP_LAYERS", "").strip()
-    if not value:
-        return set()
-    if value.lower() == "all":
-        return None
-    selected: set[int] = set()
-    for item in value.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        try:
-            selected.add(int(item))
-        except ValueError:
-            continue
-    return selected
-
-
-def _audio_debug_layer_selected(selected: set[int] | None, layer_id: int) -> bool:
-    return selected is None or layer_id in selected
 
 
 def _get_feat_extract_output_lengths(
@@ -179,8 +107,9 @@ class Qwen3OmniNextAudioAttention(nn.Module):
         valid_mask = torch.arange(max_len, device=hidden_states.device).unsqueeze(0)
         valid_mask = valid_mask < lengths.to(device=hidden_states.device).unsqueeze(1)
 
-        # 中文说明：把 packed chunks padding 成一个 batch，一次 SDPA 跑完；
-        # chunk 之间仍然完全隔离，比逐 chunk 循环更接近 Qwen reference 的 packed attention。
+        # Pad packed chunks into one batch and run SDPA once. Chunks remain
+        # fully isolated, while the execution stays closer to the reference
+        # packed attention path than a per-chunk loop.
         for row, (start, end) in enumerate(
             zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist())
         ):
@@ -355,51 +284,11 @@ class Qwen3OmniNextAudioEncoder(nn.Module):
             dtype=torch.int32,
         ).cumsum(-1)
 
-        dump_path = os.environ.get("QWEN35_AUDIO_EMBED_DUMP")
-        selected_layers = _audio_debug_layer_filter()
-        should_dump_layers = bool(dump_path) and bool(
-            os.environ.get("QWEN35_AUDIO_EMBED_DUMP_LAYERS")
-        )
-        if should_dump_layers and dump_path:
-            _append_audio_debug_record(
-                dump_path,
-                {
-                    "source": "sglang-audio-encoder",
-                    "stage": "audio_layer_input",
-                    "layer_id": 0,
-                    "hidden": _audio_debug_tensor_stats(hidden_states),
-                    "cu_seqlens": _audio_debug_tensor_values(cu_seqlens),
-                },
-            )
-
         for layer_id, encoder_layer in enumerate(self.layers):
             hidden_states = encoder_layer(hidden_states, cu_seqlens)
-            if (
-                should_dump_layers
-                and dump_path
-                and _audio_debug_layer_selected(selected_layers, layer_id)
-            ):
-                _append_audio_debug_record(
-                    dump_path,
-                    {
-                        "source": "sglang-audio-encoder",
-                        "stage": "audio_layer",
-                        "layer_id": int(layer_id),
-                        "hidden": _audio_debug_tensor_stats(hidden_states),
-                    },
-                )
 
         hidden_states = self.ln_post(hidden_states)
         hidden_states = self.proj1(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.proj2(hidden_states)
-        if should_dump_layers and dump_path:
-            _append_audio_debug_record(
-                dump_path,
-                {
-                    "source": "sglang-audio-encoder",
-                    "stage": "audio_tower_output",
-                    "hidden": _audio_debug_tensor_stats(hidden_states),
-                },
-            )
         return hidden_states

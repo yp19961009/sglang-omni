@@ -16,8 +16,6 @@
 #   response.json  - raw server response
 #   output.wav     - decoded assistant audio, when present
 #   output.txt     - assistant text, when present
-#   asr/output.txt - Whisper transcript of output.wav, when RUN_ASR=1
-#   asr_compare.json - text/audio transcript similarity scores, when RUN_ASR=1
 
 set -euo pipefail
 
@@ -41,12 +39,6 @@ SUBTALKER_TOP_K="${SUBTALKER_TOP_K:-50}"
 SUBTALKER_TOP_P="${SUBTALKER_TOP_P:-1.0}"
 SUBTALKER_REPETITION_PENALTY="${SUBTALKER_REPETITION_PENALTY:-1.05}"
 SUBTALKER_SEED="${SUBTALKER_SEED:-$SEED}"
-RUN_ASR="${RUN_ASR:-1}"
-ASR_MODEL="${ASR_MODEL:-base}"
-ASR_DEVICE="${ASR_DEVICE:-cpu}"
-ASR_LANGUAGE="${ASR_LANGUAGE:-en}"
-ASR_MIN_WORD_F1="${ASR_MIN_WORD_F1:-0.80}"
-ASR_FAIL_ON_MISMATCH="${ASR_FAIL_ON_MISMATCH:-0}"
 
 AUDIO_PATH="${1:-${AUDIO_PATH:-}}"
 OUT_DIR="${OUT_DIR:-/tmp/qwen35_omni_audio_only_$(date +%Y%m%d_%H%M%S)}"
@@ -68,14 +60,11 @@ REQUEST_JSON="$OUT_DIR/request.json"
 RESPONSE_JSON="$OUT_DIR/response.json"
 OUTPUT_WAV="$OUT_DIR/output.wav"
 OUTPUT_TXT="$OUT_DIR/output.txt"
-ASR_DIR="$OUT_DIR/asr"
-ASR_COMPARE_JSON="$OUT_DIR/asr_compare.json"
 AUDIO_B64_FILE="$OUT_DIR/input_audio.b64"
 
 echo "[qwen35] audio: $AUDIO_PATH"
 echo "[qwen35] url: $BASE_URL/v1/chat/completions"
 echo "[qwen35] output dir: $OUT_DIR"
-echo "[qwen35] asr check: $RUN_ASR model=$ASR_MODEL device=$ASR_DEVICE language=$ASR_LANGUAGE"
 
 base64 -w0 "$AUDIO_PATH" > "$AUDIO_B64_FILE"
 
@@ -201,111 +190,3 @@ else:
     print("[qwen35] audio: <missing>", file=sys.stderr)
     raise SystemExit(1)
 PY
-
-if [[ "$RUN_ASR" =~ ^(1|true|True|yes|YES|on|ON)$ ]]; then
-  if ! python - <<'PY' >/dev/null 2>&1
-import importlib.util
-raise SystemExit(0 if importlib.util.find_spec("whisper") else 1)
-PY
-  then
-    echo "[qwen35] asr: python package 'whisper' is not installed; skip audio/text check" >&2
-    exit 0
-  fi
-
-  mkdir -p "$ASR_DIR"
-  python -m whisper "$OUTPUT_WAV" \
-    --model "$ASR_MODEL" \
-    --device "$ASR_DEVICE" \
-    --language "$ASR_LANGUAGE" \
-    --fp16 False \
-    --temperature 0 \
-    --output_dir "$ASR_DIR" \
-    --output_format txt
-
-  export OUTPUT_TXT ASR_TRANSCRIPT="$ASR_DIR/output.txt" ASR_COMPARE_JSON ASR_MIN_WORD_F1 ASR_FAIL_ON_MISMATCH
-  python - <<'PY'
-import collections
-import difflib
-import json
-import os
-import re
-import sys
-from pathlib import Path
-
-text_path = Path(os.environ["OUTPUT_TXT"])
-asr_path = Path(os.environ["ASR_TRANSCRIPT"])
-compare_path = Path(os.environ["ASR_COMPARE_JSON"])
-min_word_f1 = float(os.environ["ASR_MIN_WORD_F1"])
-fail_on_mismatch = os.environ["ASR_FAIL_ON_MISMATCH"] in {
-    "1",
-    "true",
-    "True",
-    "yes",
-    "YES",
-    "on",
-    "ON",
-}
-
-text = text_path.read_text(encoding="utf-8")
-asr = asr_path.read_text(encoding="utf-8")
-
-def words(value: str) -> list[str]:
-    value = value.lower()
-    value = re.sub(r"[*_`#>\[\](){}]", " ", value)
-    value = re.sub(r"[^a-z0-9]+", " ", value)
-    return value.split()
-
-text_words = words(text)
-asr_words = words(asr)
-text_counter = collections.Counter(text_words)
-asr_counter = collections.Counter(asr_words)
-overlap = sum((text_counter & asr_counter).values())
-
-precision = overlap / len(asr_words) if asr_words else 0.0
-recall = overlap / len(text_words) if text_words else 0.0
-word_f1 = (
-    2 * precision * recall / (precision + recall)
-    if precision + recall
-    else 0.0
-)
-word_sequence_ratio = difflib.SequenceMatcher(
-    None, text_words, asr_words, autojunk=False
-).ratio()
-
-result = {
-    "text_words": len(text_words),
-    "asr_words": len(asr_words),
-    "overlap_words": overlap,
-    "precision": round(precision, 6),
-    "recall": round(recall, 6),
-    "word_f1": round(word_f1, 6),
-    "word_sequence_ratio": round(word_sequence_ratio, 6),
-    "min_word_f1": min_word_f1,
-    "pass": word_f1 >= min_word_f1,
-    "text_path": str(text_path),
-    "asr_path": str(asr_path),
-}
-compare_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-print("[qwen35] asr text:")
-print(asr)
-print(f"[qwen35] asr compare: {compare_path}")
-print(
-    "[qwen35] asr scores: "
-    f"word_f1={word_f1:.4f} "
-    f"word_sequence_ratio={word_sequence_ratio:.4f} "
-    f"precision={precision:.4f} "
-    f"recall={recall:.4f}"
-)
-
-if word_f1 < min_word_f1:
-    message = (
-        f"[qwen35] asr mismatch: word_f1={word_f1:.4f} "
-        f"< ASR_MIN_WORD_F1={min_word_f1:.4f}"
-    )
-    if fail_on_mismatch:
-        print(message, file=sys.stderr)
-        raise SystemExit(1)
-    print(message, file=sys.stderr)
-PY
-fi

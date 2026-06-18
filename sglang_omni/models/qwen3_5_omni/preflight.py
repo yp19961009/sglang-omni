@@ -615,8 +615,9 @@ def _check_hf_index_shards(
             preview = ", ".join(unsafe_shards[:5])
             if len(unsafe_shards) > 5:
                 preview += f", ... ({len(unsafe_shards)} total)"
-            # 中文说明：HF index 里的 shard 应该是模型目录内部的相对文件名；
-            # 绝对路径或 ../ 会让预检结果依赖外部路径，后续 loader 行为也不稳定。
+            # Shards in HF index files should be relative names inside the model
+            # directory. Absolute paths or ../ make preflight depend on external
+            # paths and make later loader behavior unstable.
             issues.append(
                 _issue(
                     "error",
@@ -638,9 +639,10 @@ def _check_hf_index_shards(
             preview = ", ".join(missing[:5])
             if len(missing) > 5:
                 preview += f", ... ({len(missing)} total)"
-            # 中文说明：大模型目录经常先传 index 再传 shard；如果少了某个
-            # 分片，真正启动时会在 HF/SGLang loader 深处报错。preflight
-            # 提前检查 weight_map 引用，直接指出缺哪个 shard。
+            # Large model directories are often uploaded as index first, then
+            # shards. If a shard is missing, real startup fails deep in the
+            # HF/SGLang loader. Check weight_map references early and report the
+            # exact missing shard.
             issues.append(
                 _issue(
                     "error",
@@ -710,8 +712,9 @@ def _resolve_sub_config(
         if split_config.is_file():
             data = _load_json(split_config, issues)
             return data or {}
-    # 中文说明：有些 split checkpoint 的子目录未拆出 config；这时先用 root
-    # config 做 direct-subconfig fallback，后续字段检查会给出更具体的缺口。
+    # Some split checkpoint subdirectories do not contain a separate config. Use
+    # the root config as a direct-subconfig fallback; later field checks will
+    # report more specific gaps.
     label = "/".join(subdirs)
     issues.append(
         _issue(
@@ -1038,8 +1041,9 @@ def _check_text_config_positive_fields(
         and num_key_value_heads is not None
         and num_attention_heads % num_key_value_heads != 0
     ):
-        # 中文说明：Qwen3Next 的 KV head 会被 tensor/pipeline runtime 用来
-        # 推导 attention head 分组；不整除时晚到建模阶段才失败。
+        # Qwen3Next KV heads are used by tensor/pipeline runtime to derive
+        # attention head grouping; non-divisibility would otherwise fail late
+        # during model construction.
         issues.append(
             _issue(
                 "error",
@@ -1059,9 +1063,9 @@ def _check_qwen3_next_text_runtime_fields(
     *,
     label: str,
 ) -> None:
-    # 中文说明：这些字段不是普通 shape metadata，而是当前 SGLang
-    # Qwen3Next core 启动时会直接读取的运行期约定。提前预检可以避免
-    # worker 初始化后才遇到 AttributeError/KeyError/IndexError。
+    # These fields are not plain shape metadata; current SGLang Qwen3Next core
+    # reads them directly during startup. Preflight catches them before worker
+    # initialization would raise AttributeError/KeyError/IndexError.
     num_hidden_layers = _parse_positive_int(text_config.get("num_hidden_layers"))
     _check_qwen3_next_layer_types(
         path,
@@ -1308,8 +1312,9 @@ def _check_code_predictor_config(
         and code_groups is not None
         and top_level_groups != code_groups
     ):
-        # 中文说明：talker 主链路和 residual predictor 会分别读这两个值；
-        # 不一致会导致 buffer 维度和 residual codec group 数量错位。
+        # The main talker path and residual predictor read these values
+        # separately. If they differ, buffer dimensions and residual codec group
+        # counts become inconsistent.
         issues.append(
             _issue(
                 "error",
@@ -1370,8 +1375,9 @@ def _check_code_predictor_talker_contract(
         and predictor_hidden_size is not None
         and predictor_hidden_size != talker_hidden_size
     ):
-        # 中文说明：subtalker 会把主 talker hidden 和 codec embedding 一起送入
-        # predictor；输入维度必须和主 talker hidden_size 对齐。
+        # The subtalker feeds main talker hidden states and codec embeddings into
+        # the predictor together, so the input dimension must match the main
+        # talker hidden_size.
         issues.append(
             _issue(
                 "error",
@@ -1388,8 +1394,9 @@ def _check_code_predictor_talker_contract(
         and predictor_vocab_size is not None
         and predictor_vocab_size > talker_vocab_size
     ):
-        # 中文说明：主 talker logits 会按 code_predictor_config.vocab_size
-        # 构造合法 codec id mask；predictor vocab 不能超过主 talker vocab。
+        # Main talker logits build the legal codec-id mask from
+        # code_predictor_config.vocab_size, so predictor vocab must not exceed
+        # the main talker vocab.
         issues.append(
             _issue(
                 "error",
@@ -1504,8 +1511,8 @@ def _check_root_talker_text_token_ranges(
             )
             continue
         if parsed >= talker_text_vocab_size:
-            # 中文说明：TTS/chat special token 会用于 Qwen3.5 talker 文本侧
-            # embedding/prompt 构造，必须落在 text_vocab_size 内。
+            # TTS/chat special tokens are used to build Qwen3.5 talker text-side
+            # embeddings/prompts and must be inside text_vocab_size.
             issues.append(
                 _issue(
                     "error",
@@ -1598,8 +1605,9 @@ def _check_token_id_list_map(
         for index, token_id in enumerate(token_ids):
             parsed = _parse_non_negative_int(token_id)
             if parsed is None:
-                # 中文说明：这些映射直接用于 talker prompt embedding lookup；
-                # 提前检查可以避免请求时才因为非法 id 报错。
+                # These mappings are used directly for talker prompt embedding
+                # lookup. Checking them early avoids request-time failures from
+                # invalid ids.
                 issues.append(
                     _issue(
                         "error",
@@ -1664,8 +1672,9 @@ def _check_accept_hidden_layer(
 
     invalid = [layer for layer in layers if layer < 0 or layer >= num_layers_int]
     if invalid:
-        # 中文说明：SGLang/HF 都按 transformer layer 下标捕获 hidden；
-        # 越界时真实启动可能到首个请求才暴露，这里提前报清楚。
+        # SGLang/HF capture hidden states by transformer layer index. Out-of-
+        # range values may only surface on the first real request, so report them
+        # clearly during preflight.
         issues.append(
             _issue(
                 "error",
@@ -1742,8 +1751,9 @@ def _check_code2wav_codebook_alignment(
         return
     if codebook_nums == talker_groups:
         return
-    # 中文说明：talker 每步输出 K 组 codec code，code2wav DAC 也按 K 个
-    # codebook 解码；两边不一致时通常要到首个音频 chunk 才会报维度错误。
+    # The talker emits K codec groups per step and code2wav DAC decodes K
+    # codebooks. A mismatch usually fails only at the first audio chunk, so
+    # validate it up front.
     issues.append(
         _issue(
             "error",
@@ -1980,10 +1990,11 @@ def _check_xvector_info_path(
                 )
 
     if path_errors == 0:
-        # 中文说明：这里只做轻量存在性/JSON 检查，不 pickle.load(feat.pkl)；
-        # 真正的 prompt code key 兼容性默认仍由请求构建阶段统一解析。
-        # 用户显式传 --validate-xvector-pickle 时才解析本地 pickle，
-        # 避免默认反序列化不受信任资产。
+        # Do only lightweight existence/JSON checks here and do not
+        # pickle.load(feat.pkl) by default. Prompt-code key compatibility is
+        # still handled by request construction. Parse the local pickle only
+        # when users explicitly pass --validate-xvector-pickle, avoiding default
+        # deserialization of untrusted assets.
         issues.append(
             _issue(
                 "info",
@@ -2217,8 +2228,10 @@ def _check_vision_config(
                 )
             )
         if depth is not None and layer_index >= depth:
-            # 中文说明：Qwen reference 会按这些 index 从 vision blocks 里取 multiscale
-            # hidden states；越界时要等到建模或推理才暴露，preflight 先拦住。
+            # Qwen reference uses these indices to take multiscale hidden states
+            # from vision blocks. Out-of-range values would otherwise surface
+            # only during model construction or inference, so preflight blocks
+            # them earlier.
             issues.append(
                 _issue(
                     "error",

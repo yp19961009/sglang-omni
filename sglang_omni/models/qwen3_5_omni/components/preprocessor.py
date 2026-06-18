@@ -669,9 +669,9 @@ class Qwen35OmniPreprocessor(Qwen3OmniPreprocessor):
         }.items():
             value = _first_config_value(audio_config, aliases)
             if value is not None:
-                # 中文说明：Qwen3OmniNextProcessor 会直接 pop 这三个键；
-                # 即使模型 config 暂时缺字段，也保留 Qwen reference 默认值，
-                # 避免真实调用时报错。
+                # Qwen3OmniNextProcessor pops these three keys directly. Keep
+                # the Qwen reference defaults even if the model config is
+                # missing them, so real requests do not fail later.
                 defaults[key] = int(value)
         return defaults
 
@@ -711,18 +711,20 @@ class Qwen35OmniPreprocessor(Qwen3OmniPreprocessor):
                 or _use_audio_in_video_enabled(video_kwargs)
             )
             if video_audio_requested:
-                # 中文说明：dependent_audio 是请求层语义信号，不是 HF
-                # video_processor 参数。SGLang 当前在 CPU preprocessor 里直接
-                # 完成 token 展开，因此这里只把它当作“视频使用内置音轨”的
-                # 信号，不传给 HF processor。
+                # dependent_audio is a request-level semantic flag, not an HF
+                # video_processor argument. SGLang expands tokens directly in
+                # the CPU preprocessor, so treat it only as a signal that video
+                # uses an embedded audio track and do not pass it to the HF
+                # processor.
                 video_kwargs.setdefault("use_audio_in_video", True)
             video_kwargs.setdefault("return_metadata", True)
             processor_kwargs["videos_kwargs"] = video_kwargs
 
         audio_kwargs = {
             "sampling_rate": int(audio_target_sr),
-            # 中文说明：显式固定 Qwen3.5 音频 processor 默认值，避免不同
-            # remote processor 版本的默认合并逻辑影响 attention mask 和截断。
+            # Pin Qwen3.5 audio processor defaults explicitly so remote
+            # processor version differences do not change merge behavior,
+            # attention masks, or truncation.
             "padding": True,
             "return_attention_mask": True,
             "truncation": False,
@@ -751,9 +753,10 @@ class Qwen35OmniPreprocessor(Qwen3OmniPreprocessor):
                 ),
             )
 
-        # 中文说明：Qwen3OmniNextProcessor 会用这些参数展开音频 token。
-        # 保持 processor 和 audio encoder 的 downsample 契约一致，避免
-        # placeholder 数量和 encoder 输出长度在真实权重下错位。
+        # Qwen3OmniNextProcessor uses these parameters when expanding audio
+        # tokens. Keep the processor and audio encoder downsample contract in
+        # sync so placeholder counts match encoder output lengths under real
+        # weights.
         processor_kwargs["audio_kwargs"] = audio_kwargs
         return processor_kwargs
 
@@ -762,9 +765,10 @@ class Qwen35OmniPreprocessor(Qwen3OmniPreprocessor):
         request_inputs: dict[str, Any],
         raw_videos: Any,
     ) -> Any:
-        # 中文说明：Qwen3OmniNextProcessor 默认 use_audio_in_video=False。
-        # 保持“请求显式开启才抽取视频音轨”的语义；dependent_audio 也是
-        # Qwen reference Qwen3.5 显式入口，因此可作为开启信号。
+        # Qwen3OmniNextProcessor defaults use_audio_in_video to False. Preserve
+        # the "extract video audio only when explicitly requested" semantics;
+        # dependent_audio is also an explicit Qwen3.5 reference entry point and
+        # can enable the same behavior.
         value = super()._resolve_use_audio_in_video(request_inputs, raw_videos)
         if value is not None:
             return _request_bool_value_or_list(value)
@@ -919,8 +923,8 @@ def _apply_audio_processor_default_overrides(
     downsample_times: int | None,
     downsample_chunk_size: int | None,
 ) -> None:
-    # 中文说明：这些是服务级默认值；请求里的 audio_kwargs/params 仍会在
-    # _processor_kwargs_for_request 中覆盖它们。
+    # These are service-level defaults; request-level audio_kwargs/params still
+    # override them in _processor_kwargs_for_request.
     if timestamp_interval is not None:
         defaults["timestamp_interval"] = int(timestamp_interval)
     if downsample_times is not None:
@@ -970,9 +974,10 @@ def _merge_request_params_into_inputs(inputs: Any, params: Any) -> Any:
     for target_key, aliases, value in extracted:
         if _has_request_input_value(merged, (target_key, *aliases)):
             continue
-        # 中文说明：Qwen reference Qwen3.5 OpenAI server 把 use_audio_in_video
-        # 暴露为请求顶层字段；进入 sglang serve 后可能落在 params。
-        # 这里只提升白名单 multimodal 预处理参数，避免污染采样参数。
+        # The Qwen3.5 OpenAI reference server exposes use_audio_in_video as a
+        # top-level request field, which may land in params after entering
+        # sglang serve. Promote only whitelisted multimodal preprocessing
+        # parameters so sampling params are not polluted.
         merged[target_key] = value
         changed = True
 
@@ -1131,8 +1136,8 @@ def _collect_openai_content_part(
 def _openai_text_part_value(part: dict[str, Any]) -> Any | None:
     if "text" in part:
         return part.get("text")
-    # 中文说明：OpenAI Responses 风格 content part 常用 input_text；
-    # Qwen3.5 仍只需要最终文本内容，统一并入普通 text part。
+    # OpenAI Responses-style content parts often use input_text. Qwen3.5 only
+    # needs the final text content, so fold it into a normal text part.
     return part.get("input_text")
 
 
@@ -1140,8 +1145,9 @@ def _append_openai_text_part(content_parts: list[str], text: str) -> None:
     if not text:
         return
     if content_parts and content_parts[-1] not in _OPENAI_MEDIA_PLACEHOLDER_TO_TYPE:
-        # 中文说明：连续 OpenAI text parts 等价于一个普通文本消息；
-        # 保留换行，避免把两个独立文本片段直接粘在一起。
+        # Consecutive OpenAI text parts are equivalent to one plain text
+        # message. Preserve newlines so independent text parts are not glued
+        # together.
         content_parts[-1] = f"{content_parts[-1]}\n{text}"
     else:
         content_parts.append(text)
@@ -1184,8 +1190,9 @@ def _restore_openai_media_placeholders(
             content_parts.append({"type": "text", "text": ""})
 
         restored = dict(message)
-        # 中文说明：HF Qwen3OmniNextProcessor 的 chat template 识别
-        # {"type": "video/audio/image"}，这能保留 OpenAI content part 原始顺序。
+        # HF Qwen3OmniNextProcessor chat templates recognize
+        # {"type": "video/audio/image"}, which preserves the original OpenAI
+        # content-part order.
         restored["content"] = content_parts
         restored_messages.append(restored)
     return restored_messages
@@ -1300,9 +1307,9 @@ def _normalize_request_level_media_aliases(inputs: Any) -> Any:
             continue
         if normalized is None:
             normalized = dict(inputs)
-        # 中文说明：Qwen3 基类只读取 images/videos/audios。这里把
-        # Qwen3.5 常见的 input_*/*_url 统一成复数字段，避免直连
-        # client 或自定义压测脚本漏输入。
+        # The Qwen3 base class only reads images/videos/audios. Normalize common
+        # Qwen3.5 input_* and *_url forms into plural fields so direct clients or
+        # custom benchmark scripts do not drop inputs.
         normalized[target_key] = value
     return normalized if normalized is not None else inputs
 
@@ -1407,8 +1414,9 @@ def _ordered_audio_for_openai_media_placeholders(
     if not saw_placeholder:
         return None
 
-    # 中文说明：OpenAI content part 是最精确的顺序来源。若请求同时混入了
-    # 无 placeholder 的顶层音频，作为兜底追加到末尾，避免静默丢输入。
+    # OpenAI content parts are the most precise source of ordering. If a request
+    # also includes top-level audio without a placeholder, append it at the end
+    # as a fallback instead of silently dropping it.
     ordered_audio.extend(explicit_audios[explicit_idx:])
     audio_is_dependent.extend(False for _ in explicit_audios[explicit_idx:])
     for idx, video_audio in enumerate(video_audios[video_idx:], start=video_idx):
@@ -1448,9 +1456,9 @@ def _ordered_audio_for_qwen35_default_placeholders(
             )
         return None
 
-    # 中文说明：普通顶层 videos/audios 走父类的模板注入顺序：
-    # video 在 audio 前。
-    # 因此给 HF processor 的 audio 列表也要先放视频音轨，再放独立音频。
+    # Plain top-level videos/audios follow the parent class template injection
+    # order: video before audio. Keep the HF processor audio list in the same
+    # order, with video tracks before standalone audio.
     ordered_audio.extend(explicit_audios)
     audio_is_dependent.extend(False for _ in explicit_audios)
     return _OrderedAudioInputs(
@@ -1482,10 +1490,11 @@ def _openai_media_value(
         if value is not None:
             return value
     if part_type in keys:
-        # 中文说明：兼容轻量 demo/压测脚本直接写
-        # {"type": "audio", "url": ...} 或 {"type": "input_video", "data": ...}
-        # 的形式。只有 type 明确是当前媒体类型时才读取顶层 url/path/data，
-        # 避免未知 content part 被误当成媒体。
+        # Support lightweight demos and benchmark scripts that use forms like
+        # {"type": "audio", "url": ...} or {"type": "input_video", "data": ...}.
+        # Read top-level url/path/data only when type explicitly matches the
+        # current media kind, so unknown content parts are not mistaken for
+        # media.
         return _media_payload_value(part, media_prefix=media_prefix)
     return None
 
@@ -1512,9 +1521,10 @@ def _collect_openai_video_options(
     part: dict[str, Any],
     video_options: dict[str, Any],
 ) -> None:
-    # 中文说明：Qwen3OmniNextProcessor 支持 use_audio_in_video 为 bool 或
-    # per-video bool list。OpenAI content parts 是逐视频配置，先按视频顺序
-    # 记录内部列表，merge 时再折叠成单视频 bool 或多视频 list。
+    # Qwen3OmniNextProcessor supports use_audio_in_video as either a bool or a
+    # per-video bool list. OpenAI content parts configure videos individually,
+    # so keep an internal list in video order and collapse it to a single-video
+    # bool or multi-video list during merge.
     use_audio_value = _first_openai_video_option(part, ("use_audio_in_video",))
     video_options.setdefault(_OPENAI_USE_AUDIO_IN_VIDEO_VALUES, []).append(
         use_audio_value
@@ -1526,9 +1536,10 @@ def _collect_openai_video_options(
             continue
         value = _first_openai_video_option(part, aliases)
         if value is not None:
-            # 中文说明：当前底层 video loader 只支持 request 级别的采样参数。
-            # OpenAI content part 里的同名参数先提升到顶层；未来若支持逐视频
-            # 参数，可以在这里扩展成 per-video 结构。
+            # The current lower-level video loader only supports request-level
+            # sampling parameters. Promote matching OpenAI content-part
+            # parameters to the top level for now; if per-video parameters are
+            # supported later, this can expand into a per-video structure.
             video_options[target_key] = value
 
 
@@ -1545,9 +1556,10 @@ def _collect_openai_image_options(
             nested_keys=("image", "image_url"),
         )
         if value is not None:
-            # 中文说明：当前 HF processor 接受 request 级 images_kwargs。
-            # 先对齐 Qwen reference 示例里的 image min/max pixels；多图逐项尺寸未来
-            # 如果底层支持，再扩展成 per-image 参数。
+            # The current HF processor accepts request-level images_kwargs.
+            # First match the image min/max pixels used in Qwen reference
+            # examples; if lower layers later support per-image sizing, this can
+            # expand into per-image parameters.
             image_options[target_key] = value
 
 
@@ -1564,8 +1576,8 @@ def _collect_openai_audio_options(
             nested_keys=("audio", "audio_url", "input_audio"),
         )
         if value is not None:
-            # 中文说明：OpenAI audio content part 里的采样/下采样参数本质上
-            # 是 Qwen3OmniNextProcessor 的 request 级 audio_kwargs。
+            # Sampling/downsampling parameters in OpenAI audio content parts are
+            # request-level audio_kwargs for Qwen3OmniNextProcessor.
             audio_options[target_key] = value
 
 

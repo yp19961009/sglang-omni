@@ -100,10 +100,11 @@ def _resolve_talker_quant_config(
     ):
         return quant_config
 
-    # 中文说明：Qwen3.5 root checkpoint 可能带 root-level quant_config，
-    # 但 talker 子模型未必量化。reference 会只在 talker text_config
-    # 自己声明量化/压缩时保留 quant_config；这里保持一致，避免 root
-    # quant 误套到 talker 权重映射后的子模型上。
+    # Qwen3.5 root checkpoints may include a root-level quant_config even when
+    # the talker submodel is not quantized. Match the reference behavior and
+    # keep quant_config only when the talker text_config declares
+    # quantization/compression itself, so root quantization is not incorrectly
+    # applied to the remapped talker submodel.
     return None
 
 
@@ -148,9 +149,9 @@ def _normalize_speaker_codec_embeddings(
     if loaded_weight.shape[2] == num_code_groups:
         return loaded_weight
     if loaded_weight.shape[1] == num_code_groups:
-        # 中文说明：reference 的原始 checkpoint 存的是 [S,K,T]，
-        # engine 加载时转成运行时使用的 [S,T,K]。这里同步这个约定，
-        # 避免 speaker prompt 的时间维和 codec group 维被反着解释。
+        # The raw reference checkpoint stores [S, K, T], while the engine
+        # converts it to runtime [S, T, K]. Mirror that convention so the speaker
+        # prompt time dimension and codec group dimension are not swapped.
         return loaded_weight.transpose(1, 2).contiguous()
 
     raise ValueError(
@@ -166,9 +167,9 @@ def _normalize_weight_name(name: str) -> str | None:
     if name.startswith("talker."):
         name = name[len("talker.") :]
     if name.endswith("rotary_emb.inv_freq"):
-        # 中文说明：Qwen3.5 subtalker/Next 模型的 rotary inv_freq 是由
-        # config 现场计算的 buffer。不同 HF 版本可能把它暴露在
-        # state_dict 里，但它不应该作为真实权重强制加载。
+        # Qwen3.5 subtalker/Next rotary inv_freq is a buffer computed from the
+        # config. Different HF versions may expose it in state_dict, but it
+        # should not be forced as a real weight.
         return None
 
     if name.startswith("codec_head."):
@@ -277,8 +278,8 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
             "thinker_hidden_size",
             self.text_config.hidden_size,
         )
-        # 中文说明：Qwen3.5 的文本侧已经有 talker.model.embed_tokens，
-        # 不再像 Qwen3-Omni 那样用 thinker embedding 经过 text_projection。
+        # Qwen3.5 already has talker.model.embed_tokens on the text side; unlike
+        # Qwen3-Omni, it does not use thinker embeddings through text_projection.
         self.text_projection = _IdentityProjection()
         self.hidden_projection = _LinearProjection(
             thinker_hidden_size,
@@ -452,9 +453,9 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
     def codec_code_embeddings(self, codes: torch.Tensor) -> torch.Tensor:
         """Embed codec groups and sum them into talker hidden rows.
 
-        中文说明：Qwen reference Qwen3.5 的 speaker code 使用 [T, K] 或
-        [B, K, T] 的多码本 codec id。第 0 组走主 talker codec embedding，
-        后续 residual 组走 subtalker/code_predictor 的 codec embedding。
+        Qwen3.5 reference speaker codes use multi-codebook codec ids in [T, K]
+        or [B, K, T] layout. Group 0 uses the main talker codec embedding, while
+        later residual groups use the subtalker/code_predictor codec embedding.
         """
         if codes.ndim == 2:
             code_rows = codes.to(device=self.activation_dtype_device, dtype=torch.long)
@@ -462,8 +463,8 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
                 code_rows.shape[0] == self.num_code_groups
                 and code_rows.shape[1] != self.num_code_groups
             ):
-                # 中文说明：voice clone 传入的 prompt_speaker_codes 常见布局是
-                # [K,T]，而本函数内部统一按 [T,K] 处理。
+                # Voice-clone prompt_speaker_codes often arrive as [K, T], while
+                # this function normalizes to [T, K] internally.
                 code_rows = code_rows.transpose(0, 1).contiguous()
             groups = code_rows.shape[1]
             parts = [self.model.codec_embedding(code_rows[:, 0:1])]
@@ -562,11 +563,11 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
             sub_sp = getattr(req, "_qwen35_subtalker_sampling_params", None)
             if sub_sp is None:
                 sub_sp = getattr(data, "subtalker_sampling_params", None)
-            # 中文说明：Qwen3.5 的 residual codec predictor 有自己的
-            # generation defaults（Qwen reference CodePredictor 默认
-            # temperature=0.9/top_k=50）。未显式传 subtalker_params 时，
-            # 必须使用这些默认值；若跟主 talker 的 greedy 参数绑定，会让
-            # residual codec 坍缩，code2wav 输出不可懂的噪音。
+            # Qwen3.5 residual codec prediction has its own generation defaults
+            # (Qwen reference CodePredictor defaults to temperature=0.9 and
+            # top_k=50). Use those defaults when subtalker_params are omitted;
+            # binding residual prediction to the main talker's greedy settings
+            # collapses residual codecs and makes code2wav output unintelligible.
             if sub_sp is not None:
                 self._subtalker_temperature[row_idx] = float(
                     getattr(
@@ -791,8 +792,9 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
                 sampled = sampled.squeeze(-1)
             return sampled
 
-        # 中文说明：没有 SGLang sampler 的单测/降级场景仍按请求采样参数执行，
-        # 真实服务里 bootstrap 会把 model_runner.sampler 注入到 self._sampler。
+        # Unit tests and fallback paths without an SGLang sampler still honor
+        # request sampling params. Real services inject model_runner.sampler into
+        # self._sampler during bootstrap.
         return _sample_logits(
             logits,
             temperature=self._sampling_temperatures[:batch_size, 0],
@@ -806,8 +808,9 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
         top_ps = self._sampling_top_ps[:batch_size]
         top_ks = self._sampling_top_ks[:batch_size]
         min_ps = self._sampling_min_ps[:batch_size]
-        # 中文说明：这些 flag 会影响 SGLang sampler 是否进入对应采样分支。
-        # 按当前 batch 动态设置，既保证 min_p 真正生效，也避免贪心请求走多余路径。
+        # These flags decide which branches the SGLang sampler takes. Set them
+        # from the current batch so min_p is honored while greedy requests avoid
+        # extra sampling paths.
         is_all_greedy = bool((temperatures <= 0).all().item())
         need_top_p_sampling = bool((top_ps < 1.0).any().item())
         need_top_k_sampling = bool((top_ks > 0).any().item())

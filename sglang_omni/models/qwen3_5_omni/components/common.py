@@ -53,8 +53,9 @@ _RAW_CONFIG_PRESERVE_DICT_KEYS = frozenset(
 def _to_namespace(value: Any, *, key: str | None = None) -> Any:
     if isinstance(value, dict):
         if key in _RAW_CONFIG_PRESERVE_DICT_KEYS:
-            # 中文说明：这些字段是运行期查表/量化/rope 配置，后续代码会按
-            # 普通 dict 读取；raw config fallback 不能把它们转成 namespace。
+            # These fields are runtime maps or quantization/RoPE configs that
+            # later code reads as plain dicts; the raw-config fallback must not
+            # convert them to namespaces.
             return {
                 item_key: _to_namespace(item, key=str(item_key))
                 for item_key, item in value.items()
@@ -84,9 +85,10 @@ def _normalize_qwen35_config_tree(
         return config
     seen.add(obj_id)
 
-    # 中文说明：raw fallback 绕过了 HF shim 的 PretrainedConfig 归一化。
-    # 这里补齐 thinker/talker/code predictor 需要的 SGLang 字段，避免旧
-    # transformers 环境下真实权重启动时才遇到 layers_block_type/rope 缺失。
+    # The raw fallback bypasses the PretrainedConfig normalization in the HF
+    # shim. Fill in SGLang fields required by the thinker, talker, and code
+    # predictor so older transformers environments do not fail at real-weight
+    # startup with missing layers_block_type/RoPE fields.
     ensure_sglang_qwen3_next_text_config(config)
     for attr in (
         "text_config",
@@ -115,9 +117,10 @@ def load_qwen35_config(model_path: str) -> Any:
         )
     except Exception as hf_exc:
         try:
-            # 中文说明：当前基础环境可能还没有 transformers
-            # qwen3_omni_next config。真实模型通常至少带本地 config.json，
-            # 这里转成 attr-style namespace，让 encoder/preflight 先能读配置。
+            # The base environment may not have the transformers
+            # qwen3_omni_next config yet. Real model directories usually still
+            # include a local config.json, so convert it to an attr-style
+            # namespace for encoder/preflight config reads.
             return _load_raw_config(model_path)
         except Exception as raw_exc:
             raise OSError(
@@ -128,9 +131,10 @@ def load_qwen35_config(model_path: str) -> Any:
 
 def sub_config_or_self(config: Any, attr: str) -> Any:
     value = getattr(config, attr, None)
-    # 中文说明：本地 HF config shim 会为 split thinker/talker config 保留
-    # thinker_config/talker_config 属性，但值可能是 None。此时它本身就是
-    # 子配置，不能把 None 继续传给后续 stage/model wrapper。
+    # The local HF config shim preserves thinker_config/talker_config
+    # attributes for split configs, but their values may be None. In that case
+    # the config itself is already the sub-config and None must not be forwarded
+    # to stage/model wrappers.
     return value if value is not None else config
 
 
@@ -149,9 +153,10 @@ def ensure_sglang_qwen3_next_text_config(config: Any) -> Any:
         ]
         setattr(config, "layers_block_type", sglang_layer_types)
         if getattr(config, "layer_types", None) is None:
-            # 中文说明：SGLang core 读 layers_block_type，HF 新
-            # subtalker 代码会读 layer_types；raw 配置若只带前者，这里
-            # 回填 HF 命名，避免 code predictor 初始化时访问缺失字段。
+            # SGLang core reads layers_block_type, while newer HF subtalker
+            # code reads layer_types. If the raw config only has the former,
+            # backfill the HF name so code predictor initialization does not
+            # hit a missing field.
             setattr(
                 config,
                 "layer_types",
@@ -163,11 +168,12 @@ def ensure_sglang_qwen3_next_text_config(config: Any) -> Any:
     if layer_types is None and _looks_like_qwen3_next_text_config(config):
         num_hidden_layers = getattr(config, "num_hidden_layers", None)
         if num_hidden_layers is not None:
-            # 中文说明：transformers Qwen3NextConfig 的默认 layer_types
-            # 是前三层 linear_attention、每第四层 full_attention。当前
-            # SGLang core 使用字段名 layers_block_type，且把 full_attention
-            # 叫作 attention；这里补齐别名，避免真实模型加载到第一层时报
-            # AttributeError 或 KeyError。
+            # transformers Qwen3NextConfig defaults to linear_attention for
+            # the first three layers and full_attention for every fourth layer.
+            # SGLang core currently uses layers_block_type and names
+            # full_attention as attention. Fill in that alias so real-weight
+            # loading does not fail on the first layer with AttributeError or
+            # KeyError.
             interval_pattern = _full_attention_interval(config)
             layer_types = [
                 "linear_attention"
@@ -200,9 +206,9 @@ def _ensure_sglang_qwen3_next_runtime_defaults(config: Any) -> None:
         rope_source.update(rope_scaling)
 
     if rope_scaling is None and rope_parameters is not None:
-        # 中文说明：transformers 新 config 用 rope_parameters；当前
-        # SGLang core 仍读取 rope_scaling。这里保留原字段，同时补一个
-        # SGLang 可消费的别名，避免真实模型用错默认 RoPE。
+        # New transformers configs use rope_parameters, while SGLang core still
+        # reads rope_scaling. Preserve the original field and add an alias that
+        # SGLang can consume so real models do not fall back to the wrong RoPE.
         setattr(config, "rope_scaling", dict(rope_parameters))
 
     if getattr(config, "rope_theta", None) is None and rope_source.get(
@@ -218,9 +224,9 @@ def _ensure_sglang_qwen3_next_runtime_defaults(config: Any) -> None:
         )
 
     if not hasattr(config, "torch_dtype"):
-        # 中文说明：SGLang Qwen3Next linear attention 会直接访问
-        # config.torch_dtype。PretrainedConfig 通常自带该属性，但 raw/split
-        # namespace 不一定有；补 None 让底层按默认 dtype 处理。
+        # SGLang Qwen3Next linear attention reads config.torch_dtype directly.
+        # PretrainedConfig usually has it, but raw/split namespaces may not; use
+        # None so lower layers keep their default dtype behavior.
         setattr(config, "torch_dtype", None)
 
 
@@ -275,6 +281,6 @@ def _to_hf_layer_type(value: Any) -> str:
 
 def load_qwen35_thinker_config(model_path: str) -> Any:
     cfg = load_qwen35_config(model_path)
-    # 中文说明：root checkpoint 使用 cfg.thinker_config；split checkpoint 的
-    # thinker 子目录则可能直接就是 thinker config。这里同时兼容两种布局。
+    # Root checkpoints use cfg.thinker_config, while split thinker directories
+    # may already contain the thinker config directly. Support both layouts.
     return sub_config_or_self(cfg, "thinker_config")

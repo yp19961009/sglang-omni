@@ -109,8 +109,9 @@ class MultiModalResourceConnector:
         spec_parts = spec.split(";")
         media_type = spec_parts[0].lstrip("/") or "application/octet-stream"
         if "base64" in {part.lower() for part in spec_parts[1:]}:
-            # 中文说明：真实 OpenAI 请求里常见 data:audio/wav;base64,...
-            # data 段可能被 URL percent-encode，先还原再交给 MediaIO 解码。
+            # Real OpenAI requests often use data:audio/wav;base64,... The data
+            # segment may be URL-percent-encoded, so unquote it before handing it
+            # to MediaIO.
             encoded = unquote_to_bytes(data).decode("ascii")
             return media_io.load_base64(media_type, encoded)
         return media_io.load_bytes(unquote_to_bytes(data))

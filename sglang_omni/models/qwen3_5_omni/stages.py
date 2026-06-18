@@ -68,8 +68,9 @@ _STAGE_MODEL_SUBDIRS = {
     IMAGE_STAGE: ("thinker",),
     AUDIO_STAGE: ("thinker",),
     THINKER_STAGE: ("thinker",),
-    # 中文说明：Qwen reference Qwen3.5 server/RTC 脚本默认 talker_lm，部分
-    # 离线脚本和旧 checkpoint 用 talker。自动探测时保持这个优先级。
+    # Qwen3.5 server and RTC scripts use talker_lm by default, while some
+    # offline scripts and older checkpoints use talker. Keep that priority when
+    # auto-detecting split subdirectories.
     TALKER_STAGE: ("talker_lm", "talker"),
 }
 
@@ -80,9 +81,10 @@ def _resolve_qwen35_stage_model_path(model_path: str, stage_name: str) -> str:
         return model_path
     for subdir in subdirs:
         candidate = Path(model_path) / subdir
-        # 中文说明：Qwen reference Qwen3.5 bring-up 脚本会把 root checkpoint 自动切到
-        # root/thinker 或 root/talker_lm。这里要求子目录里有 config.json，
-        # 避免把 HuggingFace repo id 或普通 root checkpoint 误当成本地 split。
+        # Qwen3.5 bring-up scripts can auto-select root/thinker or
+        # root/talker_lm from a root checkpoint. Require config.json in the
+        # subdirectory so HuggingFace repo ids or plain root checkpoints are not
+        # mistaken for local split checkpoints.
         if candidate.is_dir() and (candidate / "config.json").is_file():
             return str(candidate)
     return model_path
@@ -277,8 +279,9 @@ def _create_batched_encoder_executor(stage_name: str, model: Any):
         "max_batch_wait_ms": 50,
     }
     if stage_name == IMAGE_STAGE:
-        # 中文说明：复用 Qwen3-Omni 已校准的视觉 encoder batch budget；
-        # 这样 Video-AMME 这类并发压测不会退化成逐请求串行视觉编码。
+        # Reuse Qwen3-Omni's calibrated visual encoder batch budget so
+        # concurrent video benchmarks do not degrade into per-request serial
+        # vision encoding.
         kwargs["request_cost_fn"] = _create_image_encoder_request_cost_fn(model)
         kwargs["max_batch_cost"] = QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES
     return SimpleScheduler(_encode, **kwargs)
@@ -475,8 +478,8 @@ def create_talker_ar_executor_from_config(
 
     resolved_model_path = _resolve_qwen35_stage_model_path(model_path, TALKER_STAGE)
     if root_model_path is None and resolved_model_path != model_path:
-        # 中文说明：split checkpoint 常见布局是 root/talker_lm 或
-        # root/talker 保存未带 "talker." 前缀的权重；root config 仍提供
+        # Split checkpoints commonly store unprefixed talker weights under
+        # root/talker_lm or root/talker, while the root config still provides
         # tokenizer/special token。
         root_model_path = model_path
         weight_prefix = ""

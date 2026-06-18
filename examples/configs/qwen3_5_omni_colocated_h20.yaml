@@ -4,8 +4,9 @@
 # The Python pipeline config owns the stage topology; this file only sets the
 # runtime memory budgets needed for colocated launch.
 #
-# 中文说明：这是单 H20 colocated 启动的保守初始配置。AR 并发默认使用
-# max_running_requests=32；正式压测时应根据实际显存峰值重新校准。
+# Conservative initial config for single-H20 colocated serving. AR concurrency
+# defaults to max_running_requests=32; recalibrate it against real peak memory
+# before production benchmarking.
 
 config_cls: Qwen35OmniSpeechColocatedPipelineConfig
 name: qwen3-5-omni-colocated-h20
@@ -20,8 +21,8 @@ stage_overrides:
       video_max_frames: 128
       video_min_frames: 4
       video_max_pixels: 401408
-      # 中文说明：这些值对齐 Qwen3OmniNextProcessor 的 perf_v2 默认；
-      # 请求里传同名参数时会覆盖这里的服务级默认值。
+      # These values follow the Qwen3OmniNextProcessor online defaults.
+      # Request-level parameters with the same names override these service defaults.
       audio_target_sr: 16000
       audio_timestamp_interval: 60
       audio_downsample_times: 4
@@ -52,9 +53,9 @@ stage_overrides:
         max_running_requests: 32
 
   code2wav:
-    # 中文说明：Qwen3.5 code2wav 代码默认 stream_chunk_size=4；这个 H20
-    # 配置显式覆盖为 8。真实压测时可继续用
-    # --code2wav-stream-chunk-size 做 A/B。
+    # Qwen3.5 code2wav defaults stream_chunk_size to 4; this H20 config
+    # explicitly overrides it to 8. Use --code2wav-stream-chunk-size for A/B
+    # testing during real benchmarks.
     runtime:
       send_chunk_size: 8
       code2wav_enable_torch_compile: true
