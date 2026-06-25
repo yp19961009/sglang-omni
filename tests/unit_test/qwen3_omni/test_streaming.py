@@ -295,6 +295,67 @@ def test_qwen_thinker_stream_builder_inlines_decode_token_when_enabled(monkeypat
     assert torch.equal(messages[1].data, torch.tensor([1.0, 2.0]))
 
 
+def test_qwen_thinker_stream_builder_batches_decode_tokens(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
+    monkeypatch.setenv("SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE", "3")
+    builder = make_thinker_stream_output_builder()
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(is_chunked=0),
+        stage_payload=_thinker_stage_payload(["text"]),
+    )
+
+    per_token_messages = [
+        builder(
+            "req-1",
+            req_data,
+            SimpleNamespace(data=token_id, extra={}),
+        )
+        for token_id in [11, 12, 13, 14, 15]
+    ]
+    decode_chunks = [
+        [msg for msg in messages if msg.target == "decode"]
+        for messages in per_token_messages
+    ]
+
+    assert decode_chunks[0][0].data == 11
+    assert decode_chunks[1] == []
+    assert decode_chunks[2] == []
+    assert decode_chunks[3][0].data == [12, 13, 14]
+    assert decode_chunks[3][0].metadata["token_count"] == 3
+    assert decode_chunks[4] == []
+
+
+def test_qwen_thinker_stream_builder_keeps_immediate_decode_prefix(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
+    monkeypatch.setenv("SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE", "3")
+    monkeypatch.setenv("SGLANG_OMNI_DECODE_STREAM_IMMEDIATE_TOKEN_COUNT", "2")
+    builder = make_thinker_stream_output_builder()
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(is_chunked=0),
+        stage_payload=_thinker_stage_payload(["text"]),
+    )
+
+    per_token_messages = [
+        builder(
+            "req-1",
+            req_data,
+            SimpleNamespace(data=token_id, extra={}),
+        )
+        for token_id in [11, 12, 13, 14, 15, 16]
+    ]
+    decode_chunks = [
+        [msg for msg in messages if msg.target == "decode"]
+        for messages in per_token_messages
+    ]
+
+    assert decode_chunks[0][0].data == 11
+    assert decode_chunks[1][0].data == 12
+    assert decode_chunks[2] == []
+    assert decode_chunks[3] == []
+    assert decode_chunks[4][0].data == [13, 14, 15]
+    assert decode_chunks[5] == []
+
+
 def test_qwen_thinker_stream_builder_keeps_talker_when_modalities_missing():
     builder = make_thinker_stream_output_builder()
     req_data = SimpleNamespace(
@@ -484,6 +545,17 @@ def test_utf8_multibyte_hold_then_emit():
     assert out[0].data["text"] == "hello"
 
 
+def test_streaming_detokenizer_accepts_batched_token_ids():
+    tok = _ByteTokenizer(vocab={1: b"hi", 2: b" there", 3: b"!"})
+    sched = StreamingDetokenizeScheduler(tokenizer=tok, eos_token_id=None)
+
+    sched._on_stream_chunk("req-1", _StreamItem(data=[1, 2, 3]))
+
+    out = _drain_outbox(sched)
+    assert [msg.data["text"] for msg in out] == ["hi", " there", "!"]
+    assert sched._state["req-1"].stream_token_count == 3
+
+
 def test_special_tokens_emit_no_delta():
     """A token in the special set must not produce a stream chunk."""
     tok = _ByteTokenizer(
@@ -605,6 +677,25 @@ def test_streaming_final_result_drops_full_text_to_avoid_duplication():
     assert "events" in final_data
     assert "usage" in final_data
     assert final_data.get("finish_reason") == "stop"
+
+
+def test_streaming_finalize_emits_unstreamed_suffix_from_output_ids():
+    tok = _ByteTokenizer(vocab={1: b"hi", 2: b" there", 3: b"!"})
+    sched = StreamingDetokenizeScheduler(tokenizer=tok, eos_token_id=None)
+
+    sched._on_stream_chunk("req-1", _StreamItem(data=1))
+    sched._on_stream_done("req-1")
+    sched._on_new_request(
+        "req-1", _payload_with_output_ids(stream=True, output_ids=[1, 2, 3])
+    )
+
+    out = _drain_outbox(sched)
+    stream_msgs = [m for m in out if m.type == "stream"]
+    result_msgs = [m for m in out if m.type == "result"]
+
+    assert [msg.data["text"] for msg in stream_msgs] == ["hi", " there!"]
+    assert len(result_msgs) == 1
+    assert "text" not in result_msgs[0].data.data
 
 
 def test_non_streaming_final_result_keeps_full_text():
@@ -799,7 +890,11 @@ def _bare_stage(*, is_terminal: bool, owns_io: bool = True) -> Stage:
     s._active_requests = set()
     s._stream_queue = None
     s._stream_chunk_counters = {}
+    s._stream_ingest_queues = {}
+    s._stream_ingest_tasks = {}
     s._first_stream_chunk_seen = set()
+    s._first_outbox_stream_dequeue_seen = set()
+    s._first_scheduler_stream_enqueue_seen = set()
     s._local_stream_targets = {}
     s._nonlocal_stream_targets = {}
     s.input_handler = SimpleNamespace(cancel=lambda request_id: None)
@@ -1224,6 +1319,8 @@ def test_client_speech_forces_non_streaming_request(
             "top_k": -1,
             "min_p": 0.0,
             "repetition_penalty": 1.0,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
             "stop": [],
             "stop_token_ids": [],
             "seed": None,

@@ -1839,6 +1839,7 @@ def make_thinker_scheduler_adapters(
 
 def make_thinker_stream_output_builder(required_aux_hidden_key: Any = None):
     aux_hidden_key = _normalize_aux_hidden_key(required_aux_hidden_key)
+    decode_stream_batcher = qwen3_request_builders._DecodeStreamTokenBatcher()
 
     def _select_stream_hidden_fallback(extra: dict[str, Any]) -> torch.Tensor | None:
         hidden = extra.get("stream_hidden_states")
@@ -1884,20 +1885,9 @@ def make_thinker_stream_output_builder(required_aux_hidden_key: Any = None):
             and (stage_payload.request.params or {}).get("stream", False)
         )
         if is_streaming:
-            decode_data: int | torch.Tensor
-            if qwen3_request_builders._inline_cpu_stream_chunks_enabled():
-                decode_data = token_id
-            else:
-                decode_data = torch.tensor([token_id], dtype=torch.long, device="cpu")
-            messages.append(
-                OutgoingMessage(
-                    request_id=request_id,
-                    type="stream",
-                    data=decode_data,
-                    target="decode",
-                    metadata={"token_id": token_id},
-                )
-            )
+            decode_msg = decode_stream_batcher.build(request_id, token_id)
+            if decode_msg is not None:
+                messages.append(decode_msg)
 
         if not should_generate_audio_output(stage_payload):
             return messages

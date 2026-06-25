@@ -3023,6 +3023,43 @@ def test_qwen35_stream_builder_inlines_decode_token_when_enabled(monkeypatch):
     assert torch.equal(messages[1].data, embed[0])
 
 
+def test_qwen35_stream_builder_batches_decode_tokens(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
+    monkeypatch.setenv("SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE", "3")
+    builder = request_builders.make_thinker_stream_output_builder(
+        required_aux_hidden_key=18
+    )
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(inputs={}, params={"stream": True}),
+        data={},
+    )
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(is_chunked=0),
+        stage_payload=payload,
+    )
+
+    per_token_messages = [
+        builder(
+            "req-0",
+            req_data,
+            SimpleNamespace(data=token_id, extra={}),
+        )
+        for token_id in [42, 43, 44, 45, 46]
+    ]
+    decode_chunks = [
+        [msg for msg in messages if msg.target == "decode"]
+        for messages in per_token_messages
+    ]
+
+    assert decode_chunks[0][0].data == 42
+    assert decode_chunks[1] == []
+    assert decode_chunks[2] == []
+    assert decode_chunks[3][0].data == [43, 44, 45]
+    assert decode_chunks[3][0].metadata["token_count"] == 3
+    assert decode_chunks[4] == []
+
+
 def test_qwen35_talker_sampling_uses_passed_codec_eos_id(monkeypatch):
     captured = {}
 

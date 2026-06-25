@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Streaming detokenizer scheduler for the Qwen3-Omni decode stage.
 
-Replaces the one-shot SimpleScheduler-based decode. Consumes per-token
-``stream_chunk`` IncomingMessages from the thinker (each carrying a single
-token id), incrementally detokenizes via HF tokenizer with UTF-8 boundary
-safety, and emits text deltas as ``OutgoingMessage(type="stream", target=None)``
-which the stage runtime forwards to the Coordinator. Final result is emitted
-on ``new_request`` (the thinker's terminal payload via ``next``), preserving
-the existing non-streaming result shape.
+Replaces the one-shot SimpleScheduler-based decode. Consumes ``stream_chunk``
+IncomingMessages from the thinker (each carrying one or more token ids),
+incrementally detokenizes via HF tokenizer with UTF-8 boundary safety, and
+emits text deltas as ``OutgoingMessage(type="stream", target=None)`` which the
+stage runtime forwards to the Coordinator. Final result is emitted on
+``new_request`` (the thinker's terminal payload via ``next``), preserving the
+existing non-streaming result shape.
 """
 from __future__ import annotations
 
@@ -65,6 +65,22 @@ class _RequestState:
     empty_delta_count: int = 0
     utf8_hold_count: int = 0
     emitted_text_count: int = 0
+    emitted_text: str = ""
+
+
+def _coerce_stream_token_ids(data: Any) -> list[int]:
+    if isinstance(data, (list, tuple)):
+        return [int(item) for item in data]
+    if hasattr(data, "detach") and hasattr(data, "reshape"):
+        values = data.detach().cpu().reshape(-1).tolist()
+        return [int(item) for item in values]
+    if hasattr(data, "tolist") and not hasattr(data, "item"):
+        values = data.tolist()
+        if isinstance(values, list):
+            return [int(item) for item in values]
+    if hasattr(data, "item"):
+        return [int(data.item())]
+    return [int(data)]
 
 
 class _PriorityFirstStreamInbox:
@@ -286,70 +302,16 @@ class StreamingDetokenizeScheduler:
             self._state[request_id] = s
         return s
 
-    def _on_stream_chunk(self, request_id: str, item: Any) -> None:
-        data = item.data
-        token_id = int(data.item()) if hasattr(data, "item") else int(data)
-        s = self._ensure_state(request_id)
-        s.stream_token_count += 1
-        if not is_decodable_token_id(self._tokenizer, token_id):
-            s.skipped_token_count += 1
-            if s.skipped_token_count == 1:
-                _emit_event(
-                    request_id=request_id,
-                    stage=self.stage_name,
-                    event_name="scheduler_stream_token_skipped",
-                    metadata={
-                        "token_id": token_id,
-                        "stream_token_count": s.stream_token_count,
-                    },
-                )
-                logger.warning(
-                    "Skipping non-text token id %s in streaming decode for request %s",
-                    token_id,
-                    request_id,
-                )
+    def _emit_text_delta(
+        self,
+        request_id: str,
+        s: _RequestState,
+        text: str,
+        *,
+        token_id: int | None,
+    ) -> None:
+        if not text:
             return
-        s.pending_tokens.append(token_id)
-
-        candidate = safe_decode_token_ids(
-            self._tokenizer,
-            s.pending_tokens,
-            skip_special_tokens=True,
-            request_id=request_id,
-            context="streaming_delta",
-        )
-        # Incomplete multi-byte UTF-8 surfaces as U+FFFD; hold pending
-        # until the next token completes the byte sequence.
-        if "�" in candidate:
-            s.utf8_hold_count += 1
-            if s.utf8_hold_count == 1:
-                _emit_event(
-                    request_id=request_id,
-                    stage=self.stage_name,
-                    event_name="scheduler_stream_utf8_hold",
-                    metadata={
-                        "token_id": token_id,
-                        "pending_len": len(s.pending_tokens),
-                        "stream_token_count": s.stream_token_count,
-                    },
-                )
-            return
-
-        s.pending_tokens.clear()
-        if not candidate:
-            s.empty_delta_count += 1
-            if s.empty_delta_count == 1:
-                _emit_event(
-                    request_id=request_id,
-                    stage=self.stage_name,
-                    event_name="scheduler_stream_empty_delta",
-                    metadata={
-                        "token_id": token_id,
-                        "stream_token_count": s.stream_token_count,
-                    },
-                )
-            return  # special tokens suppressed; nothing to emit
-
         if s.emitted_text_count == 0:
             _emit_event(
                 request_id=request_id,
@@ -358,24 +320,90 @@ class StreamingDetokenizeScheduler:
                 metadata={
                     "token_id": token_id,
                     "stream_token_count": s.stream_token_count,
-                    "text_len": len(candidate),
-                    "text_preview": candidate[:32],
+                    "text_len": len(text),
+                    "text_preview": text[:32],
                 },
             )
         s.emitted_text_count += 1
+        s.emitted_text += text
         self.outbox.put(
             OutgoingMessage(
                 request_id=request_id,
                 type="stream",
                 target=None,  # terminal stream → Coordinator
                 data={
-                    "text": candidate,
+                    "text": text,
                     "modality": "text",
                     "stage_name": self.stage_name,
                 },
                 metadata={"modality": "text"},
             )
         )
+
+    def _on_stream_chunk(self, request_id: str, item: Any) -> None:
+        s = self._ensure_state(request_id)
+        for token_id in _coerce_stream_token_ids(item.data):
+            s.stream_token_count += 1
+            if not is_decodable_token_id(self._tokenizer, token_id):
+                s.skipped_token_count += 1
+                if s.skipped_token_count == 1:
+                    _emit_event(
+                        request_id=request_id,
+                        stage=self.stage_name,
+                        event_name="scheduler_stream_token_skipped",
+                        metadata={
+                            "token_id": token_id,
+                            "stream_token_count": s.stream_token_count,
+                        },
+                    )
+                    logger.warning(
+                        "Skipping non-text token id %s in streaming decode for request %s",
+                        token_id,
+                        request_id,
+                    )
+                continue
+            s.pending_tokens.append(token_id)
+
+            candidate = safe_decode_token_ids(
+                self._tokenizer,
+                s.pending_tokens,
+                skip_special_tokens=True,
+                request_id=request_id,
+                context="streaming_delta",
+            )
+            # Incomplete multi-byte UTF-8 surfaces as U+FFFD; hold pending
+            # until the next token completes the byte sequence.
+            if "�" in candidate:
+                s.utf8_hold_count += 1
+                if s.utf8_hold_count == 1:
+                    _emit_event(
+                        request_id=request_id,
+                        stage=self.stage_name,
+                        event_name="scheduler_stream_utf8_hold",
+                        metadata={
+                            "token_id": token_id,
+                            "pending_len": len(s.pending_tokens),
+                            "stream_token_count": s.stream_token_count,
+                        },
+                    )
+                continue
+
+            s.pending_tokens.clear()
+            if not candidate:
+                s.empty_delta_count += 1
+                if s.empty_delta_count == 1:
+                    _emit_event(
+                        request_id=request_id,
+                        stage=self.stage_name,
+                        event_name="scheduler_stream_empty_delta",
+                        metadata={
+                            "token_id": token_id,
+                            "stream_token_count": s.stream_token_count,
+                        },
+                    )
+                continue  # special tokens suppressed; nothing to emit
+
+            self._emit_text_delta(request_id, s, candidate, token_id=token_id)
 
     def _on_stream_done(self, request_id: str) -> None:
         # No state row means either zero-token generation (no chunk created
@@ -403,6 +431,62 @@ class StreamingDetokenizeScheduler:
         if s.done or not is_streaming:
             self._finalize(request_id)
 
+    def _final_output_text(
+        self,
+        request_id: str,
+        payload: StagePayload,
+    ) -> str | None:
+        state = Qwen3OmniPipelineState.from_dict(payload.data)
+        thinker_out = state.thinker_out or state.engine_outputs.get(THINKER_STAGE)
+        if not isinstance(thinker_out, dict):
+            return None
+        output_ids = thinker_out.get("output_ids")
+        if not isinstance(output_ids, list) or not output_ids:
+            return None
+        return safe_decode_token_ids(
+            self._tokenizer,
+            output_ids,
+            skip_special_tokens=True,
+            request_id=request_id,
+            context="streaming_final_suffix",
+        )
+
+    def _emit_unstreamed_final_suffix(
+        self,
+        request_id: str,
+        s: _RequestState,
+    ) -> None:
+        if s.payload is None:
+            return
+        final_text = self._final_output_text(request_id, s.payload)
+        if not final_text or final_text == s.emitted_text:
+            return
+        if final_text.startswith(s.emitted_text):
+            self._emit_text_delta(
+                request_id,
+                s,
+                final_text[len(s.emitted_text) :],
+                token_id=None,
+            )
+            return
+
+        _emit_event(
+            request_id=request_id,
+            stage=self.stage_name,
+            event_name="scheduler_stream_suffix_mismatch",
+            metadata={
+                "emitted_text_len": len(s.emitted_text),
+                "final_text_len": len(final_text),
+                "emitted_preview": s.emitted_text[-32:],
+                "final_preview": final_text[:32],
+            },
+        )
+        logger.warning(
+            "Skipping streaming final suffix for request %s because final text "
+            "does not extend already emitted text",
+            request_id,
+        )
+
     def _finalize(self, request_id: str) -> None:
         s = self._state.pop(request_id, None)
         self._done_seen.pop(request_id, None)
@@ -421,20 +505,10 @@ class StreamingDetokenizeScheduler:
                 context="streaming_finalize",
             )
             if leftover:
-                self.outbox.put(
-                    OutgoingMessage(
-                        request_id=request_id,
-                        type="stream",
-                        target=None,
-                        data={
-                            "text": leftover,
-                            "modality": "text",
-                            "stage_name": self.stage_name,
-                        },
-                        metadata={"modality": "text"},
-                    )
-                )
+                self._emit_text_delta(request_id, s, leftover, token_id=None)
         is_streaming = bool((s.payload.request.params or {}).get("stream", False))
+        if is_streaming:
+            self._emit_unstreamed_final_suffix(request_id, s)
         result = self._build_result(s.payload, is_streaming=is_streaming)
         s.payload.data = result
         self.outbox.put(

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -38,6 +39,11 @@ MM_AGGREGATE_STAGE = "mm_aggregate"
 _INLINE_CPU_STREAM_CHUNK_MAX_BYTES_ENV = (
     "SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES"
 )
+_DECODE_STREAM_TOKEN_BATCH_SIZE_ENV = "SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE"
+_DECODE_STREAM_IMMEDIATE_TOKEN_COUNT_ENV = (
+    "SGLANG_OMNI_DECODE_STREAM_IMMEDIATE_TOKEN_COUNT"
+)
+_DECODE_STREAM_BATCH_STATE_MAX = 10000
 
 # Note(Chenchen Hong): PyTorch sampling_seed must fit a positive int32.
 MAX_INT32_POSITIVE = 0x7FFFFFFF
@@ -51,6 +57,93 @@ def _inline_cpu_stream_chunks_enabled() -> bool:
         return int(raw) > 0
     except ValueError:
         return False
+
+
+def _decode_stream_token_batch_size() -> int:
+    raw = os.getenv(_DECODE_STREAM_TOKEN_BATCH_SIZE_ENV)
+    if raw is None or raw == "":
+        return 1
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 1
+
+
+def _decode_stream_immediate_token_count() -> int:
+    raw = os.getenv(_DECODE_STREAM_IMMEDIATE_TOKEN_COUNT_ENV)
+    if raw is None or raw == "":
+        return 1
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 1
+
+
+def _make_decode_stream_message(
+    request_id: str,
+    token_ids: list[int],
+) -> OutgoingMessage:
+    if len(token_ids) == 1:
+        metadata = {"token_id": token_ids[0]}
+        if _inline_cpu_stream_chunks_enabled():
+            data: int | list[int] | torch.Tensor = token_ids[0]
+        else:
+            data = torch.tensor(token_ids, dtype=torch.long)
+    else:
+        metadata = {
+            "token_id": token_ids[-1],
+            "token_ids": list(token_ids),
+            "token_count": len(token_ids),
+        }
+        if _inline_cpu_stream_chunks_enabled():
+            data = list(token_ids)
+        else:
+            data = torch.tensor(token_ids, dtype=torch.long)
+
+    return OutgoingMessage(
+        request_id=request_id,
+        type="stream",
+        data=data,
+        target=DECODE_STAGE,
+        metadata=metadata,
+    )
+
+
+class _DecodeStreamTokenBatcher:
+    """Batch thinker text tokens after a short immediate-token prefix."""
+
+    def __init__(self) -> None:
+        self._buffers: OrderedDict[str, list[int]] = OrderedDict()
+        self._sent_counts: OrderedDict[str, int] = OrderedDict()
+
+    @staticmethod
+    def _evict_oldest(items: OrderedDict[str, Any]) -> None:
+        while len(items) > _DECODE_STREAM_BATCH_STATE_MAX:
+            items.popitem(last=False)
+
+    def build(self, request_id: str, token_id: int) -> OutgoingMessage | None:
+        batch_size = _decode_stream_token_batch_size()
+        if batch_size <= 1:
+            return _make_decode_stream_message(request_id, [token_id])
+
+        sent_count = self._sent_counts.get(request_id, 0)
+        if sent_count < _decode_stream_immediate_token_count():
+            self._sent_counts[request_id] = sent_count + 1
+            self._sent_counts.move_to_end(request_id)
+            self._evict_oldest(self._sent_counts)
+            return _make_decode_stream_message(request_id, [token_id])
+
+        self._sent_counts.move_to_end(request_id)
+        pending = self._buffers.setdefault(request_id, [])
+        pending.append(token_id)
+        self._buffers.move_to_end(request_id)
+        self._evict_oldest(self._buffers)
+        if len(pending) < batch_size:
+            return None
+
+        token_ids = list(pending)
+        self._buffers.pop(request_id, None)
+        return _make_decode_stream_message(request_id, token_ids)
 
 _MEDIA_MODEL_INPUT_KEYS = (
     "audio_embeds",
@@ -1174,6 +1267,8 @@ def apply_thinker_result(
 
 
 def make_thinker_stream_output_builder():
+    decode_stream_batcher = _DecodeStreamTokenBatcher()
+
     def _normalize_chunk_hidden(hidden: torch.Tensor | None) -> torch.Tensor | None:
         if hidden is None:
             return None
@@ -1231,20 +1326,9 @@ def make_thinker_stream_output_builder():
             # Inline CPU stream chunks keep tiny text-token deltas off the relay
             # tensor path. Preserve the old tensor payload when inline is not
             # enabled because relay_io.write_blob is tensor-only.
-            decode_data: int | torch.Tensor
-            if _inline_cpu_stream_chunks_enabled():
-                decode_data = token_id
-            else:
-                decode_data = torch.tensor([token_id], dtype=torch.long)
-            messages.append(
-                OutgoingMessage(
-                    request_id=request_id,
-                    type="stream",
-                    data=decode_data,
-                    target="decode",
-                    metadata={"token_id": token_id},
-                )
-            )
+            decode_msg = decode_stream_batcher.build(request_id, token_id)
+            if decode_msg is not None:
+                messages.append(decode_msg)
 
         if not should_generate_audio_output(stage_payload):
             return messages
