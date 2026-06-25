@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 from typing import Any
 
 import torch
@@ -14,6 +15,10 @@ from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.scheduling.messages import OutgoingMessage
 
 _QWEN35_EXTERNAL_DECODE_INPUT_MODE = "qwen35_external"
+_QWEN35_ALLOW_EMPTY_TEXT_FEEDBACK = os.environ.get(
+    "QWEN35_TALKER_ALLOW_EMPTY_TEXT_FEEDBACK",
+    "1",
+).lower() in {"1", "true", "yes", "on"}
 
 
 class QwenTalkerModelRunner(ModelRunner):
@@ -518,10 +523,26 @@ class QwenTalkerModelRunner(ModelRunner):
             if int(getattr(data, "talker_text_chunk_remaining", 0) or 0) > 0:
                 return True
             if getattr(data, "pending_text_queue", None):
-                return True
+                countdown = int(
+                    getattr(data, "talker_text_feedback_countdown", 0) or 0
+                )
+                if countdown > 0:
+                    return True
+                chunk_size = max(
+                    1,
+                    int(getattr(data, "talker_text_chunk_size", 1) or 1),
+                )
+                pending_len = len(getattr(data, "pending_text_queue", None) or ())
+                return (
+                    pending_len >= chunk_size
+                    or bool(getattr(data, "thinker_chunks_done", False))
+                )
             if getattr(data, "thinker_chunks_done", False):
                 return True
-            return int(getattr(data, "talker_text_feedback_countdown", 0) or 0) > 0
+            return (
+                _QWEN35_ALLOW_EMPTY_TEXT_FEEDBACK
+                and int(getattr(data, "talker_text_feedback_countdown", 0) or 0) > 0
+            )
         pending_text_queue = getattr(data, "pending_text_queue", None)
         if pending_text_queue:
             return True
@@ -674,6 +695,13 @@ class QwenTalkerModelRunner(ModelRunner):
                     data.last_talker_decode_input_kind = None
                     data.last_talker_decode_should_emit = True
                     return None
+                if (
+                    available < chunk_size
+                    and not getattr(data, "thinker_chunks_done", False)
+                ):
+                    data.last_talker_decode_input_kind = None
+                    data.last_talker_decode_should_emit = True
+                    return None
                 rows_in_chunk = min(chunk_size, available)
                 data.talker_text_chunk_remaining = rows_in_chunk
                 data.talker_text_outputs_to_drop = max(0, rows_in_chunk - 1)
@@ -686,6 +714,10 @@ class QwenTalkerModelRunner(ModelRunner):
                 should_emit = False
                 row = feedback
         elif not getattr(data, "thinker_chunks_done", False):
+            if not _QWEN35_ALLOW_EMPTY_TEXT_FEEDBACK:
+                data.last_talker_decode_input_kind = None
+                data.last_talker_decode_should_emit = True
+                return None
             countdown = int(getattr(data, "talker_text_feedback_countdown", 0) or 0)
             if countdown <= 0:
                 data.last_talker_decode_input_kind = None

@@ -101,7 +101,7 @@ _VOICE_TO_SPK_MAPPING = {
 }
 _VOICE_CONTROL_SUFFIXES = ("prefix_caching",)
 _QWEN35_TALKER_NUM_OUTPUT_IN_CHUNK = 4
-_QWEN35_TALKER_TEXT_FEEDBACK_STRIDE = _QWEN35_TALKER_NUM_OUTPUT_IN_CHUNK - 1
+_QWEN35_TALKER_TEXT_FEEDBACK_STRIDE = _QWEN35_TALKER_NUM_OUTPUT_IN_CHUNK
 _QWEN35_RTC_TEXT_FILLER_PER_CHUNK = 20
 _QWEN35_RTC_AUDIO_ROWS_PER_CHUNK = 14
 _VOICE_PARAM_KEYS = ("speaker", "voice", "voice_type")
@@ -121,11 +121,10 @@ _VOICE_STYLE_CONTAINS = re.compile(
 def _qwen35_talker_text_feedback_stride() -> int:
     raw = os.environ.get("QWEN35_TALKER_TEXT_FEEDBACK_STRIDE")
     if raw is None:
-        # Qwen3.5 external-text handoff keeps countdown/drop bookkeeping at
-        # chunk boundaries. Prefill has already produced the first codec in the
-        # current chunk, so local decode first runs num_output_in_chunk - 1
-        # audible feedback steps. Before the next external text rows arrive,
-        # the runner also inserts one boundary feedback drop step.
+        # Align Qwen3.5 external-text handoff with vLLM's
+        # VLLM_OMNI_TALKER_NUM_OUTPUT_IN_CHUNK. Text rows are consumed in
+        # 4-token chunks; between chunks the talker runs four feedback steps
+        # before the boundary drop/next external text chunk.
         return _QWEN35_TALKER_TEXT_FEEDBACK_STRIDE
     try:
         return max(0, int(raw))

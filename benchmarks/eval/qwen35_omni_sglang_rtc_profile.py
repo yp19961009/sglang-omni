@@ -19,6 +19,7 @@ import json
 import math
 import os
 import statistics
+import sys
 import time
 import uuid
 import wave
@@ -164,6 +165,27 @@ def _apply_video_request_options(payload: dict[str, Any], args: argparse.Namespa
         payload["video_total_pixels"] = args.video_total_pixels
     if args.video_override_max_pixels is not None:
         payload["video_override_max_pixels"] = bool(args.video_override_max_pixels)
+
+
+def _apply_talker_request_options(payload: dict[str, Any], args: argparse.Namespace) -> None:
+    option_names = (
+        "talker_temperature",
+        "talker_top_k",
+        "talker_top_p",
+        "talker_min_p",
+        "talker_repetition_penalty",
+        "talker_seed",
+        "subtalker_temperature",
+        "subtalker_top_k",
+        "subtalker_top_p",
+        "subtalker_min_p",
+        "subtalker_repetition_penalty",
+        "subtalker_seed",
+    )
+    for name in option_names:
+        value = getattr(args, name, None)
+        if value is not None:
+            payload[name] = value
 
 
 async def _iter_sse_json(response: aiohttp.ClientResponse):
@@ -455,6 +477,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 },
             }
             _apply_video_request_options(payload, args)
+            _apply_talker_request_options(payload, args)
             t0 = time.perf_counter()
             await post_chat(session, api_url=api_url, payload=payload, stream=False)
             print(f"pre_run trunk={trunk}/{args.trunk_size} done in {(time.perf_counter()-t0):.3f}s", flush=True)
@@ -498,6 +521,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             },
         }
         _apply_video_request_options(payload, args)
+        _apply_talker_request_options(payload, args)
 
         measured = await post_chat(
             session,
@@ -519,7 +543,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         profile_out = out_dir / f"request_profile_{args.run_id}.json"
         subprocess.run(
             [
-                "python",
+                sys.executable,
                 "-m",
                 "sglang_omni.profiler",
                 str(Path(args.event_dir).resolve()),
@@ -662,6 +686,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--prerun-max-tokens", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--talker-temperature", type=float, default=None)
+    parser.add_argument("--talker-top-k", type=int, default=None)
+    parser.add_argument("--talker-top-p", type=float, default=None)
+    parser.add_argument("--talker-min-p", type=float, default=None)
+    parser.add_argument("--talker-repetition-penalty", type=float, default=None)
+    parser.add_argument("--talker-seed", type=int, default=None)
+    parser.add_argument("--subtalker-temperature", type=float, default=None)
+    parser.add_argument("--subtalker-top-k", type=int, default=None)
+    parser.add_argument("--subtalker-top-p", type=float, default=None)
+    parser.add_argument("--subtalker-min-p", type=float, default=None)
+    parser.add_argument("--subtalker-repetition-penalty", type=float, default=None)
+    parser.add_argument("--subtalker-seed", type=int, default=None)
     parser.add_argument("--voice", default="f245")
     parser.add_argument("--audio-only", action="store_true")
     parser.add_argument("--profile", action=argparse.BooleanOptionalAction, default=True)

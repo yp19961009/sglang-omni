@@ -20,7 +20,7 @@
 #   EXTRA_ARGS="--code2wav-stream-chunk-size 4" bash examples/launch_qwen35_omni_speech_server_container.sh
 #
 # 40-trunk realtime performance profile:
-#   RELAY_BACKEND=nixl TALKER_PARTIAL_START_MIN_CHUNKS=3 \
+#   RELAY_BACKEND=nixl TALKER_PARTIAL_START_MIN_CHUNKS=4 \
 #   NO_CODE2WAV_TORCH_COMPILE=0 TORCHDYNAMO_DISABLE=0 \
 #   SGLANG_OMNI_RELAY_PAYLOAD_PREP_EXECUTOR=1 \
 #   SGLANG_OMNI_COLOCATE_PREPROCESSING_WITH_THINKER=1 \
@@ -42,7 +42,7 @@
 #   NO_CODE2WAV_TORCH_COMPILE=0 TORCHDYNAMO_DISABLE=0 \
 #   SGLANG_OMNI_VIDEO_PREPROCESS_CACHE_MAX_BYTES=17179869184 \
 #   SGLANG_OMNI_VIDEO_PREPROCESS_CACHE_MAX_ENTRIES=64 \
-#   RELAY_BACKEND=nixl TALKER_PARTIAL_START_MIN_CHUNKS=3 \
+#   RELAY_BACKEND=nixl TALKER_PARTIAL_START_MIN_CHUNKS=4 \
 #   EXTRA_ARGS="--thinker-cuda-graph on --talker-cuda-graph on --talker-torch-compile on --thinker-max-running-requests 8 --talker-max-running-requests 8" \
 #   bash examples/launch_qwen35_omni_speech_server_container.sh
 
@@ -59,6 +59,7 @@ CODE2WAV_PATH="${CODE2WAV_PATH:-$MODEL_PATH/qwen3_5_omni_codec_decode_online_030
 
 # The OpenAI-compatible model name exposed by the server.
 MODEL_NAME="${MODEL_NAME:-qwen3_5-omni}"
+PYTHON="${PYTHON:-python3}"
 
 # Server listen address. Use HOST=0.0.0.0 if another machine/container needs to
 # reach this server through a mapped port.
@@ -98,8 +99,8 @@ PREFIX_CACHING="${PREFIX_CACHING:-on}"
 # realtime video payloads; leave empty to use the pipeline default.
 RELAY_BACKEND="${RELAY_BACKEND:-}"
 
-# Optional partial-start threshold override. 3 is the lowest supported value
-# and reduced 40-trunk TTFA in the realtime profile.
+# Optional partial-start threshold override. Qwen3.5 external-text handoff uses
+# 4-token chunks; use at least 4 so the first talker chunk is complete.
 TALKER_PARTIAL_START_MIN_CHUNKS="${TALKER_PARTIAL_START_MIN_CHUNKS:-}"
 
 # Server-side preprocessing is serial by default. Higher concurrency is useful
@@ -156,7 +157,7 @@ export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN="${SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN:-1}"
 
 server_args=(
-  python
+  "$PYTHON"
   -m
   sglang_omni.cli
   serve
