@@ -2397,7 +2397,7 @@ def test_qwen35_thinker_adapter_can_limit_prefix_cache_before_media(monkeypatch)
     assert captured["limit_prefix_cache_before_media"] is True
 
 
-def test_qwen35_thinker_adapter_limits_rtc_prefix_when_omitting_visual_payloads(
+def test_qwen35_thinker_adapter_keeps_rtc_media_prefix_cache_when_omitting_visual_payloads(
     monkeypatch,
 ):
     captured = {}
@@ -2432,10 +2432,10 @@ def test_qwen35_thinker_adapter_limits_rtc_prefix_when_omitting_visual_payloads(
 
     request_builder(payload)
 
-    assert captured["limit_prefix_cache_before_media"] is True
+    assert captured["limit_prefix_cache_before_media"] is False
 
 
-def test_qwen35_thinker_adapter_allows_prefix_limit_override_for_rtc_omit(
+def test_qwen35_thinker_adapter_can_force_prefix_limit_for_rtc_omit(
     monkeypatch,
 ):
     captured = {}
@@ -2445,7 +2445,7 @@ def test_qwen35_thinker_adapter_allows_prefix_limit_override_for_rtc_omit(
         captured.update(kwargs)
         return SimpleNamespace(stage_payload=None)
 
-    monkeypatch.setenv("QWEN35_LIMIT_PREFIX_CACHE_BEFORE_MEDIA", "0")
+    monkeypatch.setenv("QWEN35_LIMIT_PREFIX_CACHE_BEFORE_MEDIA", "1")
     monkeypatch.setenv("SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS", "1")
     monkeypatch.setattr(
         request_builders.qwen3_request_builders,
@@ -2470,7 +2470,7 @@ def test_qwen35_thinker_adapter_allows_prefix_limit_override_for_rtc_omit(
 
     request_builder(payload)
 
-    assert captured["limit_prefix_cache_before_media"] is False
+    assert captured["limit_prefix_cache_before_media"] is True
 
 
 def test_qwen35_thinker_adapter_can_disable_mamba_media_branching_cache(monkeypatch):

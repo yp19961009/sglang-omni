@@ -1527,12 +1527,10 @@ def _limit_prefix_cache_before_media_enabled(request: Any | None = None) -> bool
     raw = os.getenv("QWEN35_LIMIT_PREFIX_CACHE_BEFORE_MEDIA")
     if raw is not None:
         return _env_flag_enabled(raw)
-    if (
-        request is not None
-        and (_is_qwen35_rtc_prerun(request) or _is_qwen35_rtc_actual(request))
-        and _omit_cached_visual_item_payloads_enabled()
-    ):
-        return True
+    # RTC pre-runs intentionally build growing multimedia prefixes. Let those
+    # prefixes populate SGLang's radix cache even when cached visual payloads
+    # are omitted from later requests; pad_values keep media tokens stable
+    # across the session, and embed injection skips already-cached rows.
     return False
 
 
