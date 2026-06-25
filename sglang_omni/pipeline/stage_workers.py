@@ -494,9 +494,7 @@ def _construct_stage(
         return mapped_targets[0] if isinstance(targets, str) else mapped_targets
 
     # --- Build routing ---
-    if spec.is_terminal:
-        get_next = lambda request_id, output: None
-    elif spec.route_fn:
+    if spec.route_fn:
         route_fn = import_string(spec.route_fn)
         allowed_route_targets = set(_map_target_list(spec.next_stages))
 
@@ -504,10 +502,12 @@ def _construct_stage(
             return _target_result(
                 _fn(request_id, output),
                 allowed_targets=allowed_route_targets,
-                allow_empty=False,
+                allow_empty=spec.is_terminal,
                 hook_name="route_fn",
             )
 
+    elif spec.is_terminal:
+        get_next = lambda request_id, output: None
     else:
         target = spec.next_stages
         if isinstance(target, str):

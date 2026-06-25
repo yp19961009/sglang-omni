@@ -430,10 +430,20 @@ def resolve_mm_aggregate_next_stages(
     return qwen3_request_builders.THINKER_STAGE
 
 
+def resolve_thinker_next_stages(
+    request_id: str, output: StagePayload
+) -> str | list[str] | None:
+    if _is_qwen35_rtc_thinker_terminal_prerun(output.request):
+        return None
+    return qwen3_request_builders.resolve_thinker_next_stages(request_id, output)
+
+
 def resolve_thinker_stream_done_targets(
     request_id: str, output: StagePayload
 ) -> list[str]:
     del request_id
+    if _is_qwen35_rtc_thinker_terminal_prerun(output.request):
+        return []
     if should_generate_audio_output(output):
         return [
             qwen3_request_builders.TALKER_STAGE,
@@ -443,6 +453,8 @@ def resolve_thinker_stream_done_targets(
 
 
 def resolve_terminal_stages(request: OmniRequest) -> list[str]:
+    if _is_qwen35_rtc_thinker_terminal_prerun(request):
+        return [qwen3_request_builders.THINKER_STAGE]
     if should_generate_audio_output(request):
         return [
             qwen3_request_builders.DECODE_STAGE,
@@ -1555,9 +1567,25 @@ def _rtc_isolate_prerun_prefill_enabled() -> bool:
     return _env_flag_enabled(raw, default=True)
 
 
+def _rtc_prerun_thinker_terminal_enabled() -> bool:
+    raw = os.getenv("QWEN35_RTC_PRERUN_THINKER_TERMINAL")
+    return _env_flag_enabled(raw, default=False)
+
+
 def _is_qwen35_rtc_prerun(request: Any) -> bool:
     metadata = getattr(request, "metadata", None)
     return isinstance(metadata, dict) and bool(metadata.get("pre_run"))
+
+
+def _is_qwen35_rtc_prefill_only_prerun(request: Any) -> bool:
+    return _rtc_prerun_prefill_only_enabled() and _is_qwen35_rtc_prerun(request)
+
+
+def _is_qwen35_rtc_thinker_terminal_prerun(request: Any) -> bool:
+    return (
+        _is_qwen35_rtc_prefill_only_prerun(request)
+        and _rtc_prerun_thinker_terminal_enabled()
+    )
 
 
 def _is_qwen35_rtc_actual(request: Any) -> bool:
@@ -1569,10 +1597,7 @@ def _is_qwen35_rtc_actual(request: Any) -> bool:
 
 
 def _params_for_qwen35_prerun(params: dict[str, Any], request: Any) -> dict[str, Any]:
-    if (
-        not _rtc_prerun_prefill_only_enabled()
-        or not _is_qwen35_rtc_prerun(request)
-    ):
+    if not _is_qwen35_rtc_prefill_only_prerun(request):
         return params
 
     # RTC pre_run is a cache-warm/prefix-extension request. Letting it generate
@@ -1583,6 +1608,36 @@ def _params_for_qwen35_prerun(params: dict[str, Any], request: Any) -> dict[str,
     adjusted["max_completion_tokens"] = 0
     adjusted["max_new_tokens"] = 0
     return adjusted
+
+
+def _sequence_length(value: Any) -> int | None:
+    if value is None:
+        return None
+    numel = getattr(value, "numel", None)
+    if callable(numel):
+        try:
+            return int(numel())
+        except (TypeError, ValueError):
+            return None
+    try:
+        return len(value)
+    except TypeError:
+        return None
+
+
+def _qwen35_prerun_terminal_result(data: Any) -> dict[str, Any]:
+    prompt_tokens = _sequence_length(getattr(data, "input_ids", None))
+    completion_tokens = _sequence_length(getattr(data, "output_ids", None)) or 0
+    usage: dict[str, int] = {"completion_tokens": completion_tokens}
+    if prompt_tokens is not None:
+        usage["prompt_tokens"] = prompt_tokens
+        usage["total_tokens"] = prompt_tokens + completion_tokens
+
+    return {
+        "text": "",
+        "finish_reason": getattr(data, "finish_reason", None) or "stop",
+        "usage": usage,
+    }
 
 
 def _metadata_length(value: Any) -> int | None:
@@ -1820,6 +1875,12 @@ def make_thinker_scheduler_adapters(
 
     def result_adapter(data):
         payload = data.stage_payload
+        if _is_qwen35_rtc_thinker_terminal_prerun(payload.request):
+            return payload.__class__(
+                request_id=payload.request_id,
+                request=payload.request,
+                data=_qwen35_prerun_terminal_result(data),
+            )
         state = Qwen3OmniPipelineState.from_dict(payload.data)
         qwen3_request_builders.apply_thinker_result(
             state,

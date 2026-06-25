@@ -251,6 +251,7 @@ def _thinker_stage(*, gpu: int, speech_enabled: bool, process: str) -> StageConf
         factory=f"{_PKG}.stages.create_sglang_thinker_executor_from_config",
         factory_args=factory_args,
         gpu=gpu,
+        terminal=speech_enabled,
         runtime=_qwen35_ar_runtime(),
         runtime_arg_map={"max_seq_len": "thinker_max_seq_len"},
         next="decode",

@@ -65,7 +65,7 @@ def test_invalid_stage_runtime_values_raise() -> None:
 
 
 def test_stage_rejects_terminal_with_next() -> None:
-    with pytest.raises(ValueError, match="exactly one"):
+    with pytest.raises(ValueError, match="must set route_fn"):
         PipelineConfig(
             model_path="dummy",
             stages=[
@@ -73,6 +73,23 @@ def test_stage_rejects_terminal_with_next() -> None:
                 _stage(name="sink"),
             ],
         )
+
+
+def test_stage_allows_route_fn_to_choose_downstream_or_terminal() -> None:
+    config = PipelineConfig(
+        model_path="dummy",
+        stages=[
+            _stage(
+                name="source",
+                next="sink",
+                terminal=True,
+                route_fn="tests.unit_test.fixtures.pipeline_fakes.identity_route",
+            ),
+            _stage(name="sink"),
+        ],
+    )
+
+    assert config.terminal_stages == ["source", "sink"]
 
 
 def test_tp_size_normalizes_into_parallelism_tp() -> None:

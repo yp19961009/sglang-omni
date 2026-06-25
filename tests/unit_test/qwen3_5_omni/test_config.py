@@ -82,6 +82,14 @@ def test_qwen35_omni_stage_factories_are_model_specific():
     )
 
 
+def test_qwen35_speech_terminal_whitelist_allows_rtc_prerun_thinker_terminal():
+    speech_config = Qwen35OmniSpeechPipelineConfig(model_path="dummy")
+    text_config = Qwen35OmniPipelineConfig(model_path="dummy")
+
+    assert speech_config.terminal_stages == ["thinker", "decode", "code2wav"]
+    assert text_config.terminal_stages == ["decode"]
+
+
 def test_qwen35_omni_can_colocate_mm_aggregate_with_thinker(monkeypatch):
     monkeypatch.setenv("SGLANG_OMNI_COLOCATE_MM_AGGREGATE_WITH_THINKER", "1")
     config = Qwen35OmniSpeechPipelineConfig(model_path="dummy")

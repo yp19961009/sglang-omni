@@ -209,6 +209,73 @@ def test_qwen35_audio_output_resolvers_honor_params_modalities():
     assert request_builders.resolve_terminal_stages(payload.request) == ["decode"]
 
 
+def test_qwen35_rtc_prerun_resolvers_keep_decode_terminal_by_default(monkeypatch):
+    monkeypatch.delenv("QWEN35_RTC_PRERUN_PREFILL_ONLY", raising=False)
+    monkeypatch.delenv("QWEN35_RTC_PRERUN_THINKER_TERMINAL", raising=False)
+    payload = StagePayload(
+        request_id="req-prerun",
+        request=OmniRequest(
+            inputs={},
+            params={"modalities": ["text"]},
+            metadata={"pre_run": True, "media_cache_namespace": "rtc:req-0"},
+        ),
+        data={},
+    )
+
+    assert request_builders.resolve_thinker_next_stages(
+        "req-prerun", payload
+    ) == "decode"
+    assert request_builders.resolve_thinker_stream_done_targets(
+        "req-prerun", payload
+    ) == ["decode"]
+    assert request_builders.resolve_terminal_stages(payload.request) == ["decode"]
+
+
+def test_qwen35_rtc_prerun_resolvers_can_terminate_at_thinker(monkeypatch):
+    monkeypatch.delenv("QWEN35_RTC_PRERUN_PREFILL_ONLY", raising=False)
+    monkeypatch.setenv("QWEN35_RTC_PRERUN_THINKER_TERMINAL", "1")
+    payload = StagePayload(
+        request_id="req-prerun",
+        request=OmniRequest(
+            inputs={},
+            params={"modalities": ["text", "audio"]},
+            metadata={"pre_run": True, "media_cache_namespace": "rtc:req-0"},
+        ),
+        data={},
+    )
+
+    assert request_builders.resolve_thinker_next_stages("req-prerun", payload) is None
+    assert request_builders.resolve_thinker_stream_done_targets(
+        "req-prerun", payload
+    ) == []
+    assert request_builders.resolve_terminal_stages(payload.request) == ["thinker"]
+
+
+def test_qwen35_rtc_prerun_resolvers_can_keep_generation(monkeypatch):
+    monkeypatch.setenv("QWEN35_RTC_PRERUN_PREFILL_ONLY", "0")
+    monkeypatch.setenv("QWEN35_RTC_PRERUN_THINKER_TERMINAL", "1")
+    payload = StagePayload(
+        request_id="req-prerun",
+        request=OmniRequest(
+            inputs={},
+            params={"modalities": ["text", "audio"]},
+            metadata={"pre_run": True, "media_cache_namespace": "rtc:req-0"},
+        ),
+        data={},
+    )
+
+    assert request_builders.resolve_thinker_next_stages(
+        "req-prerun", payload
+    ) == "decode"
+    assert request_builders.resolve_thinker_stream_done_targets(
+        "req-prerun", payload
+    ) == ["talker_ar", "decode"]
+    assert request_builders.resolve_terminal_stages(payload.request) == [
+        "decode",
+        "code2wav",
+    ]
+
+
 def test_qwen35_mm_aggregate_to_thinker_projection_is_isolated():
     model_inputs = {"video_embeds": torch.ones(2, 4)}
     state = Qwen3OmniPipelineState(
@@ -2617,6 +2684,44 @@ def test_qwen35_thinker_adapter_makes_rtc_prerun_prefill_only(monkeypatch):
     assert captured["params"]["max_tokens"] == 0
     assert captured["params"]["max_completion_tokens"] == 0
     assert captured["params"]["max_new_tokens"] == 0
+
+
+def test_qwen35_thinker_adapter_returns_lightweight_rtc_prerun_result(monkeypatch):
+    monkeypatch.delenv("QWEN35_RTC_PRERUN_PREFILL_ONLY", raising=False)
+    monkeypatch.setenv("QWEN35_RTC_PRERUN_THINKER_TERMINAL", "1")
+    _, result_adapter = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    payload = StagePayload(
+        request_id="req-prerun",
+        request=OmniRequest(
+            inputs={},
+            metadata={"pre_run": True, "media_cache_namespace": "rtc:req-0"},
+        ),
+        data={"large": torch.ones(4)},
+    )
+    data = SimpleNamespace(
+        stage_payload=payload,
+        input_ids=torch.tensor([1, 2, 3]),
+        output_ids=[],
+        finish_reason=None,
+    )
+
+    result = result_adapter(data)
+
+    assert result.request_id == "req-prerun"
+    assert result.request is payload.request
+    assert result.data == {
+        "text": "",
+        "finish_reason": "stop",
+        "usage": {
+            "prompt_tokens": 3,
+            "completion_tokens": 0,
+            "total_tokens": 3,
+        },
+    }
 
 
 def test_qwen35_thinker_adapter_marks_rtc_prerun_isolated_before_req_init(

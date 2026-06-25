@@ -609,11 +609,16 @@ class PipelineConfig(BaseModel):
             if not s.factory:
                 raise ValueError(f"Stage {s.name!r} missing factory")
             has_next = s.next is not None
-            if has_next == bool(s.terminal):
+            if not has_next and not s.terminal:
                 raise ValueError(
                     f"Stage {s.name!r} must set exactly one of 'next' or 'terminal'"
                 )
-            if s.terminal and s.route_fn is not None:
+            if has_next and s.terminal and s.route_fn is None:
+                raise ValueError(
+                    f"Stage {s.name!r} must set route_fn when both 'next' "
+                    "and 'terminal' are configured"
+                )
+            if s.terminal and s.route_fn is not None and not has_next:
                 raise ValueError(
                     f"Stage {s.name!r} cannot set route_fn on a terminal stage"
                 )
