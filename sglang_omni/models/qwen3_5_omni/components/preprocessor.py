@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import copy
 import logging
 import math
 import os
@@ -290,6 +291,22 @@ def _video_entry_with_empty_pixels(
     trimmed = dict(video_inputs)
     trimmed["pixel_values_videos"] = _slice_first_dim(pixels, 0, 0)
     return trimmed, metadata
+
+
+def _clone_processor_cache_value(value: Any) -> Any:
+    if _is_torch_tensor(value):
+        return value.detach().clone()
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    if isinstance(value, dict):
+        return {key: _clone_processor_cache_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_clone_processor_cache_value(item) for item in value)
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        pass
+    return value
 
 
 def _emit_processor_profile_event(
@@ -945,7 +962,7 @@ class _Qwen35ProcessorShim:
         except KeyError:
             return None
         cache[cache_key] = value
-        return value
+        return _clone_processor_cache_value(value)
 
     def _processor_cache_set(
         self,
@@ -955,7 +972,7 @@ class _Qwen35ProcessorShim:
     ) -> None:
         if cache_key is None:
             return
-        cache[cache_key] = value
+        cache[cache_key] = _clone_processor_cache_value(value)
         cache.move_to_end(cache_key)
         while len(cache) > _PROCESSOR_ITEM_CACHE_MAX_ENTRIES:
             cache.popitem(last=False)
@@ -1083,11 +1100,10 @@ class _Qwen35ProcessorShim:
                 if special_token in (self.video_token_block, self.video_token):
                     metadata = next(video_metadata)
                     use_audio = next(use_audio_in_video)
-                    if getattr(metadata, "fps", None) is None:
-                        metadata.fps = 24
+                    metadata_fps = getattr(metadata, "fps", None) or 24
                     return self._get_video_tokens(
                         metadata.frames_indices,
-                        metadata.fps,
+                        metadata_fps,
                         next(video_grid_thw),
                         self.image_processor.merge_size,
                         audio_tokens_per_second if use_audio else None,
@@ -1132,8 +1148,10 @@ class _Qwen35ProcessorShim:
         audio_tokens_per_second: int | None = None,
         audio_length: int | None = None,
     ):
-        if not isinstance(indices, list):
+        if hasattr(indices, "tolist"):
             indices = indices.tolist()
+        else:
+            indices = list(indices)
         if len(indices) % merge_size != 0:
             indices.extend(
                 indices[-1] for _ in range(merge_size - len(indices) % merge_size)
