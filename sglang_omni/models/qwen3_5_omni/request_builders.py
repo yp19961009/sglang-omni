@@ -1536,8 +1536,14 @@ def _limit_prefix_cache_before_media_enabled(request: Any | None = None) -> bool
     return False
 
 
-def _mamba_media_branching_cache_enabled() -> bool:
+def _mamba_media_branching_cache_enabled(request: Any | None = None) -> bool:
     raw = os.getenv("QWEN35_MAMBA_MEDIA_BRANCH_CACHE")
+    if raw is None and (
+        request is not None
+        and (_is_qwen35_rtc_prerun(request) or _is_qwen35_rtc_actual(request))
+        and _omit_cached_visual_item_payloads_enabled()
+    ):
+        return False
     return _env_flag_enabled(raw, default=True)
 
 
@@ -1798,7 +1804,9 @@ def make_thinker_scheduler_adapters(
             limit_prefix_cache_before_media=_limit_prefix_cache_before_media_enabled(
                 payload.request
             ),
-            mamba_media_branching_cache=_mamba_media_branching_cache_enabled(),
+            mamba_media_branching_cache=_mamba_media_branching_cache_enabled(
+                payload.request
+            ),
         )
         req = getattr(req_data, "req", None)
         if (

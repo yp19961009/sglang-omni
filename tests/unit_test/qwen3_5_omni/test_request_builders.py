@@ -2505,6 +2505,82 @@ def test_qwen35_thinker_adapter_can_disable_mamba_media_branching_cache(monkeypa
     assert captured["mamba_media_branching_cache"] is False
 
 
+def test_qwen35_thinker_adapter_disables_mamba_branching_for_rtc_omit_by_default(
+    monkeypatch,
+):
+    captured = {}
+
+    def _fake_build_sglang_thinker_request(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return SimpleNamespace(stage_payload=None)
+
+    monkeypatch.delenv("QWEN35_MAMBA_MEDIA_BRANCH_CACHE", raising=False)
+    monkeypatch.setenv("SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS", "1")
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "build_sglang_thinker_request",
+        _fake_build_sglang_thinker_request,
+    )
+
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    state = Qwen3OmniPipelineState(prompt={"input_ids": torch.tensor([1])})
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(
+            inputs={},
+            metadata={"pre_run": True, "media_cache_namespace": "rtc:req-0"},
+        ),
+        data=state.to_dict(),
+    )
+
+    request_builder(payload)
+
+    assert captured["mamba_media_branching_cache"] is False
+
+
+def test_qwen35_thinker_adapter_can_force_mamba_branching_for_rtc_omit(
+    monkeypatch,
+):
+    captured = {}
+
+    def _fake_build_sglang_thinker_request(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return SimpleNamespace(stage_payload=None)
+
+    monkeypatch.setenv("QWEN35_MAMBA_MEDIA_BRANCH_CACHE", "1")
+    monkeypatch.setenv("SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS", "1")
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "build_sglang_thinker_request",
+        _fake_build_sglang_thinker_request,
+    )
+
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    state = Qwen3OmniPipelineState(prompt={"input_ids": torch.tensor([1])})
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(
+            inputs={},
+            metadata={"pre_run": True, "media_cache_namespace": "rtc:req-0"},
+        ),
+        data=state.to_dict(),
+    )
+
+    request_builder(payload)
+
+    assert captured["mamba_media_branching_cache"] is True
+
+
 def test_qwen35_thinker_adapter_makes_rtc_prerun_prefill_only(monkeypatch):
     monkeypatch.delenv("QWEN35_RTC_PRERUN_PREFILL_ONLY", raising=False)
     captured = {}
