@@ -34,6 +34,11 @@ TALKER_MEM_FRACTION_STATIC="${TALKER_MEM_FRACTION_STATIC:-}"
 ENCODER_MEM_RESERVE="${ENCODER_MEM_RESERVE:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
+# Qwen3.5 RTC emits tiny decode-token stream chunks alongside larger talker
+# chunks. Keep those CPU-only chunks on the control plane to avoid relay queue
+# tails without biasing the whole stage control plane away from audio work.
+export SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES="${SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES:-4096}"
+
 server_args=(
   python
   -m
@@ -97,6 +102,7 @@ printf -v quoted_server_cmd "%q " "${server_args[@]}"
 echo "[qwen35] launching SGLang server in container=$CONTAINER"
 echo "[qwen35] model=$MODEL_PATH"
 echo "[qwen35] listen=http://$HOST:$PORT voice=$VOICE_TYPE prefix_caching=$PREFIX_CACHING"
+echo "[qwen35] stream_inline_cpu_max_bytes=$SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES"
 
 docker exec "${docker_env_args[@]}" "$CONTAINER" bash -lc \
   "cd $quoted_workdir && \
