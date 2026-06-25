@@ -31,6 +31,21 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _stage_env_suffix(stage_name: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in stage_name.upper())
+
+
+def _stage_env_int(name: str, stage_name: str, default: int) -> int:
+    stage_name = _stage_env_suffix(stage_name)
+    stage_value = os.getenv(f"{name}_{stage_name}")
+    if stage_value is not None and stage_value != "":
+        try:
+            return int(stage_value)
+        except ValueError:
+            return default
+    return _env_int(name, default)
+
+
 def serialize_message(
     msg: (
         DataReadyMessage
@@ -317,10 +332,20 @@ class StageControlPlane:
         self._next_stage_sockets: dict[str, PushSocket] = {}
         self._next_stage_stream_sockets: dict[str, PushSocket] = {}
         self._stream_priority_burst = max(
-            1, _env_int("SGLANG_OMNI_STREAM_PRIORITY_BURST", 4)
+            1,
+            _stage_env_int(
+                "SGLANG_OMNI_STREAM_PRIORITY_BURST",
+                stage_name,
+                4,
+            ),
         )
         self._stream_priority_normal_wait_ms = max(
-            0, _env_int("SGLANG_OMNI_STREAM_PRIORITY_NORMAL_WAIT_MS", 2)
+            0,
+            _stage_env_int(
+                "SGLANG_OMNI_STREAM_PRIORITY_NORMAL_WAIT_MS",
+                stage_name,
+                2,
+            ),
         )
         self._consecutive_stream_receives = 0
 

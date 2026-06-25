@@ -1183,6 +1183,62 @@ def test_control_plane_stream_priority_allows_normal_payload_fairness(
     asyncio.run(_run())
 
 
+def test_control_plane_stream_priority_stage_override(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_STREAM_PRIORITY_BURST", "2")
+    monkeypatch.setenv("SGLANG_OMNI_STREAM_PRIORITY_BURST_DECODE", "3")
+
+    async def _run() -> None:
+        normal_endpoint = f"ipc://{tmp_path}/normal_override.sock"
+        stream_endpoint = f"ipc://{tmp_path}/stream_override.sock"
+        coordinator_endpoint = f"ipc://{tmp_path}/coordinator_override.sock"
+        abort_endpoint = f"ipc://{tmp_path}/abort_override.sock"
+        control_plane = StageControlPlane(
+            "decode",
+            normal_endpoint,
+            coordinator_endpoint,
+            abort_endpoint,
+            stream_recv_endpoint=stream_endpoint,
+        )
+        await control_plane.start()
+        normal_sender = PushSocket(normal_endpoint)
+        stream_sender = PushSocket(stream_endpoint)
+        await normal_sender.connect()
+        await stream_sender.connect()
+        await asyncio.sleep(0.05)
+
+        def make_msg(request_id: str) -> DataReadyMessage:
+            return DataReadyMessage(
+                request_id=request_id,
+                from_stage="thinker",
+                to_stage="decode",
+                shm_metadata={},
+            )
+
+        try:
+            await normal_sender.send(make_msg("normal"))
+            for idx in range(4):
+                await stream_sender.send(make_msg(f"stream{idx}"))
+            await asyncio.sleep(0.05)
+
+            received = [(await control_plane.recv()).request_id for _ in range(5)]
+            assert received == [
+                "stream0",
+                "stream1",
+                "stream2",
+                "normal",
+                "stream3",
+            ]
+        finally:
+            normal_sender.close()
+            stream_sender.close()
+            control_plane.close()
+            ControlPlaneContext.close()
+
+    asyncio.run(_run())
+
+
 def test_async_stream_ingest_does_not_block_message_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

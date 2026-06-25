@@ -35,9 +35,12 @@ ENCODER_MEM_RESERVE="${ENCODER_MEM_RESERVE:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 # Qwen3.5 RTC emits tiny decode-token stream chunks alongside larger talker
-# chunks. Keep those CPU-only chunks on the control plane to avoid relay queue
-# tails without biasing the whole stage control plane away from audio work.
+# chunks. Keep those CPU-only chunks on the control plane and prioritize the
+# decode stage stream without changing stream fairness for audio stages.
 export SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES="${SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES:-4096}"
+export SGLANG_OMNI_STREAM_PRIORITY_BURST_DECODE="${SGLANG_OMNI_STREAM_PRIORITY_BURST_DECODE:-256}"
+export SGLANG_OMNI_STREAM_PRIORITY_NORMAL_WAIT_MS_DECODE="${SGLANG_OMNI_STREAM_PRIORITY_NORMAL_WAIT_MS_DECODE:-0}"
+export SGLANG_OMNI_DEFER_PREFILL_DURING_PRIORITY_DECODE="${SGLANG_OMNI_DEFER_PREFILL_DURING_PRIORITY_DECODE:-1}"
 
 server_args=(
   python
@@ -102,7 +105,7 @@ printf -v quoted_server_cmd "%q " "${server_args[@]}"
 echo "[qwen35] launching SGLang server in container=$CONTAINER"
 echo "[qwen35] model=$MODEL_PATH"
 echo "[qwen35] listen=http://$HOST:$PORT voice=$VOICE_TYPE prefix_caching=$PREFIX_CACHING"
-echo "[qwen35] stream_inline_cpu_max_bytes=$SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES"
+echo "[qwen35] stream_inline_cpu_max_bytes=$SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES decode_stream_priority_burst=$SGLANG_OMNI_STREAM_PRIORITY_BURST_DECODE decode_stream_priority_normal_wait_ms=$SGLANG_OMNI_STREAM_PRIORITY_NORMAL_WAIT_MS_DECODE defer_prefill_during_priority_decode=$SGLANG_OMNI_DEFER_PREFILL_DURING_PRIORITY_DECODE"
 
 docker exec "${docker_env_args[@]}" "$CONTAINER" bash -lc \
   "cd $quoted_workdir && \
