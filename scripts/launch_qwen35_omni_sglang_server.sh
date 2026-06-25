@@ -28,6 +28,10 @@ GPU_CODE2WAV="${GPU_CODE2WAV:-1}"
 THINKER_MAX_SEQ_LEN="${THINKER_MAX_SEQ_LEN:-192000}"
 PREFIX_CACHING="${PREFIX_CACHING:-on}"
 NO_CODE2WAV_TORCH_COMPILE="${NO_CODE2WAV_TORCH_COMPILE:-1}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-}"
+THINKER_MEM_FRACTION_STATIC="${THINKER_MEM_FRACTION_STATIC:-}"
+TALKER_MEM_FRACTION_STATIC="${TALKER_MEM_FRACTION_STATIC:-}"
+ENCODER_MEM_RESERVE="${ENCODER_MEM_RESERVE:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 server_args=(
@@ -56,11 +60,36 @@ if [[ "$NO_CODE2WAV_TORCH_COMPILE" == "1" ]]; then
   server_args+=(--no-code2wav-torch-compile)
 fi
 
+if [[ -n "$MEM_FRACTION_STATIC" ]]; then
+  server_args+=(--mem-fraction-static "$MEM_FRACTION_STATIC")
+fi
+
+if [[ -n "$THINKER_MEM_FRACTION_STATIC" ]]; then
+  server_args+=(--thinker-mem-fraction-static "$THINKER_MEM_FRACTION_STATIC")
+fi
+
+if [[ -n "$TALKER_MEM_FRACTION_STATIC" ]]; then
+  server_args+=(--talker-mem-fraction-static "$TALKER_MEM_FRACTION_STATIC")
+fi
+
+if [[ -n "$ENCODER_MEM_RESERVE" ]]; then
+  server_args+=(--encoder-mem-reserve "$ENCODER_MEM_RESERVE")
+fi
+
 if [[ -n "$EXTRA_ARGS" ]]; then
   # shellcheck disable=SC2206
   extra_args_array=($EXTRA_ARGS)
   server_args+=("${extra_args_array[@]}")
 fi
+
+docker_env_args=()
+for env_name in $(env | sed -n 's/^\([^=][A-Za-z0-9_]*\)=.*/\1/p'); do
+  case "$env_name" in
+    QWEN35_* | SGLANG_OMNI_* | RELAY_BACKEND | PREPROCESSING_MAX_CONCURRENCY | TALKER_PARTIAL_START_MIN_CHUNKS | TORCHDYNAMO_DISABLE | PYTORCH_CUDA_ALLOC_CONF)
+      docker_env_args+=(-e "$env_name=${!env_name}")
+      ;;
+  esac
+done
 
 printf -v quoted_workdir "%q" "$WORKDIR"
 printf -v quoted_server_cmd "%q " "${server_args[@]}"
@@ -69,7 +98,7 @@ echo "[qwen35] launching SGLang server in container=$CONTAINER"
 echo "[qwen35] model=$MODEL_PATH"
 echo "[qwen35] listen=http://$HOST:$PORT voice=$VOICE_TYPE prefix_caching=$PREFIX_CACHING"
 
-docker exec "$CONTAINER" bash -lc \
+docker exec "${docker_env_args[@]}" "$CONTAINER" bash -lc \
   "cd $quoted_workdir && \
    export PYTHONPATH=$quoted_workdir:\${PYTHONPATH:-} && \
    export TORCHDYNAMO_DISABLE=\${TORCHDYNAMO_DISABLE:-1} && \

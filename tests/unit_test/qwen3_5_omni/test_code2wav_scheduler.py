@@ -7,6 +7,7 @@ import torch
 
 from sglang_omni.models.qwen3_5_omni.components.code2wav_scheduler import (
     Qwen35Code2WavScheduler,
+    _warmup_code2wav_decode,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 
@@ -74,3 +75,59 @@ def test_qwen35_code2wav_reads_nested_quantizer_bins():
 
     assert scheduler._codec_codebook_size() == 2048
     assert scheduler._should_skip_invalid_codec_row("req-1", chunk)
+
+
+class _WarmupModel:
+    total_upsample = 1
+    codebook_nums = 16
+
+    def __init__(self) -> None:
+        self.calls: list[torch.Tensor] = []
+
+    def decode(self, codes: torch.Tensor) -> torch.Tensor:
+        self.calls.append(codes.detach().clone())
+        return torch.zeros(1, 1)
+
+
+def test_qwen35_code2wav_compile_warmup_matches_first_chunk_shape(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_QWEN35_CODE2WAV_COMPILE_WARMUP", "1")
+    model = _WarmupModel()
+
+    assert _warmup_code2wav_decode(
+        model,
+        device="cpu",
+        stream_chunk_size=4,
+        left_context_size=25,
+    )
+
+    assert len(model.calls) == 1
+    assert tuple(model.calls[0].shape) == (1, 32, 16)
+    assert model.calls[0].dtype == torch.long
+
+
+def test_qwen35_code2wav_compile_warmup_defaults_off(monkeypatch):
+    monkeypatch.delenv("SGLANG_OMNI_QWEN35_CODE2WAV_COMPILE_WARMUP", raising=False)
+    model = _WarmupModel()
+
+    assert not _warmup_code2wav_decode(
+        model,
+        device="cpu",
+        stream_chunk_size=4,
+        left_context_size=25,
+    )
+
+    assert model.calls == []
+
+
+def test_qwen35_code2wav_compile_warmup_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_QWEN35_CODE2WAV_COMPILE_WARMUP", "0")
+    model = _WarmupModel()
+
+    assert not _warmup_code2wav_decode(
+        model,
+        device="cpu",
+        stream_chunk_size=4,
+        left_context_size=25,
+    )
+
+    assert model.calls == []

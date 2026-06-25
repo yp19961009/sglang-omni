@@ -12,6 +12,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -338,6 +339,13 @@ def _coerce_optional_bool(value: Any, *, option_name: str) -> bool | None:
     if value is None:
         return None
     return _coerce_bool(value, option_name=option_name)
+
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _coalesce_alias_value(
@@ -945,6 +953,77 @@ def _apply_code2wav_torch_compile(
     return model
 
 
+def _code2wav_code_group_count(model: Any) -> int:
+    value = getattr(model, "codebook_nums", None)
+    if value is not None:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = 0
+        if parsed > 0:
+            return parsed
+
+    code_embeddings = getattr(model, "code_embeddings", None)
+    if code_embeddings is not None:
+        try:
+            parsed = len(code_embeddings)
+        except TypeError:
+            parsed = 0
+        if parsed > 0:
+            return parsed
+
+    return 16
+
+
+def _warmup_code2wav_decode(
+    model: Any,
+    *,
+    device: str,
+    stream_chunk_size: int,
+    left_context_size: int,
+) -> bool:
+    if not _env_flag(
+        "SGLANG_OMNI_QWEN35_CODE2WAV_COMPILE_WARMUP",
+        default=False,
+    ):
+        return False
+
+    torch_device = torch.device(device)
+    chunk_size = max(int(stream_chunk_size), 1)
+    left_context = max(int(left_context_size), 0)
+    padding_interval = ((left_context + chunk_size) // 8 + 1) * 8
+    padding_to = max(chunk_size, padding_interval)
+    if padding_to % padding_interval != 0:
+        padding_to += padding_interval - (padding_to % padding_interval)
+
+    code_groups = _code2wav_code_group_count(model)
+    codes = torch.zeros(
+        (1, padding_to, code_groups),
+        dtype=torch.long,
+        device=torch_device,
+    )
+    try:
+        with torch.inference_mode():
+            if torch_device.type == "cuda":
+                torch.cuda.set_device(torch_device)
+            decode = getattr(model, "decode", None)
+            if callable(decode):
+                decode(codes)
+            else:
+                model(codes.transpose(1, 2).contiguous())
+        if torch_device.type == "cuda":
+            torch.cuda.synchronize(torch_device)
+    except Exception:
+        logger.exception("Qwen3.5 code2wav compile warmup failed")
+        return False
+
+    logger.info(
+        "Qwen3.5 code2wav compile warmup completed shape=%s",
+        tuple(codes.shape),
+    )
+    return True
+
+
 def _get_nested_attr(obj: Any, path: tuple[str, ...]) -> Any | None:
     current = obj
     for name in path:
@@ -1299,6 +1378,12 @@ def create_code2wav_scheduler(
             model = _apply_code2wav_torch_compile(
                 model,
                 compile_first_chunk=bool(compile_first_chunk),
+            )
+            _warmup_code2wav_decode(
+                model,
+                device=device,
+                stream_chunk_size=stream_chunk_size,
+                left_context_size=left_context_size,
             )
         return Qwen35Code2WavScheduler(
             model,
