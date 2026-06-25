@@ -15,12 +15,18 @@ from __future__ import annotations
 import importlib
 import logging
 import math
+import os
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sglang.srt.layers.sampler import multinomial_with_seed
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_executor.cuda_graph_runner import (
+    get_is_capture_mode,
+    set_torch_compile_config,
+)
 from sglang_omni.vendor.sglang.layers import ReplicatedLinear
 
 logger = logging.getLogger(__name__)
@@ -131,7 +137,7 @@ def _apply_top_k(logits: torch.Tensor, top_k: torch.Tensor) -> torch.Tensor:
     vocab_size = logits.shape[-1]
     top_k = top_k.to(device=logits.device, dtype=torch.long).clamp(min=0)
     active = (top_k > 0) & (top_k < vocab_size)
-    if not bool(active.any()):
+    if not get_is_capture_mode() and not bool(active.any()):
         return logits
 
     sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
@@ -146,16 +152,14 @@ def _apply_top_k(logits: torch.Tensor, top_k: torch.Tensor) -> torch.Tensor:
 def _apply_top_p(logits: torch.Tensor, top_p: torch.Tensor) -> torch.Tensor:
     top_p = top_p.to(device=logits.device, dtype=torch.float32).clamp(0.0, 1.0)
     active = top_p < 1.0
-    if not bool(active.any()):
+    if not get_is_capture_mode() and not bool(active.any()):
         return logits
 
     sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
     probs = F.softmax(sorted_logits, dim=-1, dtype=torch.float32)
     cumulative = torch.cumsum(probs, dim=-1)
     remove = cumulative > top_p.unsqueeze(1)
-    shifted = remove.clone()
-    shifted[:, 1:] = remove[:, :-1]
-    shifted[:, 0] = False
+    shifted = torch.cat([torch.zeros_like(remove[:, :1]), remove[:, :-1]], dim=1)
     remove = shifted & active.unsqueeze(1)
     sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
     filtered = torch.full_like(logits, float("-inf"))
@@ -165,7 +169,7 @@ def _apply_top_p(logits: torch.Tensor, top_p: torch.Tensor) -> torch.Tensor:
 def _apply_min_p(logits: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
     min_p = min_p.to(device=logits.device, dtype=torch.float32).clamp(0.0, 1.0)
     active = min_p > 0
-    if not bool(active.any()):
+    if not get_is_capture_mode() and not bool(active.any()):
         return logits
 
     probs = F.softmax(logits, dim=-1, dtype=torch.float32)
@@ -188,7 +192,7 @@ def _sample_logits(
     temperature = temperature.to(device=logits.device, dtype=torch.float32)
     greedy = temperature <= 0
     greedy_ids = torch.argmax(logits, dim=-1)
-    if bool(greedy.all()):
+    if not get_is_capture_mode() and bool(greedy.all()):
         return greedy_ids
 
     scaled = logits / temperature.clamp_min(1.0e-6).unsqueeze(1)
@@ -204,20 +208,55 @@ def _sample_logits(
         sampled = probs.div_(noise).argmax(dim=-1)
     else:
         seed = seed.to(device=logits.device, dtype=torch.long).reshape(-1)
-        sampled = torch.empty(logits.shape[0], dtype=torch.long, device=logits.device)
-        for row_idx in range(logits.shape[0]):
-            if bool(greedy[row_idx]):
-                sampled[row_idx] = greedy_ids[row_idx]
-                continue
-            noise = torch.empty_like(probs[row_idx])
-            if int(seed[row_idx].item()) >= 0:
-                generator = torch.Generator(device=logits.device)
-                generator.manual_seed(int(seed[row_idx].item()))
-                noise.exponential_(generator=generator)
-            else:
-                noise.exponential_()
-            sampled[row_idx] = probs[row_idx].div(noise).argmax(dim=-1)
+        positions = torch.arange(
+            logits.shape[0],
+            dtype=torch.long,
+            device=logits.device,
+        )
+        enabled_seed = seed >= 0
+        effective_seed = torch.where(
+            enabled_seed,
+            seed,
+            _disabled_seed_capture_fallback(seed),
+        )
+        seeded = multinomial_with_seed(
+            probs,
+            effective_seed,
+            positions,
+        ).view(-1)
+        if get_is_capture_mode() or not bool((~enabled_seed).any()):
+            sampled = seeded
+        else:
+            noise = torch.empty_like(probs)
+            noise.exponential_()
+            unseeded = probs.div_(noise).argmax(dim=-1)
+            sampled = torch.where(enabled_seed, seeded, unseeded)
     return torch.where(greedy, greedy_ids, sampled)
+
+
+def _disabled_seed_capture_fallback(seed: torch.Tensor) -> torch.Tensor:
+    # Negative seeds mean "unseeded" outside graph capture. During graph capture
+    # the sampler still needs a tensor seed, so derive a deterministic fallback
+    # while preserving the disabled marker for normal execution.
+    return (-seed).clamp_min(1) + 41
+
+
+def _offset_optional_sampling_seed(
+    seed: torch.Tensor | None,
+    offset: int,
+) -> torch.Tensor | None:
+    if seed is None:
+        return None
+    if offset == 0:
+        return seed
+    return torch.where(seed >= 0, seed + int(offset), seed - int(offset))
+
+
+def _mark_torch_compile_cudagraph_step_begin() -> None:
+    compiler = getattr(torch, "compiler", None)
+    marker = getattr(compiler, "cudagraph_mark_step_begin", None)
+    if marker is not None:
+        marker()
 
 
 def _bind_default_weight_loaders(module: nn.Module) -> None:
@@ -719,7 +758,59 @@ class Qwen35ResidualCodePredictor(nn.Module):
                 for idx in range(max(self.num_code_groups - 1, 0))
             ]
         )
+        self.register_buffer(
+            "_position_ids",
+            torch.arange(self.num_code_groups + 1, dtype=torch.long).unsqueeze(0),
+            persistent=False,
+        )
+        self._compiled_predict_step = None
+        self._mark_compiled_predict_steps = False
         _bind_default_weight_loaders(self)
+
+    def _predict_step(
+        self,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache: _NextKVCache,
+        lm_head_weight: torch.Tensor,
+        temperature: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        min_p: torch.Tensor,
+        seed: torch.Tensor | None,
+    ) -> torch.Tensor:
+        hidden = self.model(
+            inputs_embeds,
+            position_ids=position_ids,
+            past_key_values=kv_cache,
+            use_cache=True,
+        )
+        logits = F.linear(hidden[:, -1], lm_head_weight)
+        return _sample_logits(
+            logits,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            min_p=min_p,
+            seed=seed,
+        )
+
+    def enable_torch_compile(self, *, mode: str | None = None) -> None:
+        set_torch_compile_config()
+        compile_mode = mode or os.environ.get(
+            "SGLANG_TORCH_COMPILE_MODE",
+            "default",
+        )
+        logger.info(
+            "enabling Qwen3.5 residual code predictor torch.compile mode=%s",
+            compile_mode,
+        )
+        self._mark_compiled_predict_steps = compile_mode == "reduce-overhead"
+        self._compiled_predict_step = torch.compile(
+            self._predict_step,
+            dynamic=True,
+            mode=compile_mode,
+        )
 
     def generate(
         self,
@@ -807,11 +898,8 @@ class Qwen35ResidualCodePredictor(nn.Module):
         summed_embeddings = layer0_embed.clone()
         inputs_embeds = torch.cat([flat_talker_hidden, layer0_embed], dim=1)
         kv_cache = _NextKVCache(len(self.model.layers))
-        position_ids = torch.arange(
-            self.num_code_groups + 1,
-            dtype=torch.long,
-            device=device,
-        ).unsqueeze(0).expand(flat_size, -1)
+        position_ids = self._position_ids.to(device=device).expand(flat_size, -1)
+        predict_step = self._compiled_predict_step or self._predict_step
 
         for group_idx in range(self.num_code_groups - 1):
             if group_idx == 0:
@@ -820,24 +908,19 @@ class Qwen35ResidualCodePredictor(nn.Module):
             else:
                 step_inputs = next_input
                 step_positions = position_ids[:, group_idx + 1 : group_idx + 2]
-            hidden = self.model(
+            lm_head_weight = self.lm_head[group_idx].linear.weight
+            if self._mark_compiled_predict_steps:
+                _mark_torch_compile_cudagraph_step_begin()
+            next_code = predict_step(
                 step_inputs,
-                position_ids=step_positions,
-                past_key_values=kv_cache,
-                use_cache=True,
-            )
-            logits = self.lm_head[group_idx](hidden)
-            next_code = _sample_logits(
-                logits[:, -1, :],
-                temperature=sampling_temperature,
-                top_k=sampling_top_k,
-                top_p=sampling_top_p,
-                min_p=sampling_min_p,
-                seed=(
-                    None
-                    if sampling_seed is None
-                    else sampling_seed + int(group_idx)
-                ),
+                step_positions,
+                kv_cache,
+                lm_head_weight,
+                sampling_temperature,
+                sampling_top_k,
+                sampling_top_p,
+                sampling_min_p,
+                seed=_offset_optional_sampling_seed(sampling_seed, int(group_idx)),
             )
             codes[:, group_idx + 1] = next_code
             next_input = F.embedding(

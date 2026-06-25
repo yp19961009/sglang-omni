@@ -42,6 +42,60 @@ logger = logging.getLogger(__name__)
 
 GetNextFn = Callable[[str, Any], str | list[str] | None]
 GetStreamDoneTargetsFn = Callable[[str, Any], str | list[str] | None]
+_STREAM_RELAY_COMPLETION_TIMEOUT_ENV = "SGLANG_OMNI_STREAM_RELAY_COMPLETION_TIMEOUT_S"
+_STREAM_RELAY_COMPLETION_DEFAULT_TIMEOUT_S = 300.0
+_DEFER_NONSTREAM_COMPLETES_ENV = "SGLANG_OMNI_DEFER_NONSTREAM_COMPLETES"
+_STAGE_IO_YIELD_EVERY_MESSAGES_ENV = "SGLANG_OMNI_STAGE_IO_YIELD_EVERY_MESSAGES"
+_ASYNC_STREAM_INGEST_ENV = "SGLANG_OMNI_ASYNC_STREAM_INGEST"
+
+
+def _stream_relay_completion_timeout() -> float | None:
+    raw = os.getenv(_STREAM_RELAY_COMPLETION_TIMEOUT_ENV)
+    if raw is None or raw == "":
+        return _STREAM_RELAY_COMPLETION_DEFAULT_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using %.1fs",
+            _STREAM_RELAY_COMPLETION_TIMEOUT_ENV,
+            raw,
+            _STREAM_RELAY_COMPLETION_DEFAULT_TIMEOUT_S,
+        )
+        return _STREAM_RELAY_COMPLETION_DEFAULT_TIMEOUT_S
+    if value <= 0:
+        return None
+    return value
+
+
+def _defer_nonstream_completes_enabled() -> bool:
+    raw = os.getenv(_DEFER_NONSTREAM_COMPLETES_ENV)
+    if raw is None or raw == "":
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _stage_io_yield_every_messages() -> int:
+    raw = os.getenv(_STAGE_IO_YIELD_EVERY_MESSAGES_ENV)
+    if raw is None or raw == "":
+        return 1
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using 1",
+            _STAGE_IO_YIELD_EVERY_MESSAGES_ENV,
+            raw,
+        )
+        return 1
+    return max(0, value)
+
+
+def _async_stream_ingest_enabled() -> bool:
+    raw = os.getenv(_ASYNC_STREAM_INGEST_ENV)
+    if raw is None or raw == "":
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 class Stage:
@@ -69,6 +123,7 @@ class Stage:
         gpu_id: int | None,
         endpoints: dict[str, str],
         control_plane: Any,
+        stream_endpoints: dict[str, str] | None = None,
         input_handler: InputHandler | None = None,
         relay: Relay | None = None,
         relay_config: dict[str, Any] | None = None,
@@ -77,6 +132,7 @@ class Stage:
         stream_targets: list[str] | None = None,
         get_stream_done_targets: GetStreamDoneTargetsFn | None = None,
         same_gpu_targets: set[str] | None = None,
+        same_gpu_payload_targets: set[str] | None = None,
         same_process_targets: set[str] | None = None,
         local_dispatcher: Any | None = None,
         can_accept_stream_before_payload: bool = False,
@@ -88,6 +144,7 @@ class Stage:
         self.get_next = get_next
         self.gpu_id = gpu_id
         self.endpoints = endpoints
+        self.stream_endpoints = stream_endpoints or endpoints
         self.control_plane = control_plane
         self.input_handler = input_handler or DirectInput()
         self.scheduler = scheduler
@@ -95,6 +152,7 @@ class Stage:
         self._stream_targets = stream_targets or []
         self.get_stream_done_targets = get_stream_done_targets
         self._same_gpu_targets = same_gpu_targets or set()
+        self._same_gpu_payload_targets = same_gpu_payload_targets or set()
         self._same_process_targets = same_process_targets or set()
         self._local_dispatcher = local_dispatcher
         self._can_accept_stream_before_payload = can_accept_stream_before_payload
@@ -136,18 +194,32 @@ class Stage:
         self._stream_chunk_counters: dict[tuple[str, str], int] = {}
         # Per-request: did we already emit the first stream-chunk event?
         self._first_stream_chunk_seen: set[str] = set()
+        self._first_outbox_stream_dequeue_seen: set[str] = set()
+        self._first_scheduler_stream_enqueue_seen: set[str] = set()
         self._local_stream_targets: dict[str, set[str]] = {}
         self._nonlocal_stream_targets: dict[str, set[str]] = {}
         self._scheduler_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._scheduler_crash_error: BaseException | None = None
         self._background_task_error: BaseException | None = None
+        self._stream_relay_completion_timeout = _stream_relay_completion_timeout()
+        self._stream_relay_completion_tasks: set[asyncio.Task] = set()
+        self._defer_nonstream_completes = _defer_nonstream_completes_enabled()
+        self._deferred_complete_queue: asyncio.Queue[CompleteMessage] | None = None
+        self._stage_io_yield_every_messages = _stage_io_yield_every_messages()
+        self._async_stream_ingest = _async_stream_ingest_enabled()
+        self._stream_ingest_queues: dict[
+            str, asyncio.Queue[DataReadyMessage | None]
+        ] = {}
+        self._stream_ingest_tasks: dict[str, asyncio.Task] = {}
 
     async def start(self) -> None:
         if self._running:
             return
         await self.control_plane.start()
         self._loop = asyncio.get_running_loop()
+        if self._owns_external_io and self._defer_nonstream_completes:
+            self._deferred_complete_queue = asyncio.Queue()
         self._running = True
 
         # Start scheduler in dedicated thread
@@ -192,6 +264,26 @@ class Stage:
         if self.scheduler is not None:
             self.scheduler.stop()
         self.control_plane.close()
+        for queue in list(self._stream_ingest_queues.values()):
+            queue.put_nowait(None)
+        for task in list(self._stream_ingest_tasks.values()):
+            task.cancel()
+        if self._stream_ingest_tasks:
+            stream_ingest_tasks = list(self._stream_ingest_tasks.values())
+            await asyncio.gather(
+                *stream_ingest_tasks,
+                return_exceptions=True,
+            )
+            self._stream_ingest_tasks.clear()
+            self._stream_ingest_queues.clear()
+        for task in list(self._stream_relay_completion_tasks):
+            task.cancel()
+        if self._stream_relay_completion_tasks:
+            await asyncio.gather(
+                *self._stream_relay_completion_tasks,
+                return_exceptions=True,
+            )
+            self._stream_relay_completion_tasks.clear()
         if self._tp_fanout is not None:
             self._tp_fanout.close()
         self.relay.close()
@@ -202,14 +294,26 @@ class Stage:
 
         abort_task = asyncio.create_task(self._abort_listener())
         outbox_task = asyncio.create_task(self._drain_outbox())
+        deferred_complete_task = (
+            asyncio.create_task(self._drain_deferred_completes())
+            if self._deferred_complete_queue is not None
+            else None
+        )
         abort_task.add_done_callback(
             lambda task: self._on_background_task_done(task, "abort listener")
         )
         outbox_task.add_done_callback(
             lambda task: self._on_background_task_done(task, "outbox drain")
         )
+        if deferred_complete_task is not None:
+            deferred_complete_task.add_done_callback(
+                lambda task: self._on_background_task_done(
+                    task, "deferred complete drain"
+                )
+            )
 
         try:
+            handled_messages = 0
             while self._running:
                 msg = await self.control_plane.recv()
                 if (
@@ -225,8 +329,22 @@ class Stage:
                     break
                 if isinstance(msg, TPWorkMessage):
                     await self._execute(msg.data)
+                    handled_messages += 1
+                    if (
+                        self._stage_io_yield_every_messages > 0
+                        and handled_messages
+                        % self._stage_io_yield_every_messages
+                        == 0
+                    ):
+                        await asyncio.sleep(0)
                     continue
                 await self._handle_message(msg)
+                handled_messages += 1
+                if (
+                    self._stage_io_yield_every_messages > 0
+                    and handled_messages % self._stage_io_yield_every_messages == 0
+                ):
+                    await asyncio.sleep(0)
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -240,6 +358,10 @@ class Stage:
                 await abort_task
             with suppress(asyncio.CancelledError):
                 await outbox_task
+            if deferred_complete_task is not None:
+                deferred_complete_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await deferred_complete_task
             if self._background_task_error is not None:
                 raise self._background_task_error
             if self._scheduler_crash_error is not None:
@@ -251,7 +373,12 @@ class Stage:
         if isinstance(msg, SubmitMessage):
             await self._on_submit(msg)
         elif isinstance(msg, DataReadyMessage):
-            if msg.is_done or msg.error:
+            if (
+                self._async_stream_ingest
+                and (msg.is_done or msg.error or msg.chunk_id is not None)
+            ):
+                self._enqueue_stream_control_message(msg)
+            elif msg.is_done or msg.error:
                 await self._on_stream_signal(msg)
             elif msg.chunk_id is not None:
                 await self._on_stream_chunk(msg)
@@ -290,15 +417,23 @@ class Stage:
 
         # Read payload from relay
         try:
-            payload = await relay_io.read_payload(
-                self.relay, request_id, msg.shm_metadata
-            )
+            if (
+                isinstance(msg.shm_metadata, dict)
+                and msg.shm_metadata.get("_payload_ipc")
+            ):
+                failure_prefix = "payload read failed"
+                payload = relay_io.deserialize_ipc_payload(msg.shm_metadata)
+            else:
+                failure_prefix = "relay read failed"
+                payload = await relay_io.read_payload(
+                    self.relay, request_id, msg.shm_metadata
+                )
         except Exception as exc:
             logger.exception(
-                "Stage %s: relay read failed for %s", self.name, request_id
+                "Stage %s: %s for %s", self.name, failure_prefix, request_id
             )
             self.relay.cleanup(request_id)
-            await self._send_failure(request_id, f"relay read failed: {exc}")
+            await self._send_failure(request_id, f"{failure_prefix}: {exc}")
             return
 
         await self._receive_payload_from_stage(request_id, msg.from_stage, payload)
@@ -388,6 +523,38 @@ class Stage:
             return
         self._active_requests.add(request_id)
 
+        # Tiny CPU-only chunks, such as text token ids for the decode stage, can
+        # ride in the control message and avoid the relay data path entirely.
+        if isinstance(msg.shm_metadata, dict) and msg.shm_metadata.get("_inline_cpu"):
+            try:
+                data, metadata = relay_io.deserialize_inline_cpu_chunk(
+                    msg.shm_metadata
+                )
+            except Exception as exc:
+                logger.error(
+                    "Stage %s: inline CPU stream deserialize failed for %s: %s",
+                    self.name,
+                    request_id,
+                    exc,
+                )
+                await self._queue_stream_error(request_id, msg.from_stage, exc)
+                return
+            if request_id in self._aborted:
+                return
+            item = StreamItem(
+                chunk_id=msg.chunk_id,
+                data=data,
+                from_stage=msg.from_stage,
+                metadata=metadata,
+            )
+            self._emit_stream_chunk_received(
+                request_id=msg.request_id,
+                from_stage=msg.from_stage,
+                chunk_id=msg.chunk_id,
+            )
+            await self._route_stream_item_or_fail(request_id, item)
+            return
+
         # Same-GPU CUDA IPC
         if isinstance(msg.shm_metadata, dict) and msg.shm_metadata.get("_ipc"):
             try:
@@ -441,6 +608,43 @@ class Stage:
             chunk_id=msg.chunk_id,
         )
         await self._route_stream_item_or_fail(request_id, item)
+
+    def _enqueue_stream_control_message(self, msg: DataReadyMessage) -> None:
+        request_id = msg.request_id
+        queue = self._stream_ingest_queues.get(request_id)
+        if queue is None:
+            queue = asyncio.Queue()
+            self._stream_ingest_queues[request_id] = queue
+            task = asyncio.create_task(
+                self._drain_stream_ingest_queue(request_id, queue)
+            )
+            self._stream_ingest_tasks[request_id] = task
+            task.add_done_callback(
+                lambda done, rid=request_id: self._on_stream_ingest_done(rid, done)
+            )
+        queue.put_nowait(msg)
+
+    async def _drain_stream_ingest_queue(
+        self,
+        request_id: str,
+        queue: asyncio.Queue[DataReadyMessage | None],
+    ) -> None:
+        while self._running or not queue.empty():
+            msg = await queue.get()
+            if msg is None:
+                break
+            if msg.is_done or msg.error:
+                await self._on_stream_signal(msg)
+                break
+            await self._on_stream_chunk(msg)
+            await asyncio.sleep(0)
+
+    def _on_stream_ingest_done(self, request_id: str, task: asyncio.Task) -> None:
+        current = self._stream_ingest_tasks.get(request_id)
+        if current is task:
+            self._stream_ingest_tasks.pop(request_id, None)
+            self._stream_ingest_queues.pop(request_id, None)
+        self._on_background_task_done(task, f"stream ingest {request_id}")
 
     def _emit_stream_chunk_received(
         self,
@@ -525,6 +729,8 @@ class Stage:
 
     async def _discard_payload_data(self, msg: DataReadyMessage) -> None:
         request_id = msg.request_id
+        if isinstance(msg.shm_metadata, dict) and msg.shm_metadata.get("_payload_ipc"):
+            return
         try:
             await relay_io.read_payload(self.relay, request_id, msg.shm_metadata)
         except Exception:
@@ -537,7 +743,9 @@ class Stage:
             self.relay.cleanup(request_id)
 
     async def _discard_stream_chunk_data(self, msg: DataReadyMessage) -> None:
-        if isinstance(msg.shm_metadata, dict) and msg.shm_metadata.get("_ipc"):
+        if isinstance(msg.shm_metadata, dict) and (
+            msg.shm_metadata.get("_ipc") or msg.shm_metadata.get("_inline_cpu")
+        ):
             return
         if msg.chunk_id is None:
             return
@@ -635,6 +843,27 @@ class Stage:
         self.scheduler.inbox.put(
             IncomingMessage(request_id=request_id, type="stream_chunk", data=item)
         )
+        if request_id not in self._first_scheduler_stream_enqueue_seen:
+            self._first_scheduler_stream_enqueue_seen.add(request_id)
+            _emit_event(
+                request_id=request_id,
+                stage=self.name,
+                event_name="stage_first_stream_chunk_enqueued",
+                metadata={
+                    "from_stage": item.from_stage,
+                    "chunk_id": item.chunk_id,
+                    "token_id": (
+                        item.metadata.get("token_id")
+                        if isinstance(item.metadata, dict)
+                        else None
+                    ),
+                    "inbox_qsize": (
+                        self.scheduler.inbox.qsize()
+                        if hasattr(self.scheduler.inbox, "qsize")
+                        else None
+                    ),
+                },
+            )
 
     async def _execute(self, payload: Any) -> None:
         request_id = payload.request_id
@@ -665,21 +894,60 @@ class Stage:
 
     async def _drain_outbox_external(self) -> None:
         """Drain scheduler outbox and route results downstream."""
-        loop = asyncio.get_running_loop()
+        handled_messages = 0
         while self._running or not self.scheduler.outbox.empty():
             try:
-                out = await loop.run_in_executor(
-                    None, lambda: self.scheduler.outbox.get(timeout=0.1)
-                )
+                out = self.scheduler.outbox.get_nowait()
             except _queue_mod.Empty:
+                await asyncio.sleep(0.001)
                 continue
 
             if out.request_id not in self._active_requests:
+                if out.type == "stream":
+                    _emit_event(
+                        request_id=out.request_id,
+                        stage=self.name,
+                        event_name="stage_outbox_stream_skipped_inactive",
+                        metadata={
+                            "target": out.target,
+                            "modality": (
+                                out.metadata.get("modality")
+                                if isinstance(out.metadata, dict)
+                                else None
+                            ),
+                        },
+                    )
+                handled_messages += 1
+                if (
+                    self._stage_io_yield_every_messages > 0
+                    and handled_messages % self._stage_io_yield_every_messages == 0
+                ):
+                    await asyncio.sleep(0)
                 continue
 
             if out.type == "result":
                 await self._route_result(out.request_id, out.data)
             elif out.type == "stream":
+                if out.request_id not in self._first_outbox_stream_dequeue_seen:
+                    self._first_outbox_stream_dequeue_seen.add(out.request_id)
+                    _emit_event(
+                        request_id=out.request_id,
+                        stage=self.name,
+                        event_name="stage_first_outbox_stream_dequeued",
+                        metadata={
+                            "target": out.target,
+                            "modality": (
+                                out.metadata.get("modality")
+                                if isinstance(out.metadata, dict)
+                                else None
+                            ),
+                            "outbox_qsize": (
+                                self.scheduler.outbox.qsize()
+                                if hasattr(self.scheduler.outbox, "qsize")
+                                else None
+                            ),
+                        },
+                    )
                 if out.target is None:
                     if self._stream_targets:
                         for target in self._stream_targets:
@@ -705,25 +973,37 @@ class Stage:
             elif out.type == "error":
                 await self._send_failure(out.request_id, str(out.data))
 
+            handled_messages += 1
+            if (
+                self._stage_io_yield_every_messages > 0
+                and handled_messages % self._stage_io_yield_every_messages == 0
+            ):
+                await asyncio.sleep(0)
+
     async def _drain_outbox_follower(self) -> None:
         """Drain follower outbox without emitting external stage traffic."""
-        loop = asyncio.get_running_loop()
+        handled_messages = 0
         while self._running or not self.scheduler.outbox.empty():
             try:
-                out = await loop.run_in_executor(
-                    None, lambda: self.scheduler.outbox.get(timeout=0.1)
-                )
+                out = self.scheduler.outbox.get_nowait()
             except _queue_mod.Empty:
+                await asyncio.sleep(0.001)
                 continue
 
             if out.type == "result":
                 self._clear_request_state(out.request_id)
             elif out.type == "stream":
-                continue
+                pass
             elif out.type == "error":
                 raise RuntimeError(
                     f"TP follower stage {self.name} received scheduler error: {out.data}"
                 )
+            handled_messages += 1
+            if (
+                self._stage_io_yield_every_messages > 0
+                and handled_messages % self._stage_io_yield_every_messages == 0
+            ):
+                await asyncio.sleep(0)
 
     async def _route_result(self, request_id: str, result: Any) -> None:
         """Route a completed result to next stage(s) or complete at coordinator."""
@@ -757,14 +1037,16 @@ class Stage:
                 event_name="stage_complete",
                 metadata={"terminal": True},
             )
-            await self.control_plane.send_complete(
-                CompleteMessage(
-                    request_id=request_id,
-                    from_stage=self.name,
-                    success=True,
-                    result=result.data,
-                )
+            complete_msg = CompleteMessage(
+                request_id=request_id,
+                from_stage=self.name,
+                success=True,
+                result=result.data,
             )
+            if self._should_defer_terminal_complete(result):
+                self._enqueue_deferred_complete(complete_msg)
+            else:
+                await self.control_plane.send_complete(complete_msg)
         else:
             if isinstance(next_stages, str):
                 next_stages = [next_stages]
@@ -786,6 +1068,36 @@ class Stage:
                 )
 
         self._clear_request_state(request_id)
+
+    def _should_defer_terminal_complete(self, result: Any) -> bool:
+        if self._deferred_complete_queue is None:
+            return False
+        request = getattr(result, "request", None)
+        params = getattr(request, "params", None)
+        return not bool((params or {}).get("stream", False))
+
+    def _enqueue_deferred_complete(self, msg: CompleteMessage) -> None:
+        queue = self._deferred_complete_queue
+        if queue is None:
+            return
+        queue.put_nowait(msg)
+        _emit_event(
+            request_id=msg.request_id,
+            stage=self.name,
+            event_name="stage_complete_deferred",
+            metadata={"queue_size": queue.qsize()},
+        )
+
+    async def _drain_deferred_completes(self) -> None:
+        queue = self._deferred_complete_queue
+        if queue is None:
+            return
+        while self._running or not queue.empty():
+            try:
+                msg = await asyncio.wait_for(queue.get(), timeout=0.1)
+            except TimeoutError:
+                continue
+            await self.control_plane.send_complete_low_priority(msg)
 
     async def _send_to_stage(
         self,
@@ -849,6 +1161,25 @@ class Stage:
             )
             return
 
+        if (
+            target in self._same_gpu_payload_targets
+            and relay_io.should_use_cuda_ipc_payload(projected_payload)
+        ):
+            msg = DataReadyMessage(
+                request_id=request_id,
+                from_stage=self.name,
+                to_stage=target,
+                shm_metadata=relay_io.serialize_ipc_payload(projected_payload),
+            )
+            _emit_event(
+                request_id=request_id,
+                stage=self.name,
+                event_name="stage_hop_sent",
+                metadata={"to_stage": target, "transport": "cuda_ipc"},
+            )
+            await self.control_plane.send_to_stage(target, endpoint, msg)
+            return
+
         metadata, op = await relay_io.write_payload(
             self.relay, request_id, projected_payload
         )
@@ -862,10 +1193,21 @@ class Stage:
             request_id=request_id,
             stage=self.name,
             event_name="stage_hop_sent",
-            metadata={"to_stage": target},
+            metadata={
+                "to_stage": target,
+                "tensor_count": metadata.get("tensor_count"),
+                "tensor_bytes": metadata.get("tensor_bytes"),
+                "relay_bytes": metadata.get("relay_bytes"),
+                "payload_pickle_bytes": metadata.get("payload_pickle_bytes"),
+            },
         )
         await self.control_plane.send_to_stage(target, endpoint, msg)
-        await op.wait_for_completion()
+        self._track_relay_completion(
+            kind="payload",
+            request_id=request_id,
+            target=target,
+            pending_ops=[op],
+        )
 
     @staticmethod
     def _is_isolated_projected_payload(
@@ -972,7 +1314,7 @@ class Stage:
     ) -> None:
         if not self._owns_external_io:
             return
-        endpoint = self.endpoints.get(target)
+        endpoint = self.stream_endpoints.get(target) or self.endpoints.get(target)
         if endpoint is None:
             return
         key = (request_id, target)
@@ -1016,7 +1358,7 @@ class Stage:
             )
             return
         self._record_nonlocal_stream_target(request_id, target)
-        await relay_io.send_stream_chunk(
+        pending_ops = await relay_io.send_stream_chunk(
             self.relay,
             self.control_plane,
             request_id=request_id,
@@ -1027,7 +1369,85 @@ class Stage:
             chunk_id=chunk_id,
             metadata=metadata,
             same_gpu_targets=self._same_gpu_targets,
+            await_completion=False,
         )
+        self._track_relay_completion(
+            kind="stream",
+            request_id=request_id,
+            target=target,
+            chunk_id=chunk_id,
+            pending_ops=pending_ops,
+        )
+
+    def _track_relay_completion(
+        self,
+        *,
+        kind: str,
+        request_id: str,
+        target: str,
+        pending_ops: list[Any],
+        chunk_id: int | None = None,
+    ) -> None:
+        if not pending_ops:
+            return
+        task = asyncio.create_task(
+            self._wait_relay_completion(
+                request_id=request_id,
+                target=target,
+                chunk_id=chunk_id,
+                pending_ops=pending_ops,
+            )
+        )
+        self._stream_relay_completion_tasks.add(task)
+        task.add_done_callback(
+            lambda done: self._on_relay_completion_done(
+                done,
+                kind=kind,
+                request_id=request_id,
+                target=target,
+                chunk_id=chunk_id,
+            )
+        )
+
+    async def _wait_relay_completion(
+        self,
+        *,
+        request_id: str,
+        target: str,
+        chunk_id: int | None,
+        pending_ops: list[Any],
+    ) -> None:
+        del request_id, target, chunk_id
+        await relay_io.wait_for_relay_ops(
+            pending_ops,
+            timeout=self._stream_relay_completion_timeout,
+        )
+
+    def _on_relay_completion_done(
+        self,
+        task: asyncio.Task,
+        *,
+        kind: str,
+        request_id: str,
+        target: str,
+        chunk_id: int | None,
+    ) -> None:
+        self._stream_relay_completion_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            logger.warning(
+                "Stage %s: %s relay completion wait failed "
+                "(request_id=%s target=%s chunk_id=%s)",
+                self.name,
+                kind,
+                request_id,
+                target,
+                chunk_id,
+                exc_info=True,
+            )
 
     async def _send_stream_signal_to_target(
         self,
@@ -1039,7 +1459,7 @@ class Stage:
     ) -> None:
         if not self._owns_external_io:
             return
-        endpoint = self.endpoints.get(target)
+        endpoint = self.stream_endpoints.get(target) or self.endpoints.get(target)
         if endpoint is None:
             return
         if target in self._same_process_targets:
@@ -1143,12 +1563,24 @@ class Stage:
         self.input_handler.cancel(request_id)
         if self._stream_queue is not None:
             self._stream_queue.close(request_id)
+        stream_ingest_queue = self._stream_ingest_queues.pop(request_id, None)
+        if stream_ingest_queue is not None:
+            stream_ingest_queue.put_nowait(None)
+        self._stream_ingest_tasks.pop(request_id, None)
         stale_keys = [
             key for key in self._stream_chunk_counters if key[0] == request_id
         ]
         for key in stale_keys:
             self._stream_chunk_counters.pop(key, None)
         self._first_stream_chunk_seen.discard(request_id)
+        first_outbox_seen = getattr(self, "_first_outbox_stream_dequeue_seen", None)
+        if first_outbox_seen is not None:
+            first_outbox_seen.discard(request_id)
+        first_enqueue_seen = getattr(
+            self, "_first_scheduler_stream_enqueue_seen", None
+        )
+        if first_enqueue_seen is not None:
+            first_enqueue_seen.discard(request_id)
         self._local_stream_targets.pop(request_id, None)
         self._nonlocal_stream_targets.pop(request_id, None)
 

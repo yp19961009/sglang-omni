@@ -650,6 +650,7 @@ class Qwen35Code2WavScheduler(Code2WavScheduler):
             chunk_sizes,
             chunk_steps,
         )
+        self._qwen35_invalid_codec_rows_logged: set[str] = set()
 
     def _compute_padding_interval(self) -> int:
         max_chunk_size = self._left_context_size + self._stream_chunk_size
@@ -731,6 +732,99 @@ class Qwen35Code2WavScheduler(Code2WavScheduler):
         super().clear_stream_state(request_id)
         self._qwen35_skip_code2wav.pop(request_id, None)
         self._qwen35_dynamic_chunk_index.pop(request_id, None)
+        self._qwen35_invalid_codec_rows_logged.discard(request_id)
+
+    def _codec_codebook_size(self) -> int | None:
+        quantizer = getattr(self._model, "quantizer", None)
+        quantizer_candidates = [
+            quantizer,
+            getattr(quantizer, "rvq_first", None),
+            getattr(quantizer, "rvq_rest", None),
+        ]
+        values = [
+            getattr(self._model, "codebook_size", None),
+            getattr(self._model, "bins", None),
+        ]
+        for candidate in quantizer_candidates:
+            if candidate is None:
+                continue
+            values.extend(
+                [
+                    getattr(candidate, "bins", None),
+                    getattr(candidate, "codebook_size", None),
+                ]
+            )
+            vq = getattr(candidate, "vq", None)
+            layers = getattr(vq, "layers", None)
+            if layers:
+                first_layer = layers[0]
+                values.extend(
+                    [
+                        getattr(first_layer, "bins", None),
+                        getattr(first_layer, "codebook_size", None),
+                    ]
+                )
+                codebook = getattr(first_layer, "_codebook", None)
+                values.append(getattr(codebook, "codebook_size", None))
+
+        for value in values:
+            if value is None:
+                continue
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                return parsed
+        code_embeddings = getattr(self._model, "code_embeddings", None)
+        if code_embeddings:
+            first = code_embeddings[0]
+            num_embeddings = getattr(first, "num_embeddings", None)
+            if num_embeddings is not None:
+                try:
+                    parsed = int(num_embeddings)
+                except (TypeError, ValueError):
+                    return None
+                if parsed > 0:
+                    return parsed
+        return None
+
+    def _should_skip_invalid_codec_row(
+        self,
+        request_id: str,
+        chunk: StreamItem,
+    ) -> bool:
+        data = chunk.data
+        if not isinstance(data, torch.Tensor):
+            return False
+        if data.numel() == 0:
+            return False
+        codebook_size = self._codec_codebook_size()
+        if codebook_size is None:
+            return False
+
+        codes = data.detach().to(dtype=torch.long, device="cpu").reshape(-1)
+        invalid = (codes < 0) | (codes >= int(codebook_size))
+        if not bool(invalid.any()):
+            return False
+
+        if request_id not in self._qwen35_invalid_codec_rows_logged:
+            bad = codes[invalid]
+            logger.warning(
+                "Qwen3.5 code2wav skipped invalid codec row req=%s "
+                "shape=%s codebook_size=%s min=%s max=%s bad_count=%s "
+                "first_bad=%s codec_eos=%s",
+                request_id,
+                tuple(data.shape),
+                int(codebook_size),
+                int(codes.min().item()),
+                int(codes.max().item()),
+                int(bad.numel()),
+                bad[:8].tolist(),
+                self._codec_eos_token_id,
+            )
+            self._qwen35_invalid_codec_rows_logged.add(request_id)
+        return True
 
     def _current_dynamic_chunk_size(self, request_id: str) -> int:
         index = self._qwen35_dynamic_chunk_index.get(request_id, 0)
@@ -760,6 +854,8 @@ class Qwen35Code2WavScheduler(Code2WavScheduler):
         chunk: StreamItem,
     ) -> list[OutgoingMessage]:
         if self._qwen35_skip_code2wav.get(request_id, False):
+            return []
+        if self._should_skip_invalid_codec_row(request_id, chunk):
             return []
         if not self._qwen35_enable_dynamic_chunk:
             return super().on_stream_chunk(request_id, chunk)

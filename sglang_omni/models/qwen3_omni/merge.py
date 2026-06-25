@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Iterable
 
 import torch
@@ -16,6 +17,81 @@ from sglang_omni.proto import StagePayload
 
 IMAGE_STAGE = "image_encoder"
 AUDIO_STAGE = "audio_encoder"
+logger = logging.getLogger(__name__)
+
+
+def _tokenizer_decode_upper_bound(tokenizer: Any) -> int | None:
+    try:
+        return int(len(tokenizer))
+    except Exception:
+        vocab_size = getattr(tokenizer, "vocab_size", None)
+        if vocab_size is None:
+            return None
+        try:
+            return int(vocab_size)
+        except Exception:
+            return None
+
+
+def is_decodable_token_id(tokenizer: Any, token_id: int) -> bool:
+    upper_bound = _tokenizer_decode_upper_bound(tokenizer)
+    if upper_bound is None:
+        return True
+    return 0 <= int(token_id) < upper_bound
+
+
+def filter_decodable_token_ids(
+    tokenizer: Any,
+    token_ids: Iterable[int],
+    *,
+    request_id: str | None = None,
+    context: str = "decode",
+) -> list[int]:
+    upper_bound = _tokenizer_decode_upper_bound(tokenizer)
+    tokens = [int(token_id) for token_id in token_ids]
+    if upper_bound is None:
+        return tokens
+
+    filtered = [token_id for token_id in tokens if 0 <= token_id < upper_bound]
+    dropped = len(tokens) - len(filtered)
+    if dropped:
+        logger.debug(
+            "Skipped %d non-text token ids during %s for request %s "
+            "(tokenizer upper_bound=%s)",
+            dropped,
+            context,
+            request_id,
+            upper_bound,
+        )
+    return filtered
+
+
+def safe_decode_token_ids(
+    tokenizer: Any,
+    token_ids: Iterable[int],
+    *,
+    skip_special_tokens: bool = True,
+    request_id: str | None = None,
+    context: str = "decode",
+) -> str:
+    tokens = filter_decodable_token_ids(
+        tokenizer,
+        token_ids,
+        request_id=request_id,
+        context=context,
+    )
+    if not tokens:
+        return ""
+    try:
+        return tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
+    except OverflowError:
+        logger.warning(
+            "Tokenizer overflow during %s for request %s; dropping %d pending tokens",
+            context,
+            request_id,
+            len(tokens),
+        )
+        return ""
 
 
 def _cast_tensor(
@@ -46,7 +122,8 @@ def merge_for_thinker(payloads: dict[str, StagePayload]) -> StagePayload:
         if stage_name in stage_state.engine_outputs:
             encoder_outs[stage_name] = stage_state.engine_outputs[stage_name]
 
-    thinker_inputs = build_thinker_inputs(state, encoder_outs)
+    request_metadata = getattr(getattr(base, "request", None), "metadata", None)
+    thinker_inputs = build_thinker_inputs(state, encoder_outs, request_metadata)
 
     state.thinker_inputs = thinker_inputs
     state.encoder_inputs = {}
@@ -61,6 +138,7 @@ def merge_for_thinker(payloads: dict[str, StagePayload]) -> StagePayload:
 def build_thinker_inputs(
     state: Qwen3OmniPipelineState,
     encoder_outs: dict[str, Any],
+    request_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     mm_inputs = state.mm_inputs
     mm_image = mm_inputs.get("image", {})
@@ -148,22 +226,53 @@ def build_thinker_inputs(
     if mm_video.get("use_audio_in_video") is True:
         thinker_model_inputs["use_audio_in_video"] = True
 
-    media_cache_keys: dict[str, str] = {}
-    encoder_inputs = state.encoder_inputs or {}
-    image_ck = (encoder_inputs.get("image_encoder") or {}).get("cache_key")
-    audio_ck = (encoder_inputs.get("audio_encoder") or {}).get("cache_key")
-    if image_ck:
-        media_cache_keys["image"] = f"image:{image_ck}"
-        # Note (Xuesong): Image and video share the same encoder cache key, so prefix them
-        # differently to avoid hashed pad-value collisions across modalities.
-        media_cache_keys["video"] = f"video:{image_ck}"
-    if audio_ck:
-        media_cache_keys["audio"] = f"audio:{audio_ck}"
+    media_cache_keys = _media_cache_keys_for_request(
+        state=state,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        audio_feature_lengths=audio_feature_lengths,
+        request_metadata=request_metadata,
+    )
 
     result: dict[str, Any] = {"model_inputs": thinker_model_inputs}
     if media_cache_keys:
         result["media_cache_keys"] = media_cache_keys
     return result
+
+
+def _media_cache_keys_for_request(
+    *,
+    state: Qwen3OmniPipelineState,
+    image_grid_thw: torch.Tensor | None,
+    video_grid_thw: torch.Tensor | None,
+    audio_feature_lengths: torch.Tensor | None,
+    request_metadata: dict[str, Any] | None,
+) -> dict[str, str]:
+    media_cache_keys: dict[str, str] = {}
+    namespace = None
+    if isinstance(request_metadata, dict):
+        namespace = request_metadata.get("media_cache_namespace")
+    if namespace:
+        namespace = str(namespace)
+        if _non_empty(image_grid_thw):
+            media_cache_keys["image"] = f"{namespace}:image"
+        if _non_empty(video_grid_thw):
+            media_cache_keys["video"] = f"{namespace}:video"
+        if _non_empty(audio_feature_lengths):
+            media_cache_keys["audio"] = f"{namespace}:audio"
+        return media_cache_keys
+
+    encoder_inputs = state.encoder_inputs or {}
+    image_ck = (encoder_inputs.get("image_encoder") or {}).get("cache_key")
+    audio_ck = (encoder_inputs.get("audio_encoder") or {}).get("cache_key")
+    if image_ck:
+        media_cache_keys["image"] = f"image:{image_ck}"
+        # Image and video share the same encoder cache key, so prefix them
+        # differently to avoid hashed pad-value collisions across modalities.
+        media_cache_keys["video"] = f"video:{image_ck}"
+    if audio_ck:
+        media_cache_keys["audio"] = f"audio:{audio_ck}"
+    return media_cache_keys
 
 
 def _prune_preprocessing_for_thinker(
@@ -247,7 +356,23 @@ def decode_events(
             for t in output_ids
             if eos_token_id is None or int(t) != int(eos_token_id)
         ]
-        text = tokenizer.decode(tokens, skip_special_tokens=True) if tokens else ""
+        tokens = filter_decodable_token_ids(
+            tokenizer,
+            tokens,
+            request_id=getattr(state, "request_id", None),
+            context="decode_events_final",
+        )
+        text = (
+            safe_decode_token_ids(
+                tokenizer,
+                tokens,
+                skip_special_tokens=True,
+                request_id=getattr(state, "request_id", None),
+                context="decode_events_final",
+            )
+            if tokens
+            else ""
+        )
         stream_state["token_ids"] = tokens
         stream_state["text"] = text
         return [
@@ -271,8 +396,17 @@ def decode_events(
             )
         ]
 
+    if not is_decodable_token_id(tokenizer, token_id):
+        return []
+
     token_ids.append(token_id)
-    decoded = tokenizer.decode(token_ids, skip_special_tokens=True)
+    decoded = safe_decode_token_ids(
+        tokenizer,
+        token_ids,
+        skip_special_tokens=True,
+        request_id=getattr(state, "request_id", None),
+        context="decode_events_delta",
+    )
     stream_state["text"] = decoded
 
     # Skip incomplete multi-byte characters (replacement char).

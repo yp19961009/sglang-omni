@@ -155,6 +155,17 @@ def test_image_encoder_hidden_size_falls_back_to_visual_config():
     assert image_encoder._resolve_vision_hidden_size(vision_cfg, visual) == 64
 
 
+def test_image_encoder_torch_compile_env(monkeypatch):
+    monkeypatch.delenv("SGLANG_OMNI_IMAGE_ENCODER_TORCH_COMPILE", raising=False)
+    assert not image_encoder._image_encoder_torch_compile_enabled()
+
+    monkeypatch.setenv("SGLANG_OMNI_IMAGE_ENCODER_TORCH_COMPILE", "1")
+    assert image_encoder._image_encoder_torch_compile_enabled()
+
+    monkeypatch.setenv("SGLANG_OMNI_IMAGE_ENCODER_TORCH_COMPILE", "false")
+    assert not image_encoder._image_encoder_torch_compile_enabled()
+
+
 def test_image_encoder_emits_canonical_deepstack_keys():
     class FakeVisual(nn.Module):
         def __init__(self):

@@ -134,6 +134,32 @@ def resolve_same_gpu_stream_targets(
     return set(plan.same_gpu_stream_targets.get(stage_cfg.name, frozenset()))
 
 
+def resolve_same_gpu_payload_targets(
+    plan: StagePlacementPlan,
+    stage_cfg: StageConfig,
+    stage_cfg_by_name: dict[str, StageConfig],
+    name_map: dict[str, str] | None = None,
+) -> set[str]:
+    """Return static payload targets that share the sender's primary GPU."""
+
+    sender_gpu = _primary_gpu(stage_cfg.name, plan.stages)
+    if sender_gpu is None or stage_cfg.next is None:
+        return set()
+
+    mapped_names = name_map or {}
+    raw_targets = (
+        [stage_cfg.next] if isinstance(stage_cfg.next, str) else list(stage_cfg.next)
+    )
+    targets: set[str] = set()
+    for raw_target in raw_targets:
+        target = mapped_names.get(raw_target, raw_target)
+        if target not in stage_cfg_by_name:
+            continue
+        if _primary_gpu(target, plan.stages) == sender_gpu:
+            targets.add(target)
+    return targets
+
+
 def _resolve_stage_gpu_ids(stage: StageConfig) -> tuple[int, ...]:
     gpu = stage.gpu
     if gpu is None:

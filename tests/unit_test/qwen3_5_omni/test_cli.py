@@ -411,6 +411,16 @@ def test_qwen35_cli_server_and_preprocessing_aliases_are_available():
     )
     assert "--max-mm-len" in _serve_option_names("max_mm_len")
     assert "--max-prefill-tokens" in _serve_option_names("max_prefill_tokens")
+    assert "--max-mamba-cache-size" in _serve_option_names("max_mamba_cache_size")
+    assert "--thinker-max-mamba-cache-size" in _serve_option_names(
+        "thinker_max_mamba_cache_size"
+    )
+    assert "--talker-max-mamba-cache-size" in _serve_option_names(
+        "talker_max_mamba_cache_size"
+    )
+    assert "--mamba-full-memory-ratio" in _serve_option_names(
+        "mamba_full_memory_ratio"
+    )
     assert "--page-size" in _serve_option_names("page_size")
     assert "--thinker-max-seq-len" in _serve_option_names("thinker_max_seq_len")
     assert (
@@ -693,6 +703,29 @@ def test_qwen35_cli_partial_start_accepts_talker_factory():
     assert _stage(config, "talker_ar").factory_args["enable_partial_start"] is False
 
 
+def test_qwen35_cli_partial_start_min_chunks_accepts_talker_factory():
+    config = Qwen35OmniSpeechPipelineConfig(model_path="dummy")
+
+    apply_partial_start_cli_overrides(
+        config,
+        talker_partial_start="default",
+        talker_partial_start_min_chunks=3,
+    )
+
+    assert _stage(config, "talker_ar").factory_args["partial_start_min_chunks"] == 3
+
+
+def test_qwen35_cli_partial_start_min_chunks_rejects_subfloor():
+    config = Qwen35OmniSpeechPipelineConfig(model_path="dummy")
+
+    with pytest.raises(typer.BadParameter, match="min-chunks must be >= 3"):
+        apply_partial_start_cli_overrides(
+            config,
+            talker_partial_start="default",
+            talker_partial_start_min_chunks=2,
+        )
+
+
 def test_qwen35_cli_colocated_rejects_moving_talker_gpu():
     config = Qwen35OmniSpeechColocatedPipelineConfig(model_path="dummy")
 
@@ -851,6 +884,8 @@ def test_qwen35_cli_applies_ar_server_args_to_speech_stages():
         talker_dtype="float16",
         mamba_ssm_dtype="float32",
         max_prefill_tokens=512,
+        max_mamba_cache_size=24,
+        mamba_full_memory_ratio=0.95,
         page_size=16,
     )
 
@@ -866,8 +901,30 @@ def test_qwen35_cli_applies_ar_server_args_to_speech_stages():
     assert talker_args["dtype"] == "float16"
     assert thinker_args["mamba_ssm_dtype"] == "float32"
     assert talker_args["mamba_ssm_dtype"] == "float32"
+    assert thinker_args["max_mamba_cache_size"] == 24
+    assert talker_args["max_mamba_cache_size"] == 24
+    assert thinker_args["mamba_full_memory_ratio"] == pytest.approx(0.95)
+    assert talker_args["mamba_full_memory_ratio"] == pytest.approx(0.95)
     assert thinker_args["page_size"] == 16
     assert talker_args["page_size"] == 16
+
+
+def test_qwen35_cli_role_max_mamba_cache_size_overrides_global():
+    config = Qwen35OmniSpeechPipelineConfig(model_path="dummy")
+
+    apply_ar_server_args_cli_overrides(
+        config,
+        prefix_caching="default",
+        chunked_prefill="default",
+        max_mamba_cache_size=8,
+        thinker_max_mamba_cache_size=32,
+        talker_max_mamba_cache_size=12,
+    )
+
+    thinker_args = _stage(config, "thinker").factory_args["server_args_overrides"]
+    talker_args = _stage(config, "talker_ar").factory_args["server_args_overrides"]
+    assert thinker_args["max_mamba_cache_size"] == 32
+    assert talker_args["max_mamba_cache_size"] == 12
 
 
 def test_qwen35_cli_keeps_speech_prefix_cache_default():

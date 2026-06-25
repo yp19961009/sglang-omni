@@ -10,6 +10,7 @@ import torch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.scheduling.messages import OutgoingMessage
 
 _QWEN35_EXTERNAL_DECODE_INPUT_MODE = "qwen35_external"
@@ -34,6 +35,38 @@ class QwenTalkerModelRunner(ModelRunner):
 
     def execute(self, scheduler_output: Any):
         return super().execute(scheduler_output)
+
+    @staticmethod
+    def _profile_request_id(sched_req: Any) -> str | None:
+        data = getattr(sched_req, "data", None)
+        for obj in (
+            getattr(data, "req", None),
+            getattr(data, "stage_payload", None),
+            sched_req,
+        ):
+            if obj is None:
+                continue
+            rid = getattr(obj, "rid", None) or getattr(obj, "request_id", None)
+            if rid:
+                return str(rid)
+        return None
+
+    def _emit_batch_profile_event(
+        self,
+        requests: list,
+        event_name: str,
+        **metadata: Any,
+    ) -> None:
+        for sched_req in requests:
+            request_id = self._profile_request_id(sched_req)
+            if request_id is None:
+                continue
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name=event_name,
+                metadata=metadata,
+            )
 
     def custom_prefill_forward(
         self,
@@ -64,8 +97,44 @@ class QwenTalkerModelRunner(ModelRunner):
                 "Talker decode reached model runner without ready feedback/text input"
             )
 
-        self.model.prepare_decode_buffers(requests)
-        self._write_feedback_buffers(requests)
+        self._emit_batch_profile_event(
+            requests,
+            "talker_feedback_prepare_start",
+            batch_size=len(requests),
+        )
+        try:
+            self._emit_batch_profile_event(
+                requests,
+                "talker_prepare_decode_buffers_start",
+                batch_size=len(requests),
+            )
+            try:
+                self.model.prepare_decode_buffers(requests)
+            finally:
+                self._emit_batch_profile_event(
+                    requests,
+                    "talker_prepare_decode_buffers_end",
+                    batch_size=len(requests),
+                )
+            self._emit_batch_profile_event(
+                requests,
+                "talker_write_feedback_buffers_start",
+                batch_size=len(requests),
+            )
+            try:
+                self._write_feedback_buffers(requests)
+            finally:
+                self._emit_batch_profile_event(
+                    requests,
+                    "talker_write_feedback_buffers_end",
+                    batch_size=len(requests),
+                )
+        finally:
+            self._emit_batch_profile_event(
+                requests,
+                "talker_feedback_prepare_end",
+                batch_size=len(requests),
+            )
 
     def post_prefill(
         self,
@@ -87,7 +156,21 @@ class QwenTalkerModelRunner(ModelRunner):
         talker_hidden = result.logits_output.hidden_states
         if isinstance(talker_hidden, torch.Tensor) and talker_hidden.ndim == 2:
             talker_hidden = talker_hidden.unsqueeze(1)
-        self._run_code_predictor_forward(layer0_codes, talker_hidden, requests)
+        self._emit_batch_profile_event(
+            requests,
+            "talker_code_predictor_start",
+            batch_size=len(requests),
+            seq_len=int(layer0_codes.shape[1]),
+        )
+        try:
+            self._run_code_predictor_forward(layer0_codes, talker_hidden, requests)
+        finally:
+            self._emit_batch_profile_event(
+                requests,
+                "talker_code_predictor_end",
+                batch_size=len(requests),
+                seq_len=int(layer0_codes.shape[1]),
+            )
         schedule_batch.output_ids = result.next_token_ids
         self._emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,
@@ -143,30 +226,49 @@ class QwenTalkerModelRunner(ModelRunner):
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        for idx, sched_req in enumerate(requests):
-            req = schedule_batch.reqs[idx]
-            code_chunk = self.model._output_codes[idx].detach().clone()
-            feedback_row = self.model._output_embeds[idx].detach().clone()
-            should_emit = bool(
-                getattr(sched_req.data, "last_talker_decode_should_emit", True)
-            )
-            # Tell code2wav whether to forward audio chunks to the Coordinator.
-            stage_payload = sched_req.data.stage_payload
-            is_streaming = bool(
-                stage_payload is not None
-                and (stage_payload.request.params or {}).get("stream", False)
-            )
-            if should_emit:
-                self._outbox.put(
-                    OutgoingMessage(
-                        request_id=req.rid,
-                        type="stream",
-                        data=code_chunk,
-                        target=self._code2wav_target,
-                        metadata={"stream": is_streaming},
-                    )
+        emitted = 0
+        skipped = 0
+        self._emit_batch_profile_event(
+            requests,
+            "talker_emit_chunk_start",
+            batch_size=len(requests),
+        )
+        try:
+            for idx, sched_req in enumerate(requests):
+                req = schedule_batch.reqs[idx]
+                code_chunk = self.model._output_codes[idx].detach().clone()
+                feedback_row = self.model._output_embeds[idx].detach().clone()
+                should_emit = bool(
+                    getattr(sched_req.data, "last_talker_decode_should_emit", True)
                 )
-            sched_req.data.pending_feedback_queue.append(feedback_row)
+                # Tell code2wav whether to forward audio chunks to the Coordinator.
+                stage_payload = sched_req.data.stage_payload
+                is_streaming = bool(
+                    stage_payload is not None
+                    and (stage_payload.request.params or {}).get("stream", False)
+                )
+                if should_emit:
+                    emitted += 1
+                    self._outbox.put(
+                        OutgoingMessage(
+                            request_id=req.rid,
+                            type="stream",
+                            data=code_chunk,
+                            target=self._code2wav_target,
+                            metadata={"stream": is_streaming},
+                        )
+                    )
+                else:
+                    skipped += 1
+                sched_req.data.pending_feedback_queue.append(feedback_row)
+        finally:
+            self._emit_batch_profile_event(
+                requests,
+                "talker_emit_chunk_end",
+                batch_size=len(requests),
+                emitted=emitted,
+                skipped=skipped,
+            )
 
     def sample_before_post_prefill(
         self, forward_batch: Any, schedule_batch: Any, requests: list

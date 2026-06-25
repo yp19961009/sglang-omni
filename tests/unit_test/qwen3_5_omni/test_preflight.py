@@ -279,8 +279,9 @@ def test_qwen35_preflight_checks_processor_assets_in_split_thinker_dir(tmp_path)
     _write_json(model_root / "talker" / "config.json", _talker_config())
     _touch_hf_weights(model_root / "thinker")
     _touch_hf_weights(model_root / "talker")
-    # 中文说明：runtime 会从 root/thinker 加载 HF processor/tokenizer；
-    # preflight 也必须检查同一路径，避免 split checkpoint 被误报 root 缺资产。
+    # Runtime loads the HF processor/tokenizer from root/thinker; preflight must
+    # check the same path so split checkpoints are not reported as missing root
+    # assets.
     _touch_processor_assets(model_root / "thinker")
     _touch_code2wav(code2wav_root)
 

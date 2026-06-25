@@ -209,6 +209,42 @@ def test_qwen35_audio_output_resolvers_honor_params_modalities():
     assert request_builders.resolve_terminal_stages(payload.request) == ["decode"]
 
 
+def test_qwen35_mm_aggregate_to_thinker_projection_is_isolated():
+    model_inputs = {"video_embeds": torch.ones(2, 4)}
+    state = Qwen3OmniPipelineState(
+        prompt={
+            "input_ids": torch.tensor([1, 2]),
+            "attention_mask": torch.tensor([1, 1]),
+            "prompt_text": "hi",
+        },
+        thinker_inputs={
+            "model_inputs": model_inputs,
+            "capture_model_output_keys": ("hidden_states",),
+        },
+        stream_state={"token_ids": []},
+        encoder_inputs={"image_encoder": {"large": torch.ones(8)}},
+    )
+    payload = StagePayload(
+        request_id="req-project",
+        request=OmniRequest(inputs={}, params={}),
+        data=state.to_dict(),
+    )
+
+    projected = request_builders.project_mm_aggregate_to_thinker(payload)
+    projected_state = Qwen3OmniPipelineState.from_dict(projected.data)
+
+    assert projected_state.prompt == state.prompt
+    assert projected_state.prompt is not state.prompt
+    assert projected_state.thinker_inputs["model_inputs"] is not model_inputs
+    assert (
+        projected_state.thinker_inputs["model_inputs"]["video_embeds"]
+        is model_inputs["video_embeds"]
+    )
+    assert projected_state.thinker_inputs is not state.thinker_inputs
+    assert projected_state.stream_state is not state.stream_state
+    assert projected_state.encoder_inputs == {}
+
+
 def test_qwen35_merge_preserves_audio_is_dependent_mask():
     state = Qwen3OmniPipelineState(
         prompt={"input_ids": torch.tensor([1]), "attention_mask": torch.tensor([1])},
@@ -464,6 +500,613 @@ def test_qwen35_talker_prefill_uses_talker_text_embedding():
 
     assert rows.tolist() == [[5.0] * 4, [6.0] * 4]
     assert model.seen_text_ids == [[5, 6]]
+
+
+def test_qwen35_talker_reconstruct_maps_media_pad_values_before_embedding():
+    model = _FakeTalkerModel()
+    builder = _builder(model)
+    pad_id = -5364141779887080204
+    hidden_seen = []
+
+    def fake_hidden_embeddings(token_ids):
+        hidden_seen.append(token_ids.detach().cpu().tolist())
+        values = token_ids.to(dtype=torch.float32).unsqueeze(-1) + 1000.0
+        return values.expand(token_ids.shape[0], 4).clone()
+
+    builder._load_thinker_hidden_embeddings = fake_hidden_embeddings
+    state = Qwen3OmniPipelineState(
+        prompt={
+            "input_ids": torch.tensor([20, 31, pad_id, 32], dtype=torch.long),
+            "attention_mask": torch.ones(4, dtype=torch.long),
+            "prompt_text": "",
+        },
+        thinker_inputs={
+            "model_inputs": {
+                "video_embeds": torch.tensor([[900.0] * 4]),
+                "pad_values": {"video": pad_id},
+            }
+        },
+    )
+
+    prompt_ids, prompt_embed, prompt_hidden, _ = builder._reconstruct_prompt_states(
+        state
+    )
+
+    assert prompt_ids.tolist() == [20, 31, 3, 32]
+    assert model.seen_text_ids == [[20, 31, 3, 32]]
+    assert hidden_seen == [[20, 31, 3, 32]]
+    assert prompt_embed[2].tolist() == [3.0] * 4
+    assert prompt_hidden[2].tolist() == [900.0] * 4
+
+
+def test_qwen35_talker_media_pad_values_accept_unsigned_int64_alias():
+    builder = _builder(_FakeTalkerModel())
+    unsigned_pad = (1 << 63) + 17
+    signed_pad = unsigned_pad - (1 << 64)
+
+    canonical = builder._canonicalize_prompt_ids_for_talker(
+        torch.tensor([20, signed_pad, 32], dtype=torch.long),
+        {"pad_values": {"video": unsigned_pad}},
+    )
+
+    assert canonical.tolist() == [20, 3, 32]
+
+
+def test_qwen35_talker_media_pad_values_accept_multiple_aliases():
+    builder = _builder(_FakeTalkerModel())
+    unsigned_pad = (1 << 63) + 19
+    signed_pad = unsigned_pad - (1 << 64)
+    other_pad = -5364141779887080204
+
+    canonical = builder._canonicalize_prompt_ids_for_talker(
+        torch.tensor([20, signed_pad, other_pad, 32], dtype=torch.long),
+        {"pad_values": {"video": [unsigned_pad, other_pad]}},
+    )
+
+    assert canonical.tolist() == [20, 3, 3, 32]
+
+
+def test_qwen35_talker_maps_cache_pad_runs_by_special_token_context():
+    builder = _builder(
+        _FakeTalkerModel(),
+        thinker_config=SimpleNamespace(
+            vision_start_token_id=100,
+            vision_end_token_id=101,
+            audio_end_token_id=102,
+        ),
+    )
+    video_pad = -5364141779887080204
+    audio_pad = -5316291547151614670
+
+    canonical = builder._canonicalize_prompt_ids_for_talker(
+        torch.tensor(
+            [
+                20,
+                100,
+                video_pad,
+                video_pad,
+                video_pad,
+                101,
+                audio_pad,
+                audio_pad,
+                102,
+                32,
+            ],
+            dtype=torch.long,
+        ),
+        {
+            "video_embeds": torch.ones((3, 4)),
+            "audio_embeds": torch.ones((2, 4)),
+        },
+    )
+
+    assert canonical.tolist() == [20, 100, 3, 3, 3, 101, 1, 1, 102, 32]
+
+
+def test_qwen35_talker_maps_fully_compressed_media_cache_prompt():
+    builder = _builder(_FakeTalkerModel())
+    compressed_ids = torch.tensor(
+        [
+            -5364141779887080204,
+            -5364141779887080203,
+            -5364141779887080202,
+            -5316291547151614670,
+            -5316291547151614669,
+            -5364141779887080201,
+            -5364141779887080200,
+            -5364141779887080199,
+            -5316291547151614668,
+            -5316291547151614667,
+        ],
+        dtype=torch.long,
+    )
+
+    canonical = builder._canonicalize_prompt_ids_for_talker(
+        compressed_ids,
+        {
+            "video_embeds": torch.ones((6, 4)),
+            "video_grid_thw": torch.tensor(
+                [[1, 1, 3], [1, 1, 3]],
+                dtype=torch.long,
+            ),
+            "audio_embeds": torch.ones((4, 4)),
+            "audio_feature_lengths": torch.tensor([200, 200], dtype=torch.long),
+        },
+    )
+
+    assert canonical.tolist() == [3, 3, 3, 1, 1, 3, 3, 3, 1, 1]
+
+
+def test_qwen35_talker_maps_compressed_rtc_media_prompt_with_text_filler():
+    builder = _builder(_FakeTalkerModel())
+    compressed_ids = torch.arange(
+        -6000000000000000000,
+        -6000000000000000000 + 36560,
+        dtype=torch.long,
+    )
+
+    canonical = builder._canonicalize_prompt_ids_for_talker(
+        compressed_ids,
+        {
+            "video_embeds": torch.ones((35200, 4)),
+            "video_grid_thw": torch.tensor([[1, 40, 88]] * 40, dtype=torch.long),
+            "audio_embeds": torch.ones((560, 4)),
+            "audio_feature_lengths": torch.tensor([200] * 40, dtype=torch.long),
+        },
+    )
+
+    assert int((canonical == 3).sum().item()) == 35200
+    assert int((canonical == 1).sum().item()) == 560
+    assert int((canonical == 0).sum().item()) == 800
+    assert canonical[:19].tolist() == [0] * 19
+    assert canonical[19:899].tolist() == [3] * 880
+    assert canonical[899].item() == 0
+    assert canonical[900:914].tolist() == [1] * 14
+
+
+def test_qwen35_talker_maps_compressed_rtc_media_prompt_without_slot_metadata():
+    builder = _builder(_FakeTalkerModel())
+    compressed_ids = torch.arange(
+        -6000000000000000000,
+        -6000000000000000000 + 36560,
+        dtype=torch.long,
+    )
+
+    canonical = builder._canonicalize_prompt_ids_for_talker(
+        compressed_ids,
+        {
+            "video_embeds": torch.ones((35200, 4)),
+            "audio_embeds": torch.ones((560, 4)),
+        },
+    )
+
+    assert int((canonical == 3).sum().item()) == 35200
+    assert int((canonical == 1).sum().item()) == 560
+    assert int((canonical == 0).sum().item()) == 800
+    assert canonical[:19].tolist() == [0] * 19
+    assert canonical[19:899].tolist() == [3] * 880
+    assert canonical[899].item() == 0
+    assert canonical[900:914].tolist() == [1] * 14
+
+
+def test_qwen35_talker_preserves_original_text_in_compressed_rtc_prompt():
+    builder = _builder(_FakeTalkerModel())
+    compressed_ids = torch.arange(
+        -6000000000000000000,
+        -6000000000000000000 + 36560,
+        dtype=torch.long,
+    )
+    original_ids = torch.full((36560,), 99, dtype=torch.long)
+
+    canonical = builder._canonicalize_prompt_ids_for_talker(
+        compressed_ids,
+        {
+            "original_input_ids": original_ids,
+            "video_embeds": torch.ones((35200, 4)),
+            "audio_embeds": torch.ones((560, 4)),
+        },
+    )
+
+    assert int((canonical == 3).sum().item()) == 35200
+    assert int((canonical == 1).sum().item()) == 560
+    assert int((canonical == 99).sum().item()) == 800
+    assert int((canonical == 0).sum().item()) == 0
+    assert canonical[:19].tolist() == [99] * 19
+    assert canonical[19:899].tolist() == [3] * 880
+    assert canonical[899].item() == 99
+    assert canonical[900:914].tolist() == [1] * 14
+
+
+def test_qwen35_talker_restores_original_ids_for_partially_compressed_rtc_prompt():
+    builder = _builder(_FakeTalkerModel())
+    original_ids = torch.tensor(
+        [3, 3, 3, 99, 1, 1, 3, 3, 3, 99, 1, 1],
+        dtype=torch.long,
+    )
+    partial_ids = torch.tensor(
+        [
+            3,
+            -6000000000000000000,
+            -6000000000000000001,
+            -6000000000000000002,
+            1,
+            -6000000000000000003,
+            -6000000000000000004,
+            3,
+            3,
+            -6000000000000000005,
+            -6000000000000000006,
+            1,
+        ],
+        dtype=torch.long,
+    )
+
+    canonical = builder._canonicalize_prompt_ids_for_talker(
+        partial_ids,
+        {
+            "original_input_ids": original_ids,
+            "video_embeds": torch.ones((6, 4)),
+            "video_grid_thw": torch.tensor(
+                [[1, 1, 3], [1, 1, 3]],
+                dtype=torch.long,
+            ),
+            "audio_embeds": torch.ones((4, 4)),
+            "audio_feature_lengths": torch.tensor([200, 200], dtype=torch.long),
+        },
+    )
+
+    assert canonical.tolist() == original_ids.tolist()
+
+
+def test_qwen35_talker_maps_partially_compressed_rtc_prompt_by_slot_layout():
+    builder = _builder(_FakeTalkerModel())
+    partial_ids = torch.tensor(
+        [
+            3,
+            -6000000000000000000,
+            -6000000000000000001,
+            -6000000000000000002,
+            1,
+            -6000000000000000003,
+            -6000000000000000004,
+            3,
+            3,
+            -6000000000000000005,
+            -6000000000000000006,
+            1,
+        ],
+        dtype=torch.long,
+    )
+
+    canonical = builder._canonicalize_prompt_ids_for_talker(
+        partial_ids,
+        {
+            "video_embeds": torch.ones((6, 4)),
+            "video_grid_thw": torch.tensor(
+                [[1, 1, 3], [1, 1, 3]],
+                dtype=torch.long,
+            ),
+            "audio_embeds": torch.ones((4, 4)),
+            "audio_feature_lengths": torch.tensor([200, 200], dtype=torch.long),
+        },
+    )
+
+    assert canonical.tolist() == [3, 3, 3, 0, 1, 1, 3, 3, 3, 0, 1, 1]
+
+
+def test_qwen35_talker_reconstruct_maps_missing_pad_values_by_feature_rows():
+    model = _FakeTalkerModel()
+    builder = _builder(model)
+    pad_id = -5316291547151614670
+    hidden_seen = []
+
+    def fake_hidden_embeddings(token_ids):
+        hidden_seen.append(token_ids.detach().cpu().tolist())
+        values = token_ids.to(dtype=torch.float32).unsqueeze(-1) + 1000.0
+        return values.expand(token_ids.shape[0], 4).clone()
+
+    builder._load_thinker_hidden_embeddings = fake_hidden_embeddings
+    state = Qwen3OmniPipelineState(
+        prompt={
+            "input_ids": torch.tensor([20, pad_id, pad_id, 32], dtype=torch.long),
+            "attention_mask": torch.ones(4, dtype=torch.long),
+            "prompt_text": "",
+        },
+        thinker_inputs={
+            "model_inputs": {
+                "video_embeds": torch.tensor([[900.0] * 4, [901.0] * 4]),
+            }
+        },
+    )
+
+    prompt_ids, _, prompt_hidden, _ = builder._reconstruct_prompt_states(state)
+
+    assert prompt_ids.tolist() == [20, 3, 3, 32]
+    assert model.seen_text_ids == [[20, 3, 3, 32]]
+    assert hidden_seen == [[20, 3, 3, 32]]
+    assert prompt_hidden[1].tolist() == [900.0] * 4
+    assert prompt_hidden[2].tolist() == [901.0] * 4
+
+
+def test_qwen35_talker_reconstruct_maps_video_frame_image_placeholders():
+    model = _FakeTalkerModel()
+    builder = _builder(model)
+    hidden_seen = []
+
+    def fake_hidden_embeddings(token_ids):
+        hidden_seen.append(token_ids.detach().cpu().tolist())
+        values = token_ids.to(dtype=torch.float32).unsqueeze(-1) + 1000.0
+        return values.expand(token_ids.shape[0], 4).clone()
+
+    builder._load_thinker_hidden_embeddings = fake_hidden_embeddings
+    state = Qwen3OmniPipelineState(
+        prompt={
+            "input_ids": torch.tensor([20, 3, 3, 2, 32], dtype=torch.long),
+            "attention_mask": torch.ones(5, dtype=torch.long),
+            "prompt_text": "",
+        },
+        thinker_inputs={
+            "model_inputs": {
+                "video_embeds": torch.tensor(
+                    [[900.0] * 4, [901.0] * 4, [902.0] * 4]
+                ),
+            }
+        },
+    )
+
+    prompt_ids, _, prompt_hidden, _ = builder._reconstruct_prompt_states(state)
+
+    assert prompt_ids.tolist() == [20, 3, 3, 3, 32]
+    assert model.seen_text_ids == [[20, 3, 3, 3, 32]]
+    assert hidden_seen == [[20, 3, 3, 3, 32]]
+    assert prompt_hidden[1].tolist() == [900.0] * 4
+    assert prompt_hidden[2].tolist() == [901.0] * 4
+    assert prompt_hidden[3].tolist() == [902.0] * 4
+
+
+def test_qwen35_talker_reconstruct_classifies_mixed_media_pad_ids_by_slot_rows():
+    model = _FakeTalkerModel()
+    builder = _builder(model)
+    video_pad_0 = -5327409853779854172
+    audio_pad = -5259013824590398178
+    video_pad_1 = -5250004939597366257
+    hidden_seen = []
+
+    def fake_hidden_embeddings(token_ids):
+        hidden_seen.append(token_ids.detach().cpu().tolist())
+        values = token_ids.to(dtype=torch.float32).unsqueeze(-1) + 1000.0
+        return values.expand(token_ids.shape[0], 4).clone()
+
+    builder._load_thinker_hidden_embeddings = fake_hidden_embeddings
+    state = Qwen3OmniPipelineState(
+        prompt={
+            "input_ids": torch.tensor(
+                [20, video_pad_0, video_pad_0, audio_pad, video_pad_1, video_pad_1, 32],
+                dtype=torch.long,
+            ),
+            "attention_mask": torch.ones(7, dtype=torch.long),
+            "prompt_text": "",
+        },
+        thinker_inputs={
+            "model_inputs": {
+                "video_embeds": torch.tensor(
+                    [[900.0] * 4, [901.0] * 4, [902.0] * 4, [903.0] * 4]
+                ),
+                "audio_embeds": torch.tensor([[800.0] * 4]),
+                "video_grid_thw": torch.tensor([[1, 1, 2], [1, 1, 2]]),
+                "audio_feature_lengths": torch.tensor([1]),
+            }
+        },
+    )
+
+    prompt_ids, _, prompt_hidden, _ = builder._reconstruct_prompt_states(state)
+
+    assert prompt_ids.tolist() == [20, 3, 3, 1, 3, 3, 32]
+    assert model.seen_text_ids == [[20, 3, 3, 1, 3, 3, 32]]
+    assert hidden_seen == [[20, 3, 3, 1, 3, 3, 32]]
+    assert prompt_hidden[1].tolist() == [900.0] * 4
+    assert prompt_hidden[2].tolist() == [901.0] * 4
+    assert prompt_hidden[3].tolist() == [800.0] * 4
+    assert prompt_hidden[4].tolist() == [902.0] * 4
+    assert prompt_hidden[5].tolist() == [903.0] * 4
+
+
+def test_qwen35_talker_reconstruct_classifies_video_slots_after_spatial_merge():
+    model = _FakeTalkerModel()
+    thinker_config = SimpleNamespace(
+        vision_config=SimpleNamespace(spatial_merge_size=2)
+    )
+    builder = _builder(model, thinker_config=thinker_config)
+    video_pad = -5238885191902315364
+    audio_pad = -5286455903937610684
+    hidden_seen = []
+
+    def fake_hidden_embeddings(token_ids):
+        hidden_seen.append(token_ids.detach().cpu().tolist())
+        values = token_ids.to(dtype=torch.float32).unsqueeze(-1) + 1000.0
+        return values.expand(token_ids.shape[0], 4).clone()
+
+    builder._load_thinker_hidden_embeddings = fake_hidden_embeddings
+    state = Qwen3OmniPipelineState(
+        prompt={
+            "input_ids": torch.tensor(
+                [
+                    20,
+                    video_pad,
+                    video_pad,
+                    video_pad,
+                    video_pad,
+                    audio_pad,
+                    audio_pad,
+                    32,
+                ],
+                dtype=torch.long,
+            ),
+            "attention_mask": torch.ones(8, dtype=torch.long),
+            "prompt_text": "",
+        },
+        thinker_inputs={
+            "model_inputs": {
+                "audio_embeds": torch.tensor([[800.0] * 4, [801.0] * 4]),
+                "video_embeds": torch.tensor(
+                    [[900.0] * 4, [901.0] * 4, [902.0] * 4, [903.0] * 4]
+                ),
+                "audio_feature_lengths": torch.tensor([2]),
+                "video_grid_thw": torch.tensor([[1, 4, 4]]),
+            }
+        },
+    )
+
+    prompt_ids, _, prompt_hidden, _ = builder._reconstruct_prompt_states(state)
+
+    assert prompt_ids.tolist() == [20, 3, 3, 3, 3, 1, 1, 32]
+    assert model.seen_text_ids == [[20, 3, 3, 3, 3, 1, 1, 32]]
+    assert hidden_seen == [[20, 3, 3, 3, 3, 1, 1, 32]]
+    assert prompt_hidden[1].tolist() == [900.0] * 4
+    assert prompt_hidden[2].tolist() == [901.0] * 4
+    assert prompt_hidden[3].tolist() == [902.0] * 4
+    assert prompt_hidden[4].tolist() == [903.0] * 4
+    assert prompt_hidden[5].tolist() == [800.0] * 4
+    assert prompt_hidden[6].tolist() == [801.0] * 4
+
+
+def test_qwen35_talker_reconstruct_infers_visual_merge_from_feature_rows():
+    model = _FakeTalkerModel()
+    builder = _builder(model)
+    video_pad = -5327409853779854172
+    audio_pad = -5259013824590398178
+    hidden_seen = []
+
+    def fake_hidden_embeddings(token_ids):
+        hidden_seen.append(token_ids.detach().cpu().tolist())
+        values = token_ids.to(dtype=torch.float32).unsqueeze(-1) + 1000.0
+        return values.expand(token_ids.shape[0], 4).clone()
+
+    builder._load_thinker_hidden_embeddings = fake_hidden_embeddings
+    state = Qwen3OmniPipelineState(
+        prompt={
+            "input_ids": torch.tensor(
+                [20, video_pad, video_pad, video_pad, video_pad, audio_pad, audio_pad, 32],
+                dtype=torch.long,
+            ),
+            "attention_mask": torch.ones(8, dtype=torch.long),
+            "prompt_text": "",
+        },
+        thinker_inputs={
+            "model_inputs": {
+                "audio_embeds": torch.tensor([[800.0] * 4, [801.0] * 4]),
+                "video_embeds": torch.tensor(
+                    [[900.0] * 4, [901.0] * 4, [902.0] * 4, [903.0] * 4]
+                ),
+                "audio_feature_lengths": torch.tensor([2]),
+                "video_grid_thw": torch.tensor([[1, 4, 4]]),
+            }
+        },
+    )
+
+    prompt_ids, _, prompt_hidden, _ = builder._reconstruct_prompt_states(state)
+
+    assert prompt_ids.tolist() == [20, 3, 3, 3, 3, 1, 1, 32]
+    assert model.seen_text_ids == [[20, 3, 3, 3, 3, 1, 1, 32]]
+    assert hidden_seen == [[20, 3, 3, 3, 3, 1, 1, 32]]
+    assert prompt_hidden[1].tolist() == [900.0] * 4
+    assert prompt_hidden[4].tolist() == [903.0] * 4
+    assert prompt_hidden[5].tolist() == [800.0] * 4
+    assert prompt_hidden[6].tolist() == [801.0] * 4
+
+
+def test_qwen35_talker_prefill_handles_empty_assistant_segment():
+    model = _FakeTalkerModel()
+    builder = _builder(model)
+    tts_bos_embed, tts_eos_embed, tts_pad_embed = (
+        torch.full((1, 4), 10.0),
+        torch.full((1, 4), 11.0),
+        torch.full((1, 4), 12.0),
+    )
+
+    prefill = builder._build_prefill_input(
+        thinker_embed=torch.ones((3, 4)),
+        thinker_hidden=torch.ones((3, 4)),
+        thinker_input_ids=torch.tensor([20, 31, 21], dtype=torch.long),
+        multimodal_mask=torch.zeros(3, dtype=torch.bool),
+        assistant_token_count=0,
+        text_projection=nn.Identity(),
+        hidden_projection=nn.Identity(),
+        codec_embed_fn=model.get_input_embeddings(),
+        tts_bos_embed=tts_bos_embed,
+        tts_eos_embed=tts_eos_embed,
+        tts_pad_embed=tts_pad_embed,
+        assistant_instruct_embed=None,
+        im_start_token_id=20,
+        system_token_id=30,
+        user_token_id=31,
+        assistant_token_id=32,
+        speaker_id=None,
+        codec_nothink_id=41,
+        codec_think_id=None,
+        codec_think_bos_id=42,
+        codec_think_eos_id=43,
+        codec_pad_id=44,
+        codec_bos_id=40,
+        tts_pad_token_id=12,
+        include_assistant_eos=True,
+        im_end_token_id=21,
+    )
+
+    assert prefill["input_embeds"].shape[0] > 0
+    assert prefill["input_ids"].shape[0] == prefill["input_embeds"].shape[0]
+    assert prefill["future_text_rows"].shape == (1, 4)
+
+
+def test_qwen35_talker_reconstruct_classifies_pad_runs_by_boundary_tokens():
+    model = _FakeTalkerModel()
+    thinker_config = SimpleNamespace(
+        vision_start_token_id=70,
+        vision_end_token_id=71,
+        audio_start_token_id=80,
+        audio_end_token_id=81,
+    )
+    builder = _builder(model, thinker_config=thinker_config)
+    video_pad = -5308550691032548132
+    audio_pad = -5267736634739934270
+    hidden_seen = []
+
+    def fake_hidden_embeddings(token_ids):
+        hidden_seen.append(token_ids.detach().cpu().tolist())
+        values = token_ids.to(dtype=torch.float32).unsqueeze(-1) + 1000.0
+        return values.expand(token_ids.shape[0], 4).clone()
+
+    builder._load_thinker_hidden_embeddings = fake_hidden_embeddings
+    state = Qwen3OmniPipelineState(
+        prompt={
+            "input_ids": torch.tensor(
+                [70, video_pad, video_pad, video_pad, 71, 80, audio_pad, audio_pad, 81],
+                dtype=torch.long,
+            ),
+            "attention_mask": torch.ones(9, dtype=torch.long),
+            "prompt_text": "",
+        },
+        thinker_inputs={
+            "model_inputs": {
+                "video_embeds": torch.tensor(
+                    [[900.0] * 4, [901.0] * 4, [902.0] * 4]
+                ),
+                "audio_embeds": torch.tensor([[800.0] * 4, [801.0] * 4]),
+                "audio_feature_lengths": torch.tensor([2]),
+            }
+        },
+    )
+
+    prompt_ids, _, prompt_hidden, _ = builder._reconstruct_prompt_states(state)
+
+    assert prompt_ids.tolist() == [70, 3, 3, 3, 71, 80, 1, 1, 81]
+    assert model.seen_text_ids == [[70, 3, 3, 3, 71, 80, 1, 1, 81]]
+    assert hidden_seen == [[70, 3, 3, 3, 71, 80, 1, 1, 81]]
+    assert prompt_hidden[1].tolist() == [900.0] * 4
+    assert prompt_hidden[2].tolist() == [901.0] * 4
+    assert prompt_hidden[3].tolist() == [902.0] * 4
+    assert prompt_hidden[6].tolist() == [800.0] * 4
+    assert prompt_hidden[7].tolist() == [801.0] * 4
 
 
 def test_qwen35_talker_special_embeds_use_talker_text_embedding():
@@ -1620,7 +2263,7 @@ def test_qwen35_mrope_positions_include_image_end_position():
         [1, 2, 1, 2],
     ]
     assert positions[:, 5].tolist() == [3, 3, 3]
-    assert delta == int(positions.max().item() + 1 - 7)
+    assert int(delta.item()) == int(positions.max().item() + 1 - 7)
 
 
 def test_qwen35_mrope_positions_append_video_audio_span():
@@ -1634,7 +2277,7 @@ def test_qwen35_mrope_positions_append_video_audio_span():
     assert positions[:, 5].tolist() == [3, 3, 3]
     assert positions[:, 6:8].tolist() == [[1, 2], [1, 2], [1, 2]]
     assert positions[:, 8].tolist() == [3, 3, 3]
-    assert delta == int(positions.max().item() + 1 - 9)
+    assert int(delta.item()) == int(positions.max().item() + 1 - 9)
 
 
 def test_qwen35_mrope_positions_delegate_audio_only_to_qwen3_builder(monkeypatch):
@@ -1668,7 +2311,7 @@ def test_qwen35_mrope_positions_delegate_audio_only_to_qwen3_builder(monkeypatch
     assert captured["thinker_config"].audio_start_token_id == config.audio_token_id
     assert captured["thinker_config"].position_id_per_seconds == 1
     assert positions.tolist() == torch.ones(3, 4, dtype=torch.long).tolist()
-    assert delta == 5
+    assert int(delta.item()) == 5
 
 
 def test_qwen35_mrope_positions_skip_text_only_without_audio():
@@ -1684,6 +2327,7 @@ def test_qwen35_mrope_positions_skip_text_only_without_audio():
 
 def test_qwen35_thinker_adapter_uses_next_mrope_builder(monkeypatch):
     monkeypatch.delenv("QWEN35_LIMIT_PREFIX_CACHE_BEFORE_MEDIA", raising=False)
+    monkeypatch.delenv("QWEN35_MAMBA_MEDIA_BRANCH_CACHE", raising=False)
     captured = {}
 
     def _fake_build_sglang_thinker_request(*args, **kwargs):
@@ -1718,6 +2362,7 @@ def test_qwen35_thinker_adapter_uses_next_mrope_builder(monkeypatch):
         is request_builders._compute_qwen35_mrope_positions
     )
     assert captured["limit_prefix_cache_before_media"] is False
+    assert captured["mamba_media_branching_cache"] is True
 
 
 def test_qwen35_thinker_adapter_can_limit_prefix_cache_before_media(monkeypatch):
@@ -1750,6 +2395,303 @@ def test_qwen35_thinker_adapter_can_limit_prefix_cache_before_media(monkeypatch)
     request_builder(payload)
 
     assert captured["limit_prefix_cache_before_media"] is True
+
+
+def test_qwen35_thinker_adapter_limits_rtc_prefix_when_omitting_visual_payloads(
+    monkeypatch,
+):
+    captured = {}
+
+    def _fake_build_sglang_thinker_request(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return SimpleNamespace(stage_payload=None)
+
+    monkeypatch.delenv("QWEN35_LIMIT_PREFIX_CACHE_BEFORE_MEDIA", raising=False)
+    monkeypatch.setenv("SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS", "1")
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "build_sglang_thinker_request",
+        _fake_build_sglang_thinker_request,
+    )
+
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    state = Qwen3OmniPipelineState(prompt={"input_ids": torch.tensor([1])})
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(
+            inputs={},
+            metadata={"pre_run": True, "media_cache_namespace": "rtc:req-0"},
+        ),
+        data=state.to_dict(),
+    )
+
+    request_builder(payload)
+
+    assert captured["limit_prefix_cache_before_media"] is True
+
+
+def test_qwen35_thinker_adapter_allows_prefix_limit_override_for_rtc_omit(
+    monkeypatch,
+):
+    captured = {}
+
+    def _fake_build_sglang_thinker_request(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return SimpleNamespace(stage_payload=None)
+
+    monkeypatch.setenv("QWEN35_LIMIT_PREFIX_CACHE_BEFORE_MEDIA", "0")
+    monkeypatch.setenv("SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS", "1")
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "build_sglang_thinker_request",
+        _fake_build_sglang_thinker_request,
+    )
+
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    state = Qwen3OmniPipelineState(prompt={"input_ids": torch.tensor([1])})
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(
+            inputs={},
+            metadata={"pre_run": True, "media_cache_namespace": "rtc:req-0"},
+        ),
+        data=state.to_dict(),
+    )
+
+    request_builder(payload)
+
+    assert captured["limit_prefix_cache_before_media"] is False
+
+
+def test_qwen35_thinker_adapter_can_disable_mamba_media_branching_cache(monkeypatch):
+    captured = {}
+
+    def _fake_build_sglang_thinker_request(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return SimpleNamespace(stage_payload=None)
+
+    monkeypatch.setenv("QWEN35_MAMBA_MEDIA_BRANCH_CACHE", "off")
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "build_sglang_thinker_request",
+        _fake_build_sglang_thinker_request,
+    )
+
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    state = Qwen3OmniPipelineState(prompt={"input_ids": torch.tensor([1])})
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(inputs={}),
+        data=state.to_dict(),
+    )
+
+    request_builder(payload)
+
+    assert captured["mamba_media_branching_cache"] is False
+
+
+def test_qwen35_thinker_adapter_makes_rtc_prerun_prefill_only(monkeypatch):
+    monkeypatch.delenv("QWEN35_RTC_PRERUN_PREFILL_ONLY", raising=False)
+    captured = {}
+
+    def _fake_build_sglang_thinker_request(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return SimpleNamespace(stage_payload=None)
+
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "build_sglang_thinker_request",
+        _fake_build_sglang_thinker_request,
+    )
+
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    state = Qwen3OmniPipelineState(prompt={"input_ids": torch.tensor([1])})
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(
+            inputs={},
+            params={"max_tokens": 2, "max_completion_tokens": 2, "max_new_tokens": 2},
+            metadata={"pre_run": True},
+        ),
+        data=state.to_dict(),
+    )
+
+    request_builder(payload)
+
+    assert captured["params"]["max_tokens"] == 0
+    assert captured["params"]["max_completion_tokens"] == 0
+    assert captured["params"]["max_new_tokens"] == 0
+
+
+def test_qwen35_thinker_adapter_marks_rtc_prerun_isolated_before_req_init(
+    monkeypatch,
+):
+    monkeypatch.delenv("QWEN35_RTC_ISOLATE_PRERUN_PREFILL", raising=False)
+    fake_req = SimpleNamespace(is_prefill_only=False)
+
+    def _fake_build_sglang_thinker_request(*args, **kwargs):
+        del args, kwargs
+        return SimpleNamespace(req=fake_req, stage_payload=None)
+
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "build_sglang_thinker_request",
+        _fake_build_sglang_thinker_request,
+    )
+
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    state = Qwen3OmniPipelineState(prompt={"input_ids": torch.tensor([1])})
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(
+            inputs={},
+            params={"max_tokens": 0},
+            metadata={"pre_run": True},
+        ),
+        data=state.to_dict(),
+    )
+
+    request_builder(payload)
+
+    assert fake_req._omni_isolate_prefill_batch is True
+
+
+def test_qwen35_thinker_adapter_can_keep_rtc_prerun_generation(monkeypatch):
+    captured = {}
+
+    def _fake_build_sglang_thinker_request(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return SimpleNamespace(stage_payload=None)
+
+    monkeypatch.setenv("QWEN35_RTC_PRERUN_PREFILL_ONLY", "0")
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "build_sglang_thinker_request",
+        _fake_build_sglang_thinker_request,
+    )
+
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    state = Qwen3OmniPipelineState(prompt={"input_ids": torch.tensor([1])})
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(
+            inputs={},
+            params={"max_tokens": 2},
+            metadata={"pre_run": True},
+        ),
+        data=state.to_dict(),
+    )
+
+    request_builder(payload)
+
+    assert captured["params"]["max_tokens"] == 2
+
+
+def test_qwen35_thinker_request_sets_mamba_media_branching_hint(monkeypatch):
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "_mamba_branching_chunk_size",
+        lambda: 64,
+    )
+
+    video_token_id = 12
+    audio_token_id = 14
+    input_ids = torch.tensor(
+        [101] + [video_token_id] * 150 + [102] + [audio_token_id] * 8,
+        dtype=torch.long,
+    )
+    state = Qwen3OmniPipelineState(
+        prompt={"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)},
+        thinker_inputs={
+            "model_inputs": {
+                "video_embeds": torch.ones((150, 4)),
+                "audio_embeds": torch.ones((8, 4)),
+            },
+            "media_cache_keys": {"video": "video:shared", "audio": "audio:q1"},
+        },
+    )
+
+    req_data = request_builders.qwen3_request_builders.build_sglang_thinker_request(
+        state,
+        params={"max_tokens": 4},
+        tokenizer=None,
+        vocab_size=256,
+        request_id="req-branch",
+        thinker_config=SimpleNamespace(
+            image_token_id=11,
+            video_token_id=video_token_id,
+            audio_token_id=audio_token_id,
+        ),
+        mrope_position_builder=lambda *args: None,
+        mamba_media_branching_cache=True,
+    )
+
+    assert req_data.req._omni_mamba_branching_seqlen == 128
+
+
+def test_qwen35_mamba_branching_hint_patch_preserves_real_cache_hit():
+    class FakeReq:
+        def init_next_round_input(self, tree_cache=None):
+            del tree_cache
+            self.prefix_indices = [0] * 128
+            self.mamba_branching_seqlen = None
+
+    request_builders.qwen3_request_builders._install_mamba_branching_hint_patch(
+        FakeReq
+    )
+    req = FakeReq()
+    req._omni_mamba_branching_seqlen = 128
+
+    req.init_next_round_input(None)
+
+    assert req.mamba_branching_seqlen is None
+
+
+def test_qwen35_mamba_branching_hint_patch_fills_missing_branch():
+    class FakeReq:
+        def init_next_round_input(self, tree_cache=None):
+            del tree_cache
+            self.prefix_indices = []
+            self.mamba_branching_seqlen = None
+
+    request_builders.qwen3_request_builders._install_mamba_branching_hint_patch(
+        FakeReq
+    )
+    req = FakeReq()
+    req._omni_mamba_branching_seqlen = 128
+
+    req.init_next_round_input(None)
+
+    assert req.mamba_branching_seqlen == 128
 
 
 def test_qwen35_thinker_sampling_accepts_openai_max_tokens_alias():
@@ -1976,7 +2918,33 @@ def test_qwen35_stream_builder_uses_stream_hidden_as_embed_fallback():
     assert len(messages) == 1
     assert messages[0].target == "talker_ar"
     assert torch.equal(messages[0].data, embed[0])
-    assert torch.equal(messages[0].metadata["layer_hidden"], hidden_18[0])
+
+
+def test_qwen35_stream_builder_inlines_decode_token_when_enabled(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
+    embed = torch.tensor([[1.0, 1.0]])
+    builder = request_builders.make_thinker_stream_output_builder(
+        required_aux_hidden_key=18
+    )
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(inputs={}, params={"stream": True}),
+        data={},
+    )
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(is_chunked=0),
+        stage_payload=payload,
+    )
+    req_output = SimpleNamespace(
+        data=42,
+        extra={"stream_hidden_states": embed},
+    )
+
+    messages = builder("req-0", req_data, req_output)
+
+    assert [msg.target for msg in messages] == ["decode", "talker_ar"]
+    assert messages[0].data == 42
+    assert torch.equal(messages[1].data, embed[0])
 
 
 def test_qwen35_talker_sampling_uses_passed_codec_eos_id(monkeypatch):
@@ -2162,6 +3130,10 @@ def test_qwen35_talker_and_subtalker_require_explicit_stage_seed(
     sub_sp = req_data.req._qwen35_subtalker_sampling_params
 
     assert captured["seed"] is None
+    assert sub_sp.temperature == 0.1
+    assert sub_sp.top_k == 5
+    assert sub_sp.top_p == 1.0
+    assert sub_sp.repetition_penalty == 1.05
     assert sub_sp.sampling_seed is None
 
 
@@ -2325,8 +3297,8 @@ def test_qwen35_talker_adapter_accepts_prefixed_sampling_params(monkeypatch):
     req_data = request_builder(payload)
     sub_sp = req_data.req._qwen35_subtalker_sampling_params
 
-    # 中文说明：prefixed talker_max_tokens 直接限制 codec 上限；
-    # 没有显式 talker 上限时，才会回退到文本 max_tokens * 40。
+    # A prefixed talker_max_tokens directly caps codec tokens; when it is
+    # omitted, the adapter falls back to text max_tokens * 40.
     assert captured["max_new_tokens"] == 12
     assert captured["temperature"] == 0.25
     assert captured["top_k"] == 4

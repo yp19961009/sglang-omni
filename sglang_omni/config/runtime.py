@@ -208,6 +208,16 @@ def _apply_typed_runtime_args(args: dict[str, Any], stage_cfg: StageConfig) -> N
         overrides = dict(args.get("server_args_overrides") or {})
         overrides["max_running_requests"] = int(max_running_requests)
         args["server_args_overrides"] = overrides
+    max_mamba_cache_size = runtime.sglang_server_args.max_mamba_cache_size
+    if max_mamba_cache_size is not None:
+        overrides = dict(args.get("server_args_overrides") or {})
+        overrides["max_mamba_cache_size"] = int(max_mamba_cache_size)
+        args["server_args_overrides"] = overrides
+    mamba_full_memory_ratio = runtime.sglang_server_args.mamba_full_memory_ratio
+    if mamba_full_memory_ratio is not None:
+        overrides = dict(args.get("server_args_overrides") or {})
+        overrides["mamba_full_memory_ratio"] = float(mamba_full_memory_ratio)
+        args["server_args_overrides"] = overrides
 
 
 def _resolve_primary_gpu_id(

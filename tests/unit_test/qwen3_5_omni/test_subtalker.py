@@ -108,6 +108,56 @@ def test_qwen35_residual_predictor_reports_local_next_decoder(monkeypatch):
     assert predictor.hf_next_error == "missing qwen3_omni_next"
 
 
+def test_qwen35_residual_predictor_compile_hook_used_by_generate(monkeypatch):
+    monkeypatch.setattr(subtalker, "_TensorLinear", _FakeTensorLinear)
+    compile_calls = []
+    config_calls = []
+
+    def fake_compile(fn, **kwargs):
+        compile_calls.append(kwargs)
+
+        def compiled(*args, **inner_kwargs):
+            compile_calls.append("used")
+            return fn(*args, **inner_kwargs)
+
+        return compiled
+
+    monkeypatch.setattr(
+        subtalker,
+        "set_torch_compile_config",
+        lambda: config_calls.append("called"),
+    )
+    monkeypatch.setattr(subtalker.torch, "compile", fake_compile)
+    config = SimpleNamespace(
+        num_code_groups=2,
+        vocab_size=5,
+        talker_hidden_size=4,
+        hidden_size=4,
+        num_hidden_layers=0,
+    )
+    predictor = subtalker.Qwen35ResidualCodePredictor(config)
+
+    def fake_predict_step(*args, **kwargs):
+        del kwargs
+        inputs_embeds = args[0]
+        return torch.ones(inputs_embeds.shape[0], dtype=torch.long)
+
+    predictor._predict_step = fake_predict_step
+    predictor.enable_torch_compile(mode="reduce-overhead")
+
+    codes, _ = predictor.generate(
+        layer0_codes=torch.tensor([[2]]),
+        talker_hidden=torch.ones(1, 1, 4),
+        layer0_embed_fn=nn.Embedding(5, 4),
+        pad_id=4,
+    )
+
+    assert config_calls == ["called"]
+    assert compile_calls[0] == {"dynamic": True, "mode": "reduce-overhead"}
+    assert compile_calls[1] == "used"
+    assert codes[:, :, 0].tolist() == [[2, 1]]
+
+
 def test_qwen35_subtalker_rmsnorm_uses_qwen_next_one_plus_weight():
     norm = subtalker._RMSNorm(2, 1e-6)
     with torch.no_grad():
@@ -284,6 +334,41 @@ def test_qwen35_residual_sampling_seed_is_deterministic():
     second = subtalker._sample_logits(logits, **kwargs)
 
     assert first.tolist() == second.tolist()
+
+
+def test_qwen35_residual_sampling_seed_offset_preserves_disabled_rows():
+    seed = torch.tensor([-1, 7])
+
+    shifted = subtalker._offset_optional_sampling_seed(seed, 3)
+
+    assert shifted.tolist() == [-4, 10]
+
+
+def test_qwen35_residual_sampling_capture_uses_disabled_seed_fallback(monkeypatch):
+    captured = {}
+
+    def fake_multinomial_with_seed(probs, seed, positions):
+        del positions
+        captured["seed"] = seed.detach().cpu().tolist()
+        return torch.zeros((probs.shape[0], 1), dtype=torch.long)
+
+    monkeypatch.setattr(subtalker, "get_is_capture_mode", lambda: True)
+    monkeypatch.setattr(
+        subtalker,
+        "multinomial_with_seed",
+        fake_multinomial_with_seed,
+    )
+
+    sampled = subtalker._sample_logits(
+        torch.zeros((3, 4)),
+        temperature=torch.ones(3),
+        top_k=torch.zeros(3, dtype=torch.long),
+        top_p=torch.ones(3),
+        seed=torch.tensor([-1, -4, 9]),
+    )
+
+    assert sampled.tolist() == [0, 0, 0]
+    assert captured["seed"] == [42, 45, 9]
 
 
 def test_qwen35_residual_predictor_exact_env_uses_local_decoder(monkeypatch):

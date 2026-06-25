@@ -75,6 +75,7 @@ class Code2WavScheduler(StreamingSimpleScheduler):
         self._emitted: dict[str, int] = {}
         self._audio_chunks: dict[str, list[np.ndarray]] = {}
         self._stream_enabled: dict[str, bool] = {}
+        self._collecting_window: set[str] = set()
         super().__init__(compute_fn=None)
         self._payloads = self._stream_payloads
 
@@ -91,6 +92,7 @@ class Code2WavScheduler(StreamingSimpleScheduler):
         self._emitted.pop(request_id, None)
         self._audio_chunks.pop(request_id, None)
         self._stream_enabled.pop(request_id, None)
+        self._collecting_window.discard(request_id)
 
     def _fail_request(self, request_id: str, error: Exception) -> None:
         self.outbox.put(
@@ -147,7 +149,30 @@ class Code2WavScheduler(StreamingSimpleScheduler):
                     "Code2Wav skip EOS req=%s codes=%s", request_id, codes.tolist()
                 )
             return []
-        self._code_chunks[request_id].append(codes)
+        chunks = self._code_chunks[request_id]
+        emitted = self._emitted[request_id]
+        ready_before = len(chunks) - emitted
+        if ready_before <= 0 and request_id not in self._collecting_window:
+            self._collecting_window.add(request_id)
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name="code2wav_window_collect_start",
+                metadata={
+                    "stream_chunk_size": self._stream_chunk_size,
+                    "emitted_chunks": emitted,
+                },
+            )
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name="code2wav_chunk_received",
+            metadata={
+                "ready_before": ready_before,
+                "stream_chunk_size": self._stream_chunk_size,
+            },
+        )
+        chunks.append(codes)
         ready = len(self._code_chunks[request_id]) - self._emitted[request_id]
         if ready >= self._stream_chunk_size:
             return self._decode_and_emit(request_id)
@@ -161,53 +186,98 @@ class Code2WavScheduler(StreamingSimpleScheduler):
         if chunks and emitted < len(chunks):
             messages.extend(self._decode_and_emit(request_id))
 
-        # Build final output
-        audio_parts = self._audio_chunks.get(request_id, [])
-        if not audio_parts:
-            self._fail_request(
-                request_id,
-                RuntimeError(f"code2wav produced no audio for {request_id!r}"),
-            )
-            return []
-        full_audio = np.concatenate(audio_parts).astype(np.float32, copy=False)
-        payload = self._payloads[request_id]
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "Code2Wav finalize req=%s code_chunks=%s audio_parts=%s final_samples=%s",
-                request_id,
-                len(self._code_chunks[request_id]),
-                len(audio_parts),
-                int(full_audio.shape[0]),
-            )
-        # Streaming clients already received per-chunk audio; final result is
-        # metadata-only to avoid IPC-ing full audio that the HTTP layer drops.
-        # Default False so missing latch falls back to non-streaming (safe:
-        # may waste bandwidth, never starves a non-streaming client).
-        if self._stream_enabled.get(request_id, False):
-            final_data: dict[str, Any] = {
-                "modality": "audio",
-                "sample_rate": self._sample_rate,
-            }
-        else:
-            final_data = self._build_audio_payload(full_audio)
-        messages.append(
-            OutgoingMessage(
-                request_id=request_id,
-                type="result",
-                data=StagePayload(
-                    request_id=payload.request_id,
-                    request=payload.request,
-                    data=final_data,
-                ),
-            )
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name="code2wav_finalize_start",
         )
-        return messages
+        try:
+            # Build final output
+            audio_parts = self._audio_chunks.get(request_id, [])
+            if not audio_parts:
+                self._fail_request(
+                    request_id,
+                    RuntimeError(f"code2wav produced no audio for {request_id!r}"),
+                )
+                return []
+            full_audio = np.concatenate(audio_parts).astype(np.float32, copy=False)
+            payload = self._payloads[request_id]
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Code2Wav finalize req=%s code_chunks=%s audio_parts=%s final_samples=%s",
+                    request_id,
+                    len(self._code_chunks[request_id]),
+                    len(audio_parts),
+                    int(full_audio.shape[0]),
+                )
+            # Streaming clients already received per-chunk audio; final result is
+            # metadata-only to avoid IPC-ing full audio that the HTTP layer drops.
+            # Default False so missing latch falls back to non-streaming (safe:
+            # may waste bandwidth, never starves a non-streaming client).
+            if self._stream_enabled.get(request_id, False):
+                final_data: dict[str, Any] = {
+                    "modality": "audio",
+                    "sample_rate": self._sample_rate,
+                }
+            else:
+                final_data = self._build_audio_payload(full_audio)
+            messages.append(
+                OutgoingMessage(
+                    request_id=request_id,
+                    type="result",
+                    data=StagePayload(
+                        request_id=payload.request_id,
+                        request=payload.request,
+                        data=final_data,
+                    ),
+                )
+            )
+            return messages
+        finally:
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name="code2wav_finalize_end",
+            )
 
     def _decode_and_emit(self, request_id: str) -> list[OutgoingMessage]:
         chunks = self._code_chunks[request_id]
         start = self._emitted[request_id]
         end = len(chunks)
-        audio = self._decode_incremental(request_id, chunks, start, end)
+        window_metadata = {
+            "start": start,
+            "end": end,
+            "new_chunks": end - start,
+            "context_chunks": min(self._left_context_size, start),
+            "stream_chunk_size": self._stream_chunk_size,
+        }
+        if request_id in self._collecting_window:
+            self._collecting_window.discard(request_id)
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name="code2wav_window_collect_end",
+                metadata=window_metadata,
+            )
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name="code2wav_decode_start",
+            metadata=window_metadata,
+        )
+        audio: np.ndarray | None = None
+        try:
+            audio = self._decode_incremental(request_id, chunks, start, end)
+        finally:
+            decode_metadata = dict(window_metadata)
+            if audio is not None:
+                decode_metadata["samples"] = int(audio.shape[0])
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name="code2wav_decode_end",
+                metadata=decode_metadata,
+            )
         self._emitted[request_id] = end
         messages: list[OutgoingMessage] = []
         if audio.size > 0:

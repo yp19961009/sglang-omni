@@ -16,6 +16,11 @@ from pydantic import ValidationError
 from sglang_omni.config.schema import StageConfig
 from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
 from sglang_omni.pipeline import relay_io
+from sglang_omni.pipeline.control_plane import (
+    ControlPlaneContext,
+    PushSocket,
+    StageControlPlane,
+)
 from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.pipeline.stage.stream_queue import StreamItem, StreamQueue
 from sglang_omni.proto import DataReadyMessage, OmniRequest, StagePayload
@@ -67,6 +72,28 @@ class _DoneOp:
 
     async def wait_for_completion(self) -> None:
         pass
+
+
+class _HangingOp:
+    def __init__(self, size: int = 1) -> None:
+        self.metadata = {"transfer_info": {"size": size}}
+        self.started = asyncio.Event()
+
+    async def wait_for_completion(self, timeout: float = 30.0) -> None:
+        self.started.set()
+        await asyncio.Event().wait()
+
+
+class _HangingRelay(_FakeRelay):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ops: list[_HangingOp] = []
+
+    async def put_async(self, tensor, request_id):
+        self.puts.append((request_id, tensor))
+        op = _HangingOp(tensor.numel())
+        self.ops.append(op)
+        return op
 
 
 class _AbortOnReadRelay(_FakeRelay):
@@ -593,28 +620,143 @@ def test_send_stream_chunk_uses_relay() -> None:
     asyncio.run(_run())
 
 
-def test_send_stream_chunk_uses_relay_for_cpu_same_gpu_chunk() -> None:
+def test_stage_cross_process_stream_does_not_block_on_relay_completion() -> None:
+    async def _run() -> None:
+        control_plane = _FakeControlPlane()
+        relay = _HangingRelay()
+        stage = Stage(
+            name="thinker",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={"talker": "inproc://talker"},
+            control_plane=control_plane,
+            relay=relay,
+            scheduler=SimpleNamespace(),
+        )
+
+        await asyncio.wait_for(
+            stage._send_stream_to_target(
+                "req",
+                torch.arange(4, dtype=torch.float32),
+                "talker",
+                {"modality": "hidden"},
+            ),
+            timeout=0.5,
+        )
+        await asyncio.sleep(0)
+
+        assert len(control_plane.stage_messages) == 1
+        assert len(relay.puts) == 1
+        assert len(stage._stream_relay_completion_tasks) == 1
+        assert relay.ops[0].started.is_set()
+
+        for task in list(stage._stream_relay_completion_tasks):
+            task.cancel()
+        await asyncio.gather(
+            *stage._stream_relay_completion_tasks,
+            return_exceptions=True,
+        )
+
+    asyncio.run(_run())
+
+
+def test_stage_cross_process_payload_does_not_block_on_relay_completion() -> None:
+    async def _run() -> None:
+        control_plane = _FakeControlPlane()
+        relay = _HangingRelay()
+        stage = Stage(
+            name="thinker",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={"decode": "inproc://decode"},
+            control_plane=control_plane,
+            relay=relay,
+            scheduler=SimpleNamespace(),
+        )
+        payload = StagePayload(
+            request_id="req",
+            request=OmniRequest(inputs="hello"),
+            data={"value": torch.arange(4, dtype=torch.float32)},
+        )
+
+        await asyncio.wait_for(
+            stage._send_to_stage("req", "decode", payload),
+            timeout=0.5,
+        )
+        await asyncio.sleep(0)
+
+        assert len(control_plane.stage_messages) == 1
+        assert len(relay.puts) == 1
+        assert len(stage._stream_relay_completion_tasks) == 1
+        assert relay.ops[0].started.is_set()
+
+        for task in list(stage._stream_relay_completion_tasks):
+            task.cancel()
+        await asyncio.gather(
+            *stage._stream_relay_completion_tasks,
+            return_exceptions=True,
+        )
+
+    asyncio.run(_run())
+
+
+def test_send_stream_chunk_inlines_small_cpu_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
+
     async def _run() -> None:
         control_plane = _FakeControlPlane()
         relay = _FakeRelay()
-        codes = torch.arange(11, dtype=torch.float32)
+        token = torch.tensor([11], dtype=torch.long)
 
         await relay_io.send_stream_chunk(
             relay,
             control_plane,
             request_id="req",
-            data=codes,
-            target_stage="vocoder",
-            target_endpoint="inproc://vocoder",
-            from_stage="tts_engine",
+            data=token,
+            target_stage="decode",
+            target_endpoint="inproc://decode",
+            from_stage="thinker",
             chunk_id=0,
-            same_gpu_targets={"vocoder"},
+            metadata={"token_id": 11},
+        )
+
+        assert relay.puts == []
+        assert len(control_plane.stage_messages) == 1
+        _, _, msg = control_plane.stage_messages[0]
+        assert msg.shm_metadata["_inline_cpu"] is True
+        data, metadata = relay_io.deserialize_inline_cpu_chunk(msg.shm_metadata)
+        assert torch.equal(data, token)
+        assert metadata == {"token_id": 11}
+
+    asyncio.run(_run())
+
+
+def test_send_stream_chunk_uses_relay_for_cpu_chunk_by_default() -> None:
+    async def _run() -> None:
+        control_plane = _FakeControlPlane()
+        relay = _FakeRelay()
+        token = torch.tensor([11], dtype=torch.long)
+
+        await relay_io.send_stream_chunk(
+            relay,
+            control_plane,
+            request_id="req",
+            data=token,
+            target_stage="decode",
+            target_endpoint="inproc://decode",
+            from_stage="thinker",
+            chunk_id=0,
+            metadata={"token_id": 11},
         )
 
         assert len(relay.puts) == 1
         assert len(control_plane.stage_messages) == 1
         _, _, msg = control_plane.stage_messages[0]
-        assert "_ipc" not in msg.shm_metadata
+        assert "_inline_cpu" not in msg.shm_metadata
 
     asyncio.run(_run())
 
@@ -963,6 +1105,198 @@ def test_ipc_stream_chunk_survives_control_plane_serialization() -> None:
     assert torch.equal(item.metadata["items"][0], hidden + 1)
     assert torch.equal(item.metadata["pair"][0], hidden + 2)
     assert item.metadata["pair"][1] == "kept"
+
+
+def test_inline_cpu_stream_chunk_survives_control_plane_serialization() -> None:
+    pytest.importorskip("msgpack")
+    from sglang_omni.pipeline.control_plane import (
+        deserialize_message,
+        serialize_message,
+    )
+
+    msg = DataReadyMessage(
+        request_id="req",
+        from_stage="thinker",
+        to_stage="decode",
+        shm_metadata=relay_io.serialize_inline_cpu_chunk(
+            torch.tensor([123], dtype=torch.long),
+            {"token_id": 123},
+        ),
+        chunk_id=0,
+    )
+
+    round_tripped = deserialize_message(serialize_message(msg))
+    data, metadata = relay_io.deserialize_inline_cpu_chunk(
+        round_tripped.shm_metadata
+    )
+
+    assert torch.equal(data, torch.tensor([123], dtype=torch.long))
+    assert metadata == {"token_id": 123}
+
+
+def test_control_plane_stream_priority_allows_normal_payload_fairness(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_STREAM_PRIORITY_BURST", "2")
+
+    async def _run() -> None:
+        normal_endpoint = f"ipc://{tmp_path}/normal.sock"
+        stream_endpoint = f"ipc://{tmp_path}/stream.sock"
+        coordinator_endpoint = f"ipc://{tmp_path}/coordinator.sock"
+        abort_endpoint = f"ipc://{tmp_path}/abort.sock"
+        control_plane = StageControlPlane(
+            "decode",
+            normal_endpoint,
+            coordinator_endpoint,
+            abort_endpoint,
+            stream_recv_endpoint=stream_endpoint,
+        )
+        await control_plane.start()
+        normal_sender = PushSocket(normal_endpoint)
+        stream_sender = PushSocket(stream_endpoint)
+        await normal_sender.connect()
+        await stream_sender.connect()
+        await asyncio.sleep(0.05)
+
+        def make_msg(request_id: str) -> DataReadyMessage:
+            return DataReadyMessage(
+                request_id=request_id,
+                from_stage="thinker",
+                to_stage="decode",
+                shm_metadata={},
+            )
+
+        try:
+            await normal_sender.send(make_msg("normal"))
+            for idx in range(3):
+                await stream_sender.send(make_msg(f"stream{idx}"))
+            await asyncio.sleep(0.05)
+
+            received = [(await control_plane.recv()).request_id for _ in range(4)]
+            assert received == ["stream0", "stream1", "normal", "stream2"]
+        finally:
+            normal_sender.close()
+            stream_sender.close()
+            control_plane.close()
+            ControlPlaneContext.close()
+
+    asyncio.run(_run())
+
+
+def test_async_stream_ingest_does_not_block_message_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_ASYNC_STREAM_INGEST", "1")
+
+    async def _run() -> None:
+        scheduler = SimpleNamespace(
+            outbox=queue.Queue(),
+            inbox=queue.Queue(),
+            abort=lambda request_id: None,
+        )
+        stage = Stage(
+            name="decode",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={},
+            control_plane=_FakeControlPlane(),
+            relay=_FakeRelay(),
+            scheduler=scheduler,
+            can_accept_stream_before_payload=True,
+        )
+        stage._stream_queue = StreamQueue(max_pending=4096)
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        processed: list[str] = []
+
+        async def _blocked_stream_chunk(msg: DataReadyMessage) -> None:
+            started.set()
+            await release.wait()
+            processed.append(msg.request_id)
+
+        stage._on_stream_chunk = _blocked_stream_chunk
+
+        def make_msg(request_id: str) -> DataReadyMessage:
+            return DataReadyMessage(
+                request_id=request_id,
+                from_stage="thinker",
+                to_stage="decode",
+                shm_metadata={},
+                chunk_id=0,
+            )
+
+        await stage._handle_message(make_msg("req-a"))
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        await stage._handle_message(make_msg("req-b"))
+
+        assert processed == []
+        assert set(stage._stream_ingest_tasks) == {"req-a", "req-b"}
+
+        release.set()
+        await asyncio.wait_for(
+            asyncio.gather(*stage._stream_ingest_tasks.values()),
+            timeout=1.0,
+        )
+        assert sorted(processed) == ["req-a", "req-b"]
+
+    asyncio.run(_run())
+
+
+def test_async_stream_ingest_preserves_per_request_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_ASYNC_STREAM_INGEST", "1")
+
+    async def _run() -> None:
+        scheduler = SimpleNamespace(
+            outbox=queue.Queue(),
+            inbox=queue.Queue(),
+            abort=lambda request_id: None,
+        )
+        stage = Stage(
+            name="decode",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={},
+            control_plane=_FakeControlPlane(),
+            relay=_FakeRelay(),
+            scheduler=scheduler,
+            can_accept_stream_before_payload=True,
+        )
+        stage._stream_queue = StreamQueue(max_pending=4096)
+
+        def make_msg(request_id: str, chunk_id: int) -> DataReadyMessage:
+            return DataReadyMessage(
+                request_id=request_id,
+                from_stage="thinker",
+                to_stage="decode",
+                shm_metadata=relay_io.serialize_ipc_chunk(
+                    f"{request_id}:{chunk_id}",
+                    {"token_id": chunk_id},
+                ),
+                chunk_id=chunk_id,
+            )
+
+        await stage._handle_message(make_msg("req-a", 0))
+        await stage._handle_message(make_msg("req-a", 1))
+        await stage._handle_message(make_msg("req-b", 0))
+        await asyncio.wait_for(
+            asyncio.gather(*stage._stream_ingest_tasks.values()),
+            timeout=1.0,
+        )
+
+        by_request: dict[str, list[int]] = {}
+        while not scheduler.inbox.empty():
+            msg = scheduler.inbox.get_nowait()
+            by_request.setdefault(msg.request_id, []).append(msg.data.chunk_id)
+
+        assert by_request["req-a"] == [0, 1]
+        assert by_request["req-b"] == [0]
+
+    asyncio.run(_run())
 
 
 def test_stage_drops_stream_chunk_after_abort_during_relay_read() -> None:

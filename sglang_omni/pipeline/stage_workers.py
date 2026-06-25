@@ -67,14 +67,17 @@ class StageLaunchConfig:
 
     # Endpoints
     recv_endpoint: str = ""
+    stream_recv_endpoint: str = ""
     coordinator_endpoint: str = ""
     abort_endpoint: str = ""
     stage_endpoints: dict[str, str] = field(default_factory=dict)
+    stage_stream_endpoints: dict[str, str] = field(default_factory=dict)
 
     # Stream wiring
     stream_targets: list[str] = field(default_factory=list)
     stream_done_to_fn: str | None = None
     same_gpu_targets: set[str] = field(default_factory=set)
+    same_gpu_payload_targets: set[str] = field(default_factory=set)
     is_stream_receiver: bool = False
     can_accept_stream_before_payload: bool = False
 
@@ -560,6 +563,7 @@ def _construct_stage(
             recv_endpoint=spec.recv_endpoint,
             coordinator_endpoint=spec.coordinator_endpoint,
             abort_endpoint=spec.abort_endpoint,
+            stream_recv_endpoint=spec.stream_recv_endpoint,
         )
     else:
         control_plane = TPFollowerControlPlane(
@@ -584,6 +588,7 @@ def _construct_stage(
         get_next=get_next,
         gpu_id=spec.gpu_id,
         endpoints=spec.stage_endpoints,
+        stream_endpoints=spec.stage_stream_endpoints,
         control_plane=control_plane,
         input_handler=input_handler,
         relay_config=spec.relay_config,
@@ -592,6 +597,7 @@ def _construct_stage(
         stream_targets=spec.stream_targets or None,
         get_stream_done_targets=get_stream_done_targets,
         same_gpu_targets=spec.same_gpu_targets or None,
+        same_gpu_payload_targets=spec.same_gpu_payload_targets or None,
         same_process_targets=spec.same_process_targets or None,
         local_dispatcher=local_dispatcher,
         can_accept_stream_before_payload=spec.can_accept_stream_before_payload,

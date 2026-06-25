@@ -106,9 +106,10 @@ def test_qwen35_preprocessing_executor_uses_thinker_subdir(monkeypatch, tmp_path
 
     monkeypatch.setattr(stages, "Qwen35OmniPreprocessor", FakePreprocessor)
 
-    stages.create_preprocessing_executor(
+    scheduler = stages.create_preprocessing_executor(
         str(root),
         thinker_max_seq_len=123,
+        max_concurrency=2,
         video_seconds_per_chunk=2.0,
         video_position_id_per_seconds=25.0,
         audio_target_sr=16000,
@@ -118,6 +119,7 @@ def test_qwen35_preprocessing_executor_uses_thinker_subdir(monkeypatch, tmp_path
     )
 
     assert seen["model_path"] == str(thinker)
+    assert scheduler._max_concurrency == 2
     assert seen["kwargs"]["max_seq_len"] == 123
     assert seen["kwargs"]["video_seconds_per_chunk"] == 2.0
     assert seen["kwargs"]["video_position_id_per_seconds"] == 25.0
@@ -232,6 +234,20 @@ def test_qwen35_image_encoder_executor_reuses_batched_qwen_path(monkeypatch):
     assert scheduler._max_batch_wait_s == pytest.approx(0.05)
     assert scheduler._request_cost_fn is not None
     assert scheduler._max_batch_cost == stages.QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES
+
+
+def test_qwen35_encoder_batch_wait_can_be_overridden(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_ENCODER_MAX_BATCH_WAIT_MS", "0")
+    monkeypatch.setattr(stages, "_emit_event", lambda **_: None)
+    monkeypatch.setattr(
+        stages,
+        "_load_qwen35_encoder",
+        lambda *_, **__: _FakeImageEncoder(),
+    )
+
+    scheduler = stages.create_image_encoder_executor("/models/qwen35", device="cpu")
+
+    assert scheduler._max_batch_wait_s == 0
 
 
 def test_qwen35_image_encoder_executor_uses_thinker_subdir(monkeypatch, tmp_path):

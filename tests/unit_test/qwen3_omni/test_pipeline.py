@@ -33,6 +33,7 @@ from sglang_omni.models.qwen3_omni.payload_types import Qwen3OmniPipelineState
 from sglang_omni.models.qwen3_omni.request_builders import (
     build_sglang_talker_request,
     build_sglang_thinker_request,
+    project_preprocessing_to_image_encoder,
     project_preprocessing_to_mm_aggregate,
     project_talker_to_code2wav,
     project_thinker_to_decode,
@@ -44,8 +45,11 @@ from sglang_omni.scheduling.sglang_backend.server_args_builder import (
     apply_encoder_mem_reserve,
     build_sglang_server_args,
 )
+from sglang_omni.scheduling.stage_cache import StageOutputCache
 from sglang_omni.utils.imports import import_string
 from tests.unit_test.fixtures.qwen_fakes import (
+    FakeAudioEncoderModel,
+    FakeImageEncoderModel,
     FakeQwenTokenizer,
     make_qwen_payload,
     make_qwen_state,
@@ -415,6 +419,29 @@ def test_qwen_aggregate_projection_marks_uncached_active_encoder_inputs() -> Non
         "preprocessing",
         projected,
     ) == ["preprocessing", "audio_encoder"]
+
+
+def test_qwen_preprocessing_projection_isolates_mutable_encoder_inputs() -> None:
+    pixel_values = torch.ones((2, 3))
+    cache_keys = ["chunk-1", "chunk-2"]
+    state = make_qwen_state(
+        encoder_inputs={
+            "image_encoder": {
+                "pixel_values_videos": pixel_values,
+                "video_item_cache_keys": cache_keys,
+            },
+        }
+    )
+    payload = make_qwen_payload(state)
+
+    projected = project_preprocessing_to_image_encoder(payload)
+    projected_state = Qwen3OmniPipelineState.from_dict(projected.data)
+    image_inputs = projected_state.encoder_inputs["image_encoder"]
+
+    assert image_inputs is not state.encoder_inputs["image_encoder"]
+    assert image_inputs["video_item_cache_keys"] is not cache_keys
+    assert image_inputs["video_item_cache_keys"] == cache_keys
+    assert image_inputs["pixel_values_videos"] is pixel_values
 
 
 def test_qwen_builder_omits_mem_fraction_static_by_default() -> None:
@@ -1000,6 +1027,248 @@ def test_qwen_mm_aggregate_keeps_lightweight_inputs_and_prunes_after_merge() -> 
     }
 
 
+def test_qwen_image_encoder_item_cache_reuses_video_prefix() -> None:
+    model = FakeImageEncoderModel()
+    cache = StageOutputCache(max_size=16, max_bytes=1 << 20, cache_device="cpu")
+
+    first_state = make_qwen_state(
+        encoder_inputs={
+            "image_encoder": {
+                "cache_key": "whole:v1",
+                "pixel_values_videos": torch.ones((2, 3)),
+                "video_grid_thw": torch.tensor([[1, 1, 2]], dtype=torch.long),
+                "video_item_cache_keys": ["v1"],
+            },
+        },
+    )
+    first = qwen_stages._run_single_encoder_payload(
+        make_qwen_payload(first_state, request_id="req-v1"),
+        stage_name="image_encoder",
+        model=model,
+        cache=cache,
+    )
+    first_out = Qwen3OmniPipelineState.from_dict(first.data).encoder_outs[
+        "image_encoder"
+    ]
+
+    assert len(model.calls) == 1
+    assert model.calls[-1]["video_grid_thw"].tolist() == [[1, 1, 2]]
+    assert first_out["video_grid_thw"].tolist() == [[1, 1, 2]]
+
+    second_state = make_qwen_state(
+        encoder_inputs={
+            "image_encoder": {
+                "cache_key": "whole:v1v2",
+                "pixel_values_videos": torch.ones((5, 3)),
+                "video_grid_thw": torch.tensor(
+                    [[1, 1, 2], [1, 1, 3]],
+                    dtype=torch.long,
+                ),
+                "video_item_cache_keys": ["v1", "v2"],
+            },
+        },
+    )
+    second = qwen_stages._run_single_encoder_payload(
+        make_qwen_payload(second_state, request_id="req-v1v2"),
+        stage_name="image_encoder",
+        model=model,
+        cache=cache,
+    )
+    second_out = Qwen3OmniPipelineState.from_dict(second.data).encoder_outs[
+        "image_encoder"
+    ]
+
+    assert len(model.calls) == 2
+    assert model.calls[-1]["pixel_values_videos"].shape[0] == 3
+    assert model.calls[-1]["video_grid_thw"].tolist() == [[1, 1, 3]]
+    assert second_out["video_grid_thw"].tolist() == [[1, 1, 2], [1, 1, 3]]
+    assert second_out["video_token_counts"].tolist() == [2, 3]
+    assert second_out["video_embeds"].shape == (5, 2)
+
+    third_state = make_qwen_state(
+        encoder_inputs={
+            "image_encoder": {
+                "cache_key": "whole:v1v2",
+                "pixel_values_videos": torch.ones((5, 3)),
+                "video_grid_thw": torch.tensor(
+                    [[1, 1, 2], [1, 1, 3]],
+                    dtype=torch.long,
+                ),
+                "video_item_cache_keys": ["v1", "v2"],
+            },
+        },
+    )
+    qwen_stages._run_single_encoder_payload(
+        make_qwen_payload(third_state, request_id="req-v1v2-repeat"),
+        stage_name="image_encoder",
+        model=model,
+        cache=cache,
+    )
+
+    assert len(model.calls) == 2
+
+
+def test_qwen_image_encoder_item_cache_does_not_store_combined_prefix_by_default(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("SGLANG_OMNI_STORE_ITEM_PLAN_COMBINED_ENCODER_CACHE", raising=False)
+    model = FakeImageEncoderModel()
+    cache = StageOutputCache(max_size=16, max_bytes=1 << 20, cache_device="cpu")
+
+    state = make_qwen_state(
+        encoder_inputs={
+            "image_encoder": {
+                "cache_key": "whole:v1",
+                "pixel_values_videos": torch.ones((2, 3)),
+                "video_grid_thw": torch.tensor([[1, 1, 2]], dtype=torch.long),
+                "video_item_cache_keys": ["v1"],
+            },
+        },
+    )
+    qwen_stages._run_single_encoder_payload(
+        make_qwen_payload(state, request_id="req-v1"),
+        stage_name="image_encoder",
+        model=model,
+        cache=cache,
+    )
+
+    assert cache.get("whole:v1") is None
+    assert cache.get("visual_item:video:v1") is not None
+
+
+def test_qwen_image_encoder_item_cache_accepts_omitted_video_pixels() -> None:
+    model = FakeImageEncoderModel()
+    cache = StageOutputCache(max_size=16, max_bytes=1 << 20, cache_device="cpu")
+
+    first_state = make_qwen_state(
+        encoder_inputs={
+            "image_encoder": {
+                "cache_key": "whole:v1",
+                "pixel_values_videos": torch.ones((2, 3)),
+                "video_grid_thw": torch.tensor([[1, 1, 2]], dtype=torch.long),
+                "video_item_cache_keys": ["v1"],
+            },
+        },
+    )
+    qwen_stages._run_single_encoder_payload(
+        make_qwen_payload(first_state, request_id="req-v1"),
+        stage_name="image_encoder",
+        model=model,
+        cache=cache,
+    )
+
+    second_state = make_qwen_state(
+        encoder_inputs={
+            "image_encoder": {
+                "cache_key": "whole:v1v2",
+                "pixel_values_videos": torch.ones((3, 3)),
+                "video_grid_thw": torch.tensor(
+                    [[1, 1, 2], [1, 1, 3]],
+                    dtype=torch.long,
+                ),
+                "video_item_cache_keys": ["v1", "v2"],
+                "video_item_pixel_present": [False, True],
+            },
+        },
+    )
+    second = qwen_stages._run_single_encoder_payload(
+        make_qwen_payload(second_state, request_id="req-v1v2"),
+        stage_name="image_encoder",
+        model=model,
+        cache=cache,
+    )
+    second_out = Qwen3OmniPipelineState.from_dict(second.data).encoder_outs[
+        "image_encoder"
+    ]
+
+    assert len(model.calls) == 2
+    assert model.calls[-1]["pixel_values_videos"].shape[0] == 3
+    assert model.calls[-1]["video_grid_thw"].tolist() == [[1, 1, 3]]
+    assert second_out["video_grid_thw"].tolist() == [[1, 1, 2], [1, 1, 3]]
+    assert second_out["video_embeds"].shape == (5, 2)
+
+
+def test_qwen_audio_encoder_item_cache_reuses_audio_prefix() -> None:
+    model = FakeAudioEncoderModel()
+    cache = StageOutputCache(max_size=16, max_bytes=1 << 20, cache_device="cpu")
+
+    first_state = make_qwen_state(
+        encoder_inputs={
+            "audio_encoder": {
+                "cache_key": "whole:a1",
+                "input_features": torch.ones((1, 2, 3)),
+                "feature_attention_mask": torch.ones((1, 3), dtype=torch.bool),
+                "audio_feature_lengths": torch.tensor([3]),
+                "audio_item_cache_keys": ["a1"],
+            },
+        },
+    )
+    first = qwen_stages._run_single_encoder_payload(
+        make_qwen_payload(first_state, request_id="req-a1"),
+        stage_name="audio_encoder",
+        model=model,
+        cache=cache,
+    )
+    first_out = Qwen3OmniPipelineState.from_dict(first.data).encoder_outs[
+        "audio_encoder"
+    ]
+
+    assert len(model.calls) == 1
+    assert model.calls[-1]["input_features"].shape == (1, 2, 3)
+    assert first_out["audio_feature_lengths"].tolist() == [3]
+
+    second_state = make_qwen_state(
+        encoder_inputs={
+            "audio_encoder": {
+                "cache_key": "whole:a1a2",
+                "input_features": torch.ones((2, 2, 5)),
+                "feature_attention_mask": torch.tensor(
+                    [[1, 1, 1, 0, 0], [1, 1, 1, 1, 1]],
+                    dtype=torch.bool,
+                ),
+                "audio_feature_lengths": torch.tensor([3, 5]),
+                "audio_item_cache_keys": ["a1", "a2"],
+            },
+        },
+    )
+    second = qwen_stages._run_single_encoder_payload(
+        make_qwen_payload(second_state, request_id="req-a1a2"),
+        stage_name="audio_encoder",
+        model=model,
+        cache=cache,
+    )
+    second_out = Qwen3OmniPipelineState.from_dict(second.data).encoder_outs[
+        "audio_encoder"
+    ]
+
+    assert len(model.calls) == 2
+    assert model.calls[-1]["input_features"].shape == (1, 2, 5)
+    assert model.calls[-1]["audio_feature_lengths"].tolist() == [5]
+    assert second_out["audio_feature_lengths"].tolist() == [3, 5]
+    assert second_out["audio_output_lengths"].tolist() == [3, 5]
+    assert second_out["audio_embeds"].shape == (8, 2)
+
+    third_state = make_qwen_state(
+        encoder_inputs={
+            "audio_encoder": {
+                "cache_key": "whole:a1a2",
+                "input_features": torch.ones((2, 2, 5)),
+                "feature_attention_mask": torch.ones((2, 5), dtype=torch.bool),
+                "audio_feature_lengths": torch.tensor([3, 5]),
+                "audio_item_cache_keys": ["a1", "a2"],
+            },
+        },
+    )
+    qwen_stages._run_single_encoder_payload(
+        make_qwen_payload(third_state, request_id="req-a1a2-repeat"),
+        stage_name="audio_encoder",
+        model=model,
+        cache=cache,
+    )
+
+    assert len(model.calls) == 2
+
+
 def test_qwen_thinker_request_and_decode_contracts() -> None:
     """Preserves incremental text deltas, replacement-char suppression, and final text."""
     stream_state = Qwen3OmniPipelineState()
@@ -1078,9 +1347,13 @@ def test_qwen_sglang_request_hashes_media_tokens_without_changing_mrope_ids(
 
     pad_values = req_data.req.omni_model_inputs["pad_values"]
     assert pad_values["audio"] >= 256
+    assert (
+        req_data.req.omni_model_inputs["original_input_ids"].tolist()
+        == input_ids.tolist()
+    )
     assert int(req_data.input_ids[1]) == pad_values["audio"]
     assert captured["input_ids"].tolist() == input_ids.tolist()
-    assert req_data.req.extra_key is None
+    assert req_data.req.extra_key == "media-cache:audio=audio:cache"
     assert not hasattr(req_data.req, "_omni_max_prefix_cache_len")
 
 
@@ -1125,7 +1398,7 @@ def test_qwen_sglang_request_can_limit_prefix_cache_before_media(
 def test_qwen_sglang_request_reuses_media_pad_tokens_for_same_cache_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Qwen3 media cache keys produce stable pad tokens across requests."""
+    """Qwen3 media cache keys produce stable radix/cache tokens across requests."""
     _patch_sampling_params(monkeypatch)
 
     audio_token_id = 77
@@ -1161,8 +1434,9 @@ def test_qwen_sglang_request_reuses_media_pad_tokens_for_same_cache_key(
     req_b = build("audio:cache", "rid-b")
     req_c = build("audio:other-cache", "rid-c")
 
-    assert req_a.req.extra_key is None
-    assert req_b.req.extra_key is None
+    assert req_a.req.extra_key == "media-cache:audio=audio:cache"
+    assert req_b.req.extra_key == req_a.req.extra_key
+    assert req_c.req.extra_key == "media-cache:audio=audio:other-cache"
     expected_audio_pad = 256 + xxhash.xxh3_64("audio:cache".encode()).intdigest() % (
         1 << 62
     )

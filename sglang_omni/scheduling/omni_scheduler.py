@@ -14,6 +14,7 @@ inheriting from ``SGLangScheduler``.
 from __future__ import annotations
 
 import logging
+import os
 import queue as _queue_mod
 import time
 import types
@@ -35,6 +36,127 @@ from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 logger = logging.getLogger(__name__)
 
 _FAILED_BATCH_RESULT = object()
+_AR_BUSY_YIELD_EVERY_ENV = "SGLANG_OMNI_AR_BUSY_YIELD_EVERY_BATCHES"
+_AR_BUSY_YIELD_EVERY_DEFAULT = 1
+_AR_BUSY_YIELD_SECONDS_ENV = "SGLANG_OMNI_AR_BUSY_YIELD_SECONDS"
+_AR_BUSY_YIELD_SECONDS_DEFAULT = 0.0
+_PRIORITY_FIRST_STREAM_ENV = "SGLANG_OMNI_PRIORITY_FIRST_STREAM"
+_PRIORITY_MARKER_ATTR = "_sg_omni_priority_stream"
+_ISOLATE_PREFILL_ONLY_BATCHES_ENV = "SGLANG_OMNI_ISOLATE_PREFILL_ONLY_BATCHES"
+_PRIORITIZE_PREFILL_ATTR = "_omni_prioritize_prefill"
+_PRIORITIZE_PREFILL_ENV = "SGLANG_OMNI_PRIORITIZE_STREAM_PREFILL"
+_PRIORITY_PREFILL_MAX_BATCH_SIZE_ENV = "SGLANG_OMNI_PRIORITY_PREFILL_MAX_BATCH_SIZE"
+_DEFER_PREFILL_DURING_PRIORITY_DECODE_ENV = (
+    "SGLANG_OMNI_DEFER_PREFILL_DURING_PRIORITY_DECODE"
+)
+
+
+class _PriorityFirstStreamQueue:
+    """Queue wrapper that lets each request's first stream bypass old chunks."""
+
+    def __init__(self):
+        self._queue: _queue_mod.PriorityQueue[tuple[int, int, Any]] = (
+            _queue_mod.PriorityQueue()
+        )
+        self._seq = 0
+
+    def put(self, item: Any, block: bool = True, timeout: float | None = None) -> None:
+        priority = 0 if bool(getattr(item, _PRIORITY_MARKER_ATTR, False)) else 1
+        self._seq += 1
+        self._queue.put((priority, self._seq, item), block=block, timeout=timeout)
+
+    def get(
+        self,
+        block: bool = True,
+        timeout: float | None = None,
+    ) -> Any:
+        return self._queue.get(block=block, timeout=timeout)[2]
+
+    def get_nowait(self) -> Any:
+        return self.get(block=False)
+
+    def empty(self) -> bool:
+        return self._queue.empty()
+
+    def qsize(self) -> int:
+        return self._queue.qsize()
+
+
+def _ar_busy_yield_every() -> int:
+    raw = os.getenv(_AR_BUSY_YIELD_EVERY_ENV)
+    if raw is None or raw == "":
+        return _AR_BUSY_YIELD_EVERY_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using %d",
+            _AR_BUSY_YIELD_EVERY_ENV,
+            raw,
+            _AR_BUSY_YIELD_EVERY_DEFAULT,
+        )
+        return _AR_BUSY_YIELD_EVERY_DEFAULT
+    return max(value, 0)
+
+
+def _ar_busy_yield_seconds() -> float:
+    raw = os.getenv(_AR_BUSY_YIELD_SECONDS_ENV)
+    if raw is None or raw == "":
+        return _AR_BUSY_YIELD_SECONDS_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using %.6f",
+            _AR_BUSY_YIELD_SECONDS_ENV,
+            raw,
+            _AR_BUSY_YIELD_SECONDS_DEFAULT,
+        )
+        return _AR_BUSY_YIELD_SECONDS_DEFAULT
+    return max(value, 0.0)
+
+
+def _priority_first_stream_enabled() -> bool:
+    raw = os.getenv(_PRIORITY_FIRST_STREAM_ENV)
+    if raw is None or raw == "":
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _isolate_prefill_only_batches_enabled() -> bool:
+    raw = os.getenv(_ISOLATE_PREFILL_ONLY_BATCHES_ENV)
+    if raw is None or raw == "":
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _prioritize_stream_prefill_enabled() -> bool:
+    raw = os.getenv(_PRIORITIZE_PREFILL_ENV)
+    if raw is None or raw == "":
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _priority_prefill_max_batch_size() -> int:
+    raw = os.getenv(_PRIORITY_PREFILL_MAX_BATCH_SIZE_ENV)
+    if raw is None or raw == "":
+        return 0
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using unlimited priority prefill batch size",
+            _PRIORITY_PREFILL_MAX_BATCH_SIZE_ENV,
+            raw,
+        )
+        return 0
+
+
+def _defer_prefill_during_priority_decode_enabled() -> bool:
+    raw = os.getenv(_DEFER_PREFILL_DURING_PRIORITY_DECODE_ENV)
+    if raw is None or raw == "":
+        return False
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 class _NoOpSender:
@@ -103,7 +225,11 @@ class OmniScheduler:
         async_decode_min_batch_size: int = 2,
     ):
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
-        self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
+        self.outbox = (
+            _PriorityFirstStreamQueue()
+            if _priority_first_stream_enabled()
+            else _queue_mod.Queue()
+        )
         self.requires_tp_work_fanout: bool = False
 
         # --- Request builder: StagePayload → SGLangARRequestData ----------
@@ -327,6 +453,15 @@ class OmniScheduler:
         self._dirty_deferred_request_ids: set[str] = set()
         self._first_emit_done: set[str] = set()
         self._prefill_start_done: set[str] = set()
+        self._busy_yield_every = _ar_busy_yield_every()
+        self._busy_yield_seconds = _ar_busy_yield_seconds()
+        self._busy_yield_counter = 0
+        self._isolate_prefill_only_batches = _isolate_prefill_only_batches_enabled()
+        self._prioritize_stream_prefill = _prioritize_stream_prefill_enabled()
+        self._priority_prefill_max_batch_size = _priority_prefill_max_batch_size()
+        self._defer_prefill_during_priority_decode = (
+            _defer_prefill_during_priority_decode_enabled()
+        )
 
     def _init_upstream_compat_flags(self, server_args: Any) -> None:
         self.enable_hisparse = bool(getattr(server_args, "enable_hisparse", False))
@@ -356,6 +491,20 @@ class OmniScheduler:
 
     def self_check_during_busy(self) -> None:
         return None
+
+    def _maybe_yield_during_busy(self) -> None:
+        if self._busy_yield_every <= 0:
+            return
+        self._busy_yield_counter += 1
+        if self._busy_yield_counter < self._busy_yield_every:
+            return
+        self._busy_yield_counter = 0
+        self._yield_to_stage_io()
+
+    def _yield_to_stage_io(self) -> None:
+        # Release the GIL so the stage asyncio loop can drain streamed outputs
+        # promptly when AR scheduling shares a process with pipeline IO.
+        time.sleep(getattr(self, "_busy_yield_seconds", 0.0))
 
     # ------------------------------------------------------------------
     # Composition: delegate missing attributes to the upstream class
@@ -522,6 +671,85 @@ class OmniScheduler:
             )
             self.waiting_queue.append(req)
 
+    def get_new_batch_prefill(self):
+        """Keep RTC actual prefill ahead of background pre-run cache writes."""
+
+        if (
+            self._prioritize_stream_prefill
+            and self.chunked_req is None
+            and self.waiting_queue
+            and any(
+                bool(getattr(req, _PRIORITIZE_PREFILL_ATTR, False))
+                for req in self.waiting_queue
+            )
+        ):
+            priority_reqs = [
+                req
+                for req in self.waiting_queue
+                if bool(getattr(req, _PRIORITIZE_PREFILL_ATTR, False))
+            ]
+            if self._priority_prefill_max_batch_size > 0:
+                selected_priority_reqs = priority_reqs[
+                    : self._priority_prefill_max_batch_size
+                ]
+                deferred_priority_reqs = priority_reqs[
+                    self._priority_prefill_max_batch_size :
+                ]
+            else:
+                selected_priority_reqs = priority_reqs
+                deferred_priority_reqs = []
+            hidden_reqs = [
+                req
+                for req in self.waiting_queue
+                if not bool(getattr(req, _PRIORITIZE_PREFILL_ATTR, False))
+            ]
+            self.waiting_queue = selected_priority_reqs
+            try:
+                return _Upstream.get_new_batch_prefill(self)
+            finally:
+                self.waiting_queue = [
+                    *self.waiting_queue,
+                    *deferred_priority_reqs,
+                    *hidden_reqs,
+                ]
+
+        if (
+            self._defer_prefill_during_priority_decode
+            and self.waiting_queue
+            and self.running_batch is not None
+            and any(
+                bool(getattr(req, _PRIORITIZE_PREFILL_ATTR, False))
+                for req in getattr(self.running_batch, "reqs", [])
+            )
+        ):
+            return None
+
+        if (
+            not self._isolate_prefill_only_batches
+            or self.chunked_req is not None
+            or not self.waiting_queue
+            or not any(
+                bool(getattr(req, "_omni_isolate_prefill_batch", False))
+                for req in self.waiting_queue
+            )
+        ):
+            return _Upstream.get_new_batch_prefill(self)
+
+        isolated_idx = next(
+            i
+            for i, req in enumerate(self.waiting_queue)
+            if bool(getattr(req, "_omni_isolate_prefill_batch", False))
+        )
+        isolated_req = self.waiting_queue[isolated_idx]
+        hidden_reqs = [
+            req for i, req in enumerate(self.waiting_queue) if i != isolated_idx
+        ]
+        self.waiting_queue = [isolated_req]
+        try:
+            return _Upstream.get_new_batch_prefill(self)
+        finally:
+            self.waiting_queue = [*self.waiting_queue, *hidden_reqs]
+
     def _prepare_request_limits(self, req_data: Any) -> str | None:
         req = req_data.req
         self.init_req_max_new_tokens(req)
@@ -653,10 +881,15 @@ class OmniScheduler:
                 continue
             req_output = mr_output.outputs[rid]
             emitted_any = False
+            prioritize_first_emit_batch = rid not in self._first_emit_done
             for msg in self._stream_output_builder(rid, sched_req.data, req_output):
+                first_stream_for_request = False
+                if prioritize_first_emit_batch:
+                    setattr(msg, _PRIORITY_MARKER_ATTR, True)
                 if not emitted_any:
-                    if rid not in self._first_emit_done:
+                    if prioritize_first_emit_batch:
                         self._first_emit_done.add(rid)
+                        first_stream_for_request = True
                         _emit_event(
                             request_id=rid,
                             stage=None,
@@ -664,6 +897,22 @@ class OmniScheduler:
                         )
                     emitted_any = True
                 self.outbox.put(msg)
+                if first_stream_for_request:
+                    _emit_event(
+                        request_id=rid,
+                        stage=None,
+                        event_name="scheduler_first_stream_outbox_put",
+                        metadata={
+                            "target": msg.target,
+                            "type": msg.type,
+                            "outbox_qsize": (
+                                self.outbox.qsize()
+                                if hasattr(self.outbox, "qsize")
+                                else None
+                            ),
+                        },
+                    )
+                    self._yield_to_stage_io()
 
     @staticmethod
     def _make_batch_result(batch, mr_output):
@@ -918,6 +1167,7 @@ class OmniScheduler:
                 result = self.run_batch(batch)
                 if result is not _FAILED_BATCH_RESULT:
                     self.process_batch_result(batch, result)
+                self._maybe_yield_during_busy()
             else:
                 self.self_check_during_idle()
                 time.sleep(0.001)
@@ -966,6 +1216,9 @@ class OmniScheduler:
 
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result)
+
+            if batch:
+                self._maybe_yield_during_busy()
 
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
@@ -1118,6 +1371,7 @@ class OmniScheduler:
                     result = self.run_batch(batch)
                     if result is not _FAILED_BATCH_RESULT:
                         self.process_batch_result(batch, result)
+                    self._maybe_yield_during_busy()
                 else:
                     self.self_check_during_idle()
                     time.sleep(0.001)

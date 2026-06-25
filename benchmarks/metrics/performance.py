@@ -114,13 +114,33 @@ def compute_speed_metrics(
     latencies = [o.latency_s for o in successes]
     rtfs = [o.rtf for o in successes if 0 < o.rtf < float("inf")]
     audio_durations = [o.audio_duration_s for o in successes if o.audio_duration_s > 0]
+    engine_latencies = [
+        o.engine_latency_s
+        for o in successes
+        if getattr(o, "engine_latency_s", None) is not None
+    ]
+    prompt_builds = [
+        o.prompt_build_s
+        for o in successes
+        if getattr(o, "prompt_build_s", None) is not None
+    ]
     ttfps = [
         o.audio_ttfp_s
         for o in successes
         if getattr(o, "audio_ttfp_s", None) is not None
     ]
+    engine_ttfps = [
+        o.engine_audio_ttfp_s
+        for o in successes
+        if getattr(o, "engine_audio_ttfp_s", None) is not None
+    ]
     text_ttfts = [
         o.text_ttft_s for o in successes if getattr(o, "text_ttft_s", None) is not None
+    ]
+    engine_text_ttfts = [
+        o.engine_text_ttft_s
+        for o in successes
+        if getattr(o, "engine_text_ttft_s", None) is not None
     ]
     inter_chunk_deltas = [
         d for o in successes for d in getattr(o, "inter_chunk_s", []) or []
@@ -165,11 +185,30 @@ def compute_speed_metrics(
         metrics_summary["audio_throughput_s_per_s"] = round(
             total_audio_s / wall_clock_s, 3
         )
+    if engine_latencies:
+        metrics_summary["engine_latency_mean_s"] = round(
+            float(np.mean(engine_latencies)), 4
+        )
+        metrics_summary["engine_latency_p95_s"] = round(
+            float(np.percentile(engine_latencies, 95)), 4
+        )
+    if prompt_builds:
+        metrics_summary["prompt_build_mean_s"] = round(float(np.mean(prompt_builds)), 4)
+        metrics_summary["prompt_build_p95_s"] = round(
+            float(np.percentile(prompt_builds, 95)), 4
+        )
     if ttfps:
         metrics_summary["audio_ttfp_mean_s"] = round(float(np.mean(ttfps)), 4)
         metrics_summary["audio_ttfp_median_s"] = round(float(np.median(ttfps)), 4)
         metrics_summary["audio_ttfp_p95_s"] = round(float(np.percentile(ttfps, 95)), 4)
         metrics_summary["audio_ttfp_p99_s"] = round(float(np.percentile(ttfps, 99)), 4)
+    if engine_ttfps:
+        metrics_summary["engine_audio_ttfp_mean_s"] = round(
+            float(np.mean(engine_ttfps)), 4
+        )
+        metrics_summary["engine_audio_ttfp_p95_s"] = round(
+            float(np.percentile(engine_ttfps, 95)), 4
+        )
     if text_ttfts:
         metrics_summary["text_ttft_mean_s"] = round(float(np.mean(text_ttfts)), 4)
         metrics_summary["text_ttft_median_s"] = round(float(np.median(text_ttfts)), 4)
@@ -178,6 +217,13 @@ def compute_speed_metrics(
         )
         metrics_summary["text_ttft_p99_s"] = round(
             float(np.percentile(text_ttfts, 99)), 4
+        )
+    if engine_text_ttfts:
+        metrics_summary["engine_text_ttft_mean_s"] = round(
+            float(np.mean(engine_text_ttfts)), 4
+        )
+        metrics_summary["engine_text_ttft_p95_s"] = round(
+            float(np.percentile(engine_text_ttfts, 95)), 4
         )
     if inter_chunk_deltas:
         metrics_summary["inter_chunk_mean_s"] = round(
@@ -237,6 +283,12 @@ def print_speed_summary(
     print_speed_metric_line(
         lw, "Audio throughput (s/s):", metrics, "audio_throughput_s_per_s"
     )
+    print_speed_metric_line(
+        lw, "Engine latency mean (s):", metrics, "engine_latency_mean_s"
+    )
+    print_speed_metric_line(lw, "Engine latency p95 (s):", metrics, "engine_latency_p95_s")
+    print_speed_metric_line(lw, "Prompt build mean (s):", metrics, "prompt_build_mean_s")
+    print_speed_metric_line(lw, "Prompt build p95 (s):", metrics, "prompt_build_p95_s")
     print_speed_metric_line(lw, "TTFC mean (s):", metrics, "audio_ttfp_mean_s")
     print_speed_metric_line(lw, "TTFC median (s):", metrics, "audio_ttfp_median_s")
     print_speed_metric_line(lw, "TTFC p95 (s):", metrics, "audio_ttfp_p95_s")
@@ -245,6 +297,18 @@ def print_speed_summary(
     print_speed_metric_line(lw, "TTFT median (s):", metrics, "text_ttft_median_s")
     print_speed_metric_line(lw, "TTFT p95 (s):", metrics, "text_ttft_p95_s")
     print_speed_metric_line(lw, "TTFT p99 (s):", metrics, "text_ttft_p99_s")
+    print_speed_metric_line(
+        lw, "Engine TTFC mean (s):", metrics, "engine_audio_ttfp_mean_s"
+    )
+    print_speed_metric_line(
+        lw, "Engine TTFC p95 (s):", metrics, "engine_audio_ttfp_p95_s"
+    )
+    print_speed_metric_line(
+        lw, "Engine TTFT mean (s):", metrics, "engine_text_ttft_mean_s"
+    )
+    print_speed_metric_line(
+        lw, "Engine TTFT p95 (s):", metrics, "engine_text_ttft_p95_s"
+    )
     print_speed_metric_line(lw, "ITL mean (s):", metrics, "inter_chunk_mean_s")
     print_speed_metric_line(lw, "ITL p95 (s):", metrics, "inter_chunk_p95_s")
     print_speed_metric_line(lw, "ITL p99 (s):", metrics, "inter_chunk_p99_s")
@@ -344,6 +408,16 @@ def _request_result_to_dict(output: RequestResult) -> dict:
         "text": output.text,
         "is_success": output.is_success,
         "latency_s": round(output.latency_s, 4),
+        "engine_latency_s": (
+            round(output.engine_latency_s, 4)
+            if getattr(output, "engine_latency_s", None) is not None
+            else None
+        ),
+        "prompt_build_s": (
+            round(output.prompt_build_s, 4)
+            if getattr(output, "prompt_build_s", None) is not None
+            else None
+        ),
         "audio_duration_s": round(output.audio_duration_s, 4),
         "rtf": round(output.rtf, 4) if output.rtf < float("inf") else None,
         "prompt_tokens": output.prompt_tokens or None,
@@ -355,6 +429,16 @@ def _request_result_to_dict(output: RequestResult) -> dict:
         "error": output.error or None,
         "audio_ttfp_s": round(ttfp, 4) if ttfp is not None else None,
         "text_ttft_s": round(ttft, 4) if ttft is not None else None,
+        "engine_audio_ttfp_s": (
+            round(output.engine_audio_ttfp_s, 4)
+            if getattr(output, "engine_audio_ttfp_s", None) is not None
+            else None
+        ),
+        "engine_text_ttft_s": (
+            round(output.engine_text_ttft_s, 4)
+            if getattr(output, "engine_text_ttft_s", None) is not None
+            else None
+        ),
         "inter_chunk_s": [round(d, 4) for d in inter] if inter else None,
         "audio_chunk_count": output.audio_chunk_count or None,
         "first_audio_payload_bytes": output.first_audio_payload_bytes or None,

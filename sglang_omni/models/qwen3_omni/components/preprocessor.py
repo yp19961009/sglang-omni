@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -34,6 +35,9 @@ from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
 
 logger = logging.getLogger(__name__)
+_OMIT_CACHED_VISUAL_ITEM_PAYLOADS_ENV = (
+    "SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS"
+)
 _OPENAI_AUDIO_OUTPUT_CONFIG_KEYS = frozenset(
     {
         "format",
@@ -65,6 +69,30 @@ _AUDIO_MEDIA_PAYLOAD_KEYS = frozenset(
         "url",
     }
 )
+
+
+async def _profiled_preprocess_awaitable(
+    request_id: str,
+    event_prefix: str,
+    awaitable: Any,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> Any:
+    _emit_event(
+        request_id=request_id,
+        stage=None,
+        event_name=f"{event_prefix}_start",
+        metadata=metadata,
+    )
+    try:
+        return await awaitable
+    finally:
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name=f"{event_prefix}_end",
+            metadata=metadata,
+        )
 
 
 def _resolve_local_model_dir(model_path: str) -> str:
@@ -156,10 +184,203 @@ def _first_present_audio_input(inputs: dict[str, Any]) -> Any | None:
     return value if _media_value_is_present(value) else None
 
 
+def _append_media_value(target: list[Any], value: Any) -> None:
+    if not _media_value_is_present(value):
+        return
+    if isinstance(value, list):
+        target.extend(value)
+    else:
+        target.append(value)
+
+
+def _media_part_value(part: dict[str, Any], *keys: str) -> Any | None:
+    for key in keys:
+        value = part.get(key)
+        if _media_value_is_present(value):
+            if isinstance(value, dict):
+                for nested_key in ("path", "url", "data"):
+                    nested_value = value.get(nested_key)
+                    if _media_value_is_present(nested_value):
+                        return nested_value
+            return value
+    return None
+
+
+def _extract_openai_content_media(
+    messages: Any,
+) -> tuple[list[Any], list[Any], list[Any], list[Any]]:
+    if not isinstance(messages, list):
+        return messages, [], [], []
+
+    images: list[Any] = []
+    videos: list[Any] = []
+    audios: list[Any] = []
+    normalized_messages: list[Any] = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            normalized_messages.append(message)
+            continue
+        content = message.get("content", "")
+        if not isinstance(content, list):
+            normalized_messages.append(message)
+            continue
+
+        text_parts: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                text_parts.append(str(part))
+                continue
+            part_type = str(part.get("type", "")).lower()
+            if part_type in ("text", "input_text"):
+                text = part.get("text", part.get("content", ""))
+                if text:
+                    text_parts.append(str(text))
+                continue
+            if part_type in ("image", "input_image", "image_url"):
+                _append_media_value(
+                    images,
+                    _media_part_value(part, "image", "image_url", "url", "path"),
+                )
+                continue
+            if part_type in ("video", "input_video", "video_url"):
+                _append_media_value(
+                    videos,
+                    _media_part_value(part, "video", "video_url", "url", "path"),
+                )
+                continue
+            if part_type in ("audio", "input_audio", "audio_url"):
+                _append_media_value(
+                    audios,
+                    _media_part_value(
+                        part,
+                        "audio",
+                        "input_audio",
+                        "audio_url",
+                        "url",
+                        "path",
+                    ),
+                )
+                continue
+            text_parts.append(str(part))
+
+        normalized = dict(message)
+        normalized["content"] = "\n".join(text for text in text_parts if text)
+        normalized_messages.append(normalized)
+
+    return normalized_messages, images, videos, audios
+
+
+def _merge_media_inputs(existing: Any, extracted: list[Any]) -> Any:
+    if not extracted:
+        return existing
+    if not _media_value_is_present(existing):
+        return extracted
+    if isinstance(existing, list):
+        return existing + extracted
+    return [existing] + extracted
+
+
 def _media_item_count(value: Any) -> int:
     if not _media_value_is_present(value):
         return 0
     return len(value) if isinstance(value, list) else 1
+
+
+def _media_items(value: Any) -> list[Any]:
+    if not _media_value_is_present(value):
+        return []
+    return list(value) if isinstance(value, list) else [value]
+
+
+def _media_item_cache_keys_for_request(
+    *,
+    raw_value: Any,
+    compute_cache_key: Callable[[Any], str | None],
+    context_by_index: Callable[[int], dict[str, Any]] | None = None,
+) -> list[str | None]:
+    item_keys: list[str | None] = []
+    for index, item in enumerate(_media_items(raw_value)):
+        cache_key = compute_cache_key(item)
+        if cache_key is not None and context_by_index is not None:
+            cache_key = _contextualize_cache_key(
+                cache_key,
+                **context_by_index(index),
+            )
+        item_keys.append(cache_key)
+    return item_keys
+
+
+def _omit_cached_visual_item_payloads_enabled() -> bool:
+    value = os.getenv(_OMIT_CACHED_VISUAL_ITEM_PAYLOADS_ENV, "")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _empty_like_first_dim(value: torch.Tensor) -> torch.Tensor:
+    return value.new_empty((0, *value.shape[1:]))
+
+
+def _trim_cached_video_item_payloads(
+    image_encoder_inputs: dict[str, Any],
+    *,
+    video_item_cache_keys: list[str | None],
+    seen_item_keys: set[str],
+) -> None:
+    if not video_item_cache_keys:
+        return
+    pixels = image_encoder_inputs.get("pixel_values_videos")
+    grid = image_encoder_inputs.get("video_grid_thw")
+    if not isinstance(pixels, torch.Tensor) or not isinstance(grid, torch.Tensor):
+        return
+    if len(video_item_cache_keys) != int(grid.shape[0]):
+        return
+    existing_mask = image_encoder_inputs.get("video_item_pixel_present")
+    if isinstance(existing_mask, list) and len(existing_mask) == int(grid.shape[0]):
+        for cache_key in video_item_cache_keys:
+            if cache_key is not None:
+                seen_item_keys.add(cache_key)
+        return
+
+    grid_long = grid.to(dtype=torch.long)
+    patch_counts = [int(count) for count in grid_long.prod(dim=-1).tolist()]
+
+    seen_before = set(seen_item_keys)
+    pixel_present: list[bool] = []
+    for cache_key in video_item_cache_keys:
+        can_omit = cache_key is not None and cache_key in seen_before
+        pixel_present.append(not can_omit)
+        if cache_key is not None:
+            seen_item_keys.add(cache_key)
+
+    if all(pixel_present):
+        return
+
+    full_patch_count = sum(patch_counts)
+    present_patch_count = sum(
+        patch_count
+        for patch_count, has_pixels in zip(patch_counts, pixel_present)
+        if has_pixels
+    )
+    actual_patch_count = int(pixels.shape[0])
+    if actual_patch_count == present_patch_count:
+        image_encoder_inputs["video_item_pixel_present"] = pixel_present
+        return
+    if actual_patch_count != full_patch_count:
+        return
+
+    kept_pixels: list[torch.Tensor] = []
+    cursor = 0
+    for cache_key, patch_count in zip(video_item_cache_keys, patch_counts):
+        end = cursor + patch_count
+        can_omit = cache_key is not None and cache_key in seen_before
+        if not can_omit:
+            kept_pixels.append(pixels[cursor:end])
+        cursor = end
+
+    image_encoder_inputs["video_item_pixel_present"] = pixel_present
+    image_encoder_inputs["pixel_values_videos"] = (
+        torch.cat(kept_pixels, dim=0) if kept_pixels else _empty_like_first_dim(pixels)
+    )
 
 
 def _request_raw_prompt_text(inputs: Any) -> str | None:
@@ -491,6 +712,15 @@ class Qwen3OmniPreprocessor:
             raw_images = _first_present_media_input(inputs, ("images", "image"))
             raw_videos = _first_present_media_input(inputs, ("videos", "video"))
             raw_audios = _first_present_audio_input(inputs)
+            (
+                messages,
+                message_images,
+                message_videos,
+                message_audios,
+            ) = _extract_openai_content_media(messages)
+            raw_images = _merge_media_inputs(raw_images, message_images)
+            raw_videos = _merge_media_inputs(raw_videos, message_videos)
+            raw_audios = _merge_media_inputs(raw_audios, message_audios)
             audio_target_sr = int(
                 inputs.get(
                     "audio_target_sr",
@@ -620,22 +850,63 @@ class Qwen3OmniPreprocessor:
                     self._processor_use_audio_in_video_value(use_audio_in_video)
                 )
 
-            images, videos_result, audios_result = await asyncio.gather(
-                ensure_image_list_async(raw_images),
-                ensure_video_list_async(
-                    raw_videos,
-                    fps=resolved_video_fps,
-                    max_frames=resolved_video_max_frames,
-                    min_frames=resolved_video_min_frames,
-                    min_pixels=resolved_video_min_pixels,
-                    max_pixels=resolved_video_max_pixels,
-                    total_pixels=resolved_video_total_pixels,
-                    override_max_pixels=resolved_video_override_max_pixels,
-                    extract_audio=extract_audio_from_video_flag,
-                    audio_target_sr=audio_target_sr,
-                ),
-                ensure_audio_list_async(raw_audios, target_sr=audio_target_sr),
+            media_metadata = {
+                "has_images": _media_value_is_present(raw_images),
+                "has_videos": _media_value_is_present(raw_videos),
+                "has_audios": _media_value_is_present(raw_audios),
+                "extract_audio_from_video": bool(extract_audio_from_video_flag),
+            }
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="preprocess_media_load_start",
+                metadata=media_metadata,
             )
+            try:
+                images, videos_result, audios_result = await asyncio.gather(
+                    _profiled_preprocess_awaitable(
+                        payload.request_id,
+                        "preprocess_image_load",
+                        ensure_image_list_async(raw_images),
+                        metadata={"has_images": media_metadata["has_images"]},
+                    ),
+                    _profiled_preprocess_awaitable(
+                        payload.request_id,
+                        "preprocess_video_load",
+                        ensure_video_list_async(
+                            raw_videos,
+                            fps=resolved_video_fps,
+                            max_frames=resolved_video_max_frames,
+                            min_frames=resolved_video_min_frames,
+                            min_pixels=resolved_video_min_pixels,
+                            max_pixels=resolved_video_max_pixels,
+                            total_pixels=resolved_video_total_pixels,
+                            override_max_pixels=resolved_video_override_max_pixels,
+                            extract_audio=extract_audio_from_video_flag,
+                            audio_target_sr=audio_target_sr,
+                        ),
+                        metadata={
+                            "has_videos": media_metadata["has_videos"],
+                            "extract_audio": media_metadata["extract_audio_from_video"],
+                        },
+                    ),
+                    _profiled_preprocess_awaitable(
+                        payload.request_id,
+                        "preprocess_audio_load",
+                        ensure_audio_list_async(
+                            raw_audios,
+                            target_sr=audio_target_sr,
+                        ),
+                        metadata={"has_audios": media_metadata["has_audios"]},
+                    ),
+                )
+            finally:
+                _emit_event(
+                    request_id=payload.request_id,
+                    stage=None,
+                    event_name="preprocess_media_load_end",
+                    metadata=media_metadata,
+                )
             videos, sampled_video_fps, extracted_audio_from_video = videos_result
             explicit_audios_for_mask = audios_result
             video_audios_for_mask = extracted_audio_from_video
@@ -651,6 +922,9 @@ class Qwen3OmniPreprocessor:
             tools = None
             raw_prompt_text = None
             raw_prompt_token_ids = None
+            raw_images = None
+            raw_videos = None
+            raw_audios = None
             images = []
             videos = []
             audios = []
@@ -694,42 +968,59 @@ class Qwen3OmniPreprocessor:
             explicit_audios_for_mask = []
             video_audios_for_mask = []
 
-        if raw_prompt_text is not None:
-            # Qwen reference TextPrompt already renders the chat template and
-            # multimodal placeholders into prompt. Reuse it directly to avoid
-            # applying the template again and duplicating placeholders.
-            prompt_text = raw_prompt_text
-        elif raw_prompt_token_ids is not None:
-            # Qwen reference TokensPrompt is already tokenized. The HF processor
-            # is still used for multimodal feature extraction, and final
-            # input_ids are overridden by caller-provided tokens so tokenized
-            # prompts are not converted back to text and re-encoded.
-            prompt_text = ""
-        else:
-            messages_norm = normalize_messages(messages)
-            # Insert placeholders:
-            # - Explicit audio files get independent audio placeholders
-            # - Video audio (when use_audio_in_video=True) is handled by video token,
-            #   no separate placeholder
-            num_audios_for_placeholder = num_explicit_audios
-            messages_mm = self._build_multimodal_messages(
-                messages_norm,
-                num_images=len(images),
-                num_audios=num_audios_for_placeholder,
-                num_videos=len(videos),
-            )
-            chat_template_kwargs: dict[str, Any] = {
-                "add_generation_prompt": True,
-                "tokenize": False,
-            }
-            if tools is not None:
-                # Qwen3.5 reference offline function-call examples pass tools to
-                # the chat template for rendering. Here we only pass schemas and
-                # do not execute tools.
-                chat_template_kwargs["tools"] = tools
-            prompt_text = self.processor.apply_chat_template(
-                messages_mm,
-                **chat_template_kwargs,
+        prompt_metadata: dict[str, Any] = {"mode": "chat_template"}
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="preprocess_prompt_start",
+            metadata=prompt_metadata,
+        )
+        try:
+            if raw_prompt_text is not None:
+                # Qwen reference TextPrompt already renders the chat template and
+                # multimodal placeholders into prompt. Reuse it directly to avoid
+                # applying the template again and duplicating placeholders.
+                prompt_metadata["mode"] = "raw_text"
+                prompt_text = raw_prompt_text
+            elif raw_prompt_token_ids is not None:
+                # Qwen reference TokensPrompt is already tokenized. The HF processor
+                # is still used for multimodal feature extraction, and final
+                # input_ids are overridden by caller-provided tokens so tokenized
+                # prompts are not converted back to text and re-encoded.
+                prompt_metadata["mode"] = "raw_token_ids"
+                prompt_text = ""
+            else:
+                messages_norm = normalize_messages(messages)
+                # Insert placeholders:
+                # - Explicit audio files get independent audio placeholders
+                # - Video audio (when use_audio_in_video=True) is handled by video token,
+                #   no separate placeholder
+                num_audios_for_placeholder = num_explicit_audios
+                messages_mm = self._build_multimodal_messages(
+                    messages_norm,
+                    num_images=len(images),
+                    num_audios=num_audios_for_placeholder,
+                    num_videos=len(videos),
+                )
+                chat_template_kwargs: dict[str, Any] = {
+                    "add_generation_prompt": True,
+                    "tokenize": False,
+                }
+                if tools is not None:
+                    # Qwen3.5 reference offline function-call examples pass tools to
+                    # the chat template for rendering. Here we only pass schemas and
+                    # do not execute tools.
+                    chat_template_kwargs["tools"] = tools
+                prompt_text = self.processor.apply_chat_template(
+                    messages_mm,
+                    **chat_template_kwargs,
+                )
+        finally:
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="preprocess_prompt_end",
+                metadata=prompt_metadata,
             )
 
         videos_kwargs: dict[str, Any] = {}
@@ -769,23 +1060,126 @@ class Qwen3OmniPreprocessor:
             images_kwargs["min_pixels"] = resolved_image_min_pixels
         if resolved_image_max_pixels is not None:
             images_kwargs["max_pixels"] = resolved_image_max_pixels
+
+        contextual_image_cache_key = _contextualize_cache_key(
+            image_cache_key,
+            min_pixels=resolved_image_min_pixels,
+            max_pixels=resolved_image_max_pixels,
+        )
+        image_item_cache_keys = _media_item_cache_keys_for_request(
+            raw_value=raw_images,
+            compute_cache_key=compute_image_cache_key,
+            context_by_index=lambda _index: {
+                "min_pixels": resolved_image_min_pixels,
+                "max_pixels": resolved_image_max_pixels,
+            },
+        )
+        effective_video_fps: tuple[float, ...] | None = None
+        if sampled_video_fps is not None:
+            effective_video_fps = tuple(float(fps) for fps in sampled_video_fps)
+        elif resolved_video_fps is not None:
+            effective_video_fps = (resolved_video_fps,)
+        contextual_video_cache_key = _contextualize_cache_key(
+            video_cache_key,
+            fps=effective_video_fps,
+            max_frames=resolved_video_max_frames,
+            min_frames=resolved_video_min_frames,
+            min_pixels=resolved_video_min_pixels,
+            max_pixels=resolved_video_max_pixels,
+            total_pixels=resolved_video_total_pixels,
+            override_max_pixels=resolved_video_override_max_pixels,
+            seconds_per_chunk=resolved_video_seconds_per_chunk,
+        )
+        sampled_fps_by_index = (
+            [float(fps) for fps in sampled_video_fps]
+            if sampled_video_fps is not None
+            else None
+        )
+
+        def _video_item_cache_context(index: int) -> dict[str, Any]:
+            if sampled_fps_by_index is not None and index < len(sampled_fps_by_index):
+                fps_context: tuple[float, ...] | None = (sampled_fps_by_index[index],)
+            elif resolved_video_fps is not None:
+                fps_context = (resolved_video_fps,)
+            else:
+                fps_context = None
+            return {
+                "fps": fps_context,
+                "max_frames": resolved_video_max_frames,
+                "min_frames": resolved_video_min_frames,
+                "min_pixels": resolved_video_min_pixels,
+                "max_pixels": resolved_video_max_pixels,
+                "total_pixels": resolved_video_total_pixels,
+                "override_max_pixels": resolved_video_override_max_pixels,
+                "seconds_per_chunk": resolved_video_seconds_per_chunk,
+            }
+
+        video_item_cache_keys = _media_item_cache_keys_for_request(
+            raw_value=raw_videos,
+            compute_cache_key=compute_video_cache_key,
+            context_by_index=_video_item_cache_context,
+        )
+        audio_item_cache_keys = _media_item_cache_keys_for_request(
+            raw_value=raw_audios,
+            compute_cache_key=compute_audio_cache_key,
+            context_by_index=lambda _index: {"target_sr": int(audio_target_sr)},
+        )
         processor_kwargs = self._processor_kwargs_for_request(
             request_inputs=inputs,
             images_kwargs=images_kwargs,
             videos_kwargs=videos_kwargs,
             audio_target_sr=audio_target_sr,
         )
+        if getattr(self.processor, "supports_item_cache_keys", False):
+            if self.processor.__class__.__name__ == "_Qwen35ProcessorShim":
+                processor_kwargs["_sglang_omni_profile_request_id"] = (
+                    payload.request_id
+                )
+            if video_item_cache_keys:
+                processor_kwargs.setdefault("videos_kwargs", {})[
+                    "_sglang_omni_item_cache_keys"
+                ] = video_item_cache_keys
+            if audio_item_cache_keys:
+                processor_kwargs.setdefault("audio_kwargs", {})[
+                    "_sglang_omni_item_cache_keys"
+                ] = audio_item_cache_keys
 
-        hf_inputs = self.processor(
-            text=prompt_text,
-            images=images or None,
-            videos=videos or None,
-            audio=audios or None,
-            add_special_tokens=False,
-            return_tensors="pt",
-            **processor_kwargs,
+        processor_metadata = {
+            "num_images": len(images),
+            "num_videos": len(videos),
+            "num_audios": _media_item_count(audios),
+            "prompt_chars": len(prompt_text),
+        }
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="preprocess_hf_processor_start",
+            metadata=processor_metadata,
         )
+        try:
+            hf_inputs = self.processor(
+                text=prompt_text,
+                images=images or None,
+                videos=videos or None,
+                audio=audios or None,
+                add_special_tokens=False,
+                return_tensors="pt",
+                **processor_kwargs,
+            )
+        finally:
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="preprocess_hf_processor_end",
+                metadata=processor_metadata,
+            )
 
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="preprocess_output_build_start",
+            metadata=processor_metadata,
+        )
         if raw_prompt_token_ids is not None:
             input_ids = raw_prompt_token_ids.to(dtype=torch.long)
             attention_mask = torch.ones_like(input_ids)
@@ -820,33 +1214,32 @@ class Qwen3OmniPreprocessor:
             **full_mm_inputs["image"],
             **full_mm_inputs["video"],
         }
-        effective_video_fps: tuple[float, ...] | None = None
-        if sampled_video_fps is not None:
-            effective_video_fps = tuple(float(fps) for fps in sampled_video_fps)
-        elif resolved_video_fps is not None:
-            effective_video_fps = (resolved_video_fps,)
-
-        contextual_image_cache_key = _contextualize_cache_key(
-            image_cache_key,
-            min_pixels=resolved_image_min_pixels,
-            max_pixels=resolved_image_max_pixels,
-        )
-        contextual_video_cache_key = _contextualize_cache_key(
-            video_cache_key,
-            fps=effective_video_fps,
-            max_frames=resolved_video_max_frames,
-            min_frames=resolved_video_min_frames,
-            min_pixels=resolved_video_min_pixels,
-            max_pixels=resolved_video_max_pixels,
-            total_pixels=resolved_video_total_pixels,
-            override_max_pixels=resolved_video_override_max_pixels,
-            seconds_per_chunk=resolved_video_seconds_per_chunk,
-        )
         combined_cache_key = _combine_cache_keys(
             contextual_image_cache_key, contextual_video_cache_key
         )
         if combined_cache_key:
             image_encoder_inputs["cache_key"] = combined_cache_key
+        if image_item_cache_keys:
+            image_encoder_inputs["image_item_cache_keys"] = image_item_cache_keys
+        if video_item_cache_keys:
+            image_encoder_inputs["video_item_cache_keys"] = video_item_cache_keys
+        if (
+            video_item_cache_keys
+            and _omit_cached_visual_item_payloads_enabled()
+        ):
+            seen_item_keys = getattr(
+                self,
+                "_visual_item_payload_cache_keys",
+                None,
+            )
+            if seen_item_keys is None:
+                seen_item_keys = set()
+                self._visual_item_payload_cache_keys = seen_item_keys
+            _trim_cached_video_item_payloads(
+                image_encoder_inputs,
+                video_item_cache_keys=video_item_cache_keys,
+                seen_item_keys=seen_item_keys,
+            )
 
         audio_encoder_inputs = {**full_mm_inputs["audio"]}
         audio_is_dependent = self._audio_is_dependent_for_request(
@@ -885,6 +1278,8 @@ class Qwen3OmniPreprocessor:
             )
         if contextualized_audio_cache_key:
             audio_encoder_inputs["cache_key"] = contextualized_audio_cache_key
+        if audio_item_cache_keys:
+            audio_encoder_inputs["audio_item_cache_keys"] = audio_item_cache_keys
 
         encoder_inputs: dict[str, dict[str, Any]] = {}
         image_encoder_inputs = {
@@ -907,10 +1302,17 @@ class Qwen3OmniPreprocessor:
             prompt={
                 "prompt_text": prompt_text,
                 "input_ids": input_ids,
+                "original_input_ids": input_ids.clone(),
                 "attention_mask": attention_mask,
             },
             encoder_inputs=encoder_inputs,
             stream_state={"token_ids": [], "text": ""},
         )
         payload.data = state.to_dict()
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="preprocess_output_build_end",
+            metadata=processor_metadata,
+        )
         return payload

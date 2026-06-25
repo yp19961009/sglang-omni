@@ -139,6 +139,171 @@ def test_optional_config_dict_allows_missing_speaker_id():
         bootstrap._optional_config_dict(
             SimpleNamespace(speaker_id=speaker_map),
             "speaker_id",
-        )
+            )
         is speaker_map
     )
+
+
+def test_maybe_enable_subtalker_torch_compile_consumes_talker_flag():
+    calls = []
+    model = SimpleNamespace(
+        enable_subtalker_torch_compile=lambda: calls.append("model_hook")
+    )
+    server_args = SimpleNamespace(enable_torch_compile=True)
+
+    assert bootstrap._maybe_enable_subtalker_torch_compile(model, server_args) is True
+
+    assert calls == ["model_hook"]
+    assert server_args.enable_torch_compile is False
+
+
+def test_maybe_enable_subtalker_torch_compile_warms_predictor(monkeypatch):
+    calls = []
+    model = SimpleNamespace(
+        enable_subtalker_torch_compile=lambda: calls.append(("compile", None)),
+        warmup_subtalker_code_predictor=lambda *, batch_sizes: calls.append(
+            ("warmup", list(batch_sizes))
+        )
+        or list(batch_sizes),
+    )
+    server_args = SimpleNamespace(enable_torch_compile=True, max_running_requests=8)
+
+    monkeypatch.setenv("SGLANG_OMNI_QWEN35_SUBTALKER_COMPILE_WARMUP", "1")
+    monkeypatch.delenv(
+        "SGLANG_OMNI_QWEN35_SUBTALKER_WARMUP_BATCHES",
+        raising=False,
+    )
+
+    assert bootstrap._maybe_enable_subtalker_torch_compile(model, server_args) is True
+
+    assert calls == [("compile", None), ("warmup", [1, 2, 3, 4, 5, 6, 7, 8])]
+    assert server_args.enable_torch_compile is False
+
+
+def test_maybe_enable_subtalker_torch_compile_avoids_reduce_overhead(monkeypatch):
+    calls = []
+
+    def compile_hook(*, mode=None):
+        calls.append(("compile", mode))
+
+    model = SimpleNamespace(
+        enable_subtalker_torch_compile=compile_hook,
+        warmup_subtalker_code_predictor=lambda *, batch_sizes: calls.append(
+            ("warmup", list(batch_sizes))
+        )
+        or list(batch_sizes),
+    )
+    server_args = SimpleNamespace(enable_torch_compile=True, max_running_requests=2)
+
+    monkeypatch.setenv("SGLANG_TORCH_COMPILE_MODE", "reduce-overhead")
+    monkeypatch.setenv("SGLANG_OMNI_QWEN35_SUBTALKER_COMPILE_WARMUP", "1")
+    monkeypatch.delenv(
+        "SGLANG_OMNI_QWEN35_SUBTALKER_WARMUP_BATCHES",
+        raising=False,
+    )
+
+    assert bootstrap._maybe_enable_subtalker_torch_compile(model, server_args) is True
+
+    assert calls == [("compile", "default"), ("warmup", [1, 2])]
+    assert server_args.enable_torch_compile is False
+
+
+def test_maybe_enable_subtalker_torch_compile_fallbacks_to_default_mode(monkeypatch):
+    calls = []
+
+    def compile_hook(*, mode=None):
+        calls.append(("compile", mode))
+
+    def warmup_hook(*, batch_sizes):
+        calls.append(("warmup", list(batch_sizes)))
+        if len([call for call in calls if call[0] == "warmup"]) == 1:
+            raise RuntimeError("compile mode failed")
+        return list(batch_sizes)
+
+    model = SimpleNamespace(
+        enable_subtalker_torch_compile=compile_hook,
+        warmup_subtalker_code_predictor=warmup_hook,
+    )
+    server_args = SimpleNamespace(enable_torch_compile=True, max_running_requests=2)
+
+    monkeypatch.setenv("SGLANG_TORCH_COMPILE_MODE", "max-autotune")
+    monkeypatch.setenv("SGLANG_OMNI_QWEN35_SUBTALKER_COMPILE_WARMUP", "1")
+    monkeypatch.delenv(
+        "SGLANG_OMNI_QWEN35_SUBTALKER_WARMUP_BATCHES",
+        raising=False,
+    )
+
+    assert bootstrap._maybe_enable_subtalker_torch_compile(model, server_args) is True
+
+    assert calls == [
+        ("compile", None),
+        ("warmup", [1, 2]),
+        ("compile", "default"),
+        ("warmup", [1, 2]),
+    ]
+    assert server_args.enable_torch_compile is False
+
+
+def test_maybe_enable_subtalker_torch_compile_warmup_defaults_on(monkeypatch):
+    calls = []
+    model = SimpleNamespace(
+        enable_subtalker_torch_compile=lambda: calls.append("compile"),
+        warmup_subtalker_code_predictor=lambda *, batch_sizes: calls.append(
+            ("warmup", list(batch_sizes))
+        )
+        or list(batch_sizes),
+    )
+    server_args = SimpleNamespace(enable_torch_compile=True, max_running_requests=3)
+
+    monkeypatch.delenv(
+        "SGLANG_OMNI_QWEN35_SUBTALKER_COMPILE_WARMUP",
+        raising=False,
+    )
+
+    assert bootstrap._maybe_enable_subtalker_torch_compile(model, server_args) is True
+
+    assert calls == ["compile", ("warmup", [1, 2, 3])]
+    assert server_args.enable_torch_compile is False
+
+
+def test_maybe_enable_subtalker_torch_compile_warmup_can_be_disabled(monkeypatch):
+    calls = []
+    model = SimpleNamespace(
+        enable_subtalker_torch_compile=lambda: calls.append("compile"),
+        warmup_subtalker_code_predictor=lambda *, batch_sizes: calls.append("warmup"),
+    )
+    server_args = SimpleNamespace(enable_torch_compile=True, max_running_requests=8)
+
+    monkeypatch.setenv("SGLANG_OMNI_QWEN35_SUBTALKER_COMPILE_WARMUP", "0")
+
+    assert bootstrap._maybe_enable_subtalker_torch_compile(model, server_args) is True
+
+    assert calls == ["compile"]
+    assert server_args.enable_torch_compile is False
+
+
+def test_maybe_enable_subtalker_torch_compile_falls_back_to_code_predictor():
+    calls = []
+    model = SimpleNamespace(
+        code_predictor=SimpleNamespace(
+            enable_torch_compile=lambda: calls.append("predictor_hook")
+        )
+    )
+    server_args = SimpleNamespace(enable_torch_compile=True)
+
+    assert bootstrap._maybe_enable_subtalker_torch_compile(model, server_args) is True
+
+    assert calls == ["predictor_hook"]
+    assert server_args.enable_torch_compile is False
+
+
+def test_maybe_enable_subtalker_torch_compile_ignores_disabled_flag():
+    model = SimpleNamespace(
+        enable_subtalker_torch_compile=lambda: (_ for _ in ()).throw(
+            AssertionError("compile hook should not be called")
+        )
+    )
+    server_args = SimpleNamespace(enable_torch_compile=False)
+
+    assert bootstrap._maybe_enable_subtalker_torch_compile(model, server_args) is False
+    assert server_args.enable_torch_compile is False

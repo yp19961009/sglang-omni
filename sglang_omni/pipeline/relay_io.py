@@ -8,9 +8,12 @@ Extracted from worker/data_plane.py and worker/runtime.py.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
+import os
 import pickle
+from dataclasses import fields, is_dataclass
 from multiprocessing.reduction import ForkingPickler
 from typing import Any
 
@@ -18,6 +21,18 @@ import torch
 
 from sglang_omni.proto import DataReadyMessage, StagePayload
 from sglang_omni.relay.base import Relay
+
+_FULL_PAYLOAD_CUDA_IPC_ENV = "SGLANG_OMNI_FULL_PAYLOAD_CUDA_IPC"
+_FULL_PAYLOAD_CUDA_IPC_MAX_CONTROL_BYTES_ENV = (
+    "SGLANG_OMNI_FULL_PAYLOAD_CUDA_IPC_MAX_CONTROL_BYTES"
+)
+_FULL_PAYLOAD_CUDA_IPC_DEFAULT_MAX_CONTROL_BYTES = 4 * 1024 * 1024
+_PAYLOAD_PREP_EXECUTOR_ENV = "SGLANG_OMNI_RELAY_PAYLOAD_PREP_EXECUTOR"
+_DEFAULT_RELAY_COMPLETION_TIMEOUT_S = 30.0
+_INLINE_CPU_STREAM_CHUNK_MAX_BYTES_ENV = (
+    "SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES"
+)
+_INLINE_CPU_STREAM_CHUNK_DEFAULT_MAX_BYTES = 0
 
 
 def _dtype_alignment(dtype: torch.dtype) -> int:
@@ -97,8 +112,39 @@ async def write_payload(
 ) -> tuple[dict[str, Any], Any]:
     """Write a StagePayload to relay. Returns (control_plane_metadata, relay_op)."""
     device = getattr(relay, "device", "cpu")
-    transport_device = torch.device(device)
+    if _env_enabled(_PAYLOAD_PREP_EXECUTOR_ENV):
+        loop = asyncio.get_running_loop()
+        metadata_bytes, tensor_info, all_tensors = await loop.run_in_executor(
+            None,
+            _prepare_payload_for_relay,
+            device,
+            payload,
+        )
+    else:
+        metadata_bytes, tensor_info, all_tensors = _prepare_payload_for_relay(
+            device,
+            payload,
+        )
 
+    op = await relay.put_async(all_tensors, request_id=request_id)
+    tensor_bytes = sum(int(info.get("size", 0)) for info in tensor_info)
+
+    return {
+        "relay_info": op.metadata,
+        "payload_pickle": base64.b64encode(metadata_bytes).decode("ascii"),
+        "tensor_info": tensor_info,
+        "payload_pickle_bytes": len(metadata_bytes),
+        "tensor_count": len(tensor_info),
+        "tensor_bytes": tensor_bytes,
+        "relay_bytes": int(all_tensors.numel()),
+    }, op
+
+
+def _prepare_payload_for_relay(
+    device: str,
+    payload: StagePayload,
+) -> tuple[bytes, list[dict[str, Any]], torch.Tensor]:
+    transport_device = torch.device(device)
     modified_data, tensor_dict = extract_tensors(payload.data)
     payload_no_tensors = StagePayload(
         request_id=payload.request_id,
@@ -136,14 +182,9 @@ async def write_payload(
     else:
         all_tensors = torch.zeros(1, dtype=torch.uint8, device=device)
         tensor_info = []
-
-    op = await relay.put_async(all_tensors, request_id=request_id)
-
-    return {
-        "relay_info": op.metadata,
-        "payload_pickle": base64.b64encode(metadata_bytes).decode("ascii"),
-        "tensor_info": tensor_info,
-    }, op
+    if transport_device.type == "cuda":
+        torch.cuda.synchronize(transport_device)
+    return metadata_bytes, tensor_info, all_tensors
 
 
 async def read_payload(
@@ -246,6 +287,36 @@ async def read_blob(
     return recv_buf[offset:].view(dtype).reshape(shape)
 
 
+async def wait_for_relay_op(
+    op: Any,
+    *,
+    timeout: float | None = _DEFAULT_RELAY_COMPLETION_TIMEOUT_S,
+) -> None:
+    """Wait for a relay operation.
+
+    ``timeout=None`` means wait indefinitely. A few unit-test fakes implement
+    the older no-argument method, so retry without the timeout only when the
+    call signature rejects the keyword.
+    """
+
+    try:
+        if timeout is None:
+            await op.wait_for_completion(timeout=float("inf"))
+        else:
+            await op.wait_for_completion(timeout=timeout)
+    except TypeError:
+        await op.wait_for_completion()
+
+
+async def wait_for_relay_ops(
+    ops: list[Any],
+    *,
+    timeout: float | None = _DEFAULT_RELAY_COMPLETION_TIMEOUT_S,
+) -> None:
+    for op in ops:
+        await wait_for_relay_op(op, timeout=timeout)
+
+
 # ---------------------------------------------------------------------------
 # Stream chunk send
 # ---------------------------------------------------------------------------
@@ -287,6 +358,29 @@ def _contains_cpu_tensor(obj: Any, seen: set[int] | None = None) -> bool:
     return False
 
 
+def _cpu_tensor_bytes(obj: Any, seen: set[int] | None = None) -> int:
+    if obj is None:
+        return 0
+    seen = set() if seen is None else seen
+    obj_id = id(obj)
+    if obj_id in seen:
+        return 0
+    seen.add(obj_id)
+
+    if isinstance(obj, torch.Tensor):
+        return 0 if obj.is_cuda else obj.numel() * obj.element_size()
+    if isinstance(obj, dict):
+        return sum(
+            _cpu_tensor_bytes(key, seen) + _cpu_tensor_bytes(value, seen)
+            for key, value in obj.items()
+        )
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return sum(_cpu_tensor_bytes(value, seen) for value in obj)
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return sum(_cpu_tensor_bytes(getattr(obj, field.name), seen) for field in fields(obj))
+    return 0
+
+
 def _inline_cpu_pickle_size(obj: Any, seen: set[int] | None = None) -> int:
     if obj is None:
         return 0
@@ -305,6 +399,11 @@ def _inline_cpu_pickle_size(obj: Any, seen: set[int] | None = None) -> int:
         )
     if isinstance(obj, (list, tuple, set, frozenset)):
         return sum(_inline_cpu_pickle_size(value, seen) for value in obj)
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return sum(
+            _inline_cpu_pickle_size(getattr(obj, field.name), seen)
+            for field in fields(obj)
+        )
 
     try:
         return len(pickle.dumps(obj))
@@ -321,6 +420,43 @@ def _should_use_cuda_ipc_stream_chunk(data: Any, metadata: dict | None) -> bool:
     return inline_size <= _IPC_INLINE_CPU_BYTES_LIMIT
 
 
+def _env_enabled(name: str) -> bool:
+    value = os.getenv(name, "")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _inline_cpu_stream_chunk_max_bytes() -> int:
+    raw = os.getenv(_INLINE_CPU_STREAM_CHUNK_MAX_BYTES_ENV)
+    if raw is None or raw == "":
+        return _INLINE_CPU_STREAM_CHUNK_DEFAULT_MAX_BYTES
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _INLINE_CPU_STREAM_CHUNK_DEFAULT_MAX_BYTES
+
+
+def _full_payload_cuda_ipc_max_control_bytes() -> int:
+    raw = os.getenv(_FULL_PAYLOAD_CUDA_IPC_MAX_CONTROL_BYTES_ENV)
+    if raw is None:
+        return _FULL_PAYLOAD_CUDA_IPC_DEFAULT_MAX_CONTROL_BYTES
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _FULL_PAYLOAD_CUDA_IPC_DEFAULT_MAX_CONTROL_BYTES
+
+
+def should_use_cuda_ipc_payload(payload: Any) -> bool:
+    if not _env_enabled(_FULL_PAYLOAD_CUDA_IPC_ENV):
+        return False
+    if not isinstance(payload, StagePayload):
+        return False
+    if not _contains_cuda_tensor(payload.data):
+        return False
+    inline_size = _inline_cpu_pickle_size(payload)
+    inline_size += _cpu_tensor_bytes(payload)
+    return inline_size <= _full_payload_cuda_ipc_max_control_bytes()
+
+
 def ipc_pickle(obj: Any) -> bytes:
     """Serialize via ForkingPickler only when CUDA IPC tensor handles are needed."""
     if not _contains_cuda_tensor(obj):
@@ -328,6 +464,23 @@ def ipc_pickle(obj: Any) -> bytes:
     buf = io.BytesIO()
     ForkingPickler(buf, 2).dump(obj)
     return buf.getvalue()
+
+
+def serialize_ipc_payload(payload: StagePayload) -> dict[str, Any]:
+    return {
+        "_payload_ipc": True,
+        "payload_bytes": ipc_pickle(payload),
+    }
+
+
+def deserialize_ipc_payload(metadata: dict[str, Any]) -> StagePayload:
+    payload = pickle.loads(metadata["payload_bytes"])
+    if not isinstance(payload, StagePayload):
+        raise TypeError(
+            "CUDA IPC payload metadata did not contain a StagePayload, got "
+            f"{type(payload).__name__}"
+        )
+    return payload
 
 
 def _serialize_ipc_metadata_value(value: Any) -> Any:
@@ -355,6 +508,50 @@ def serialize_ipc_chunk(
     return ipc_metadata
 
 
+def serialize_inline_cpu_chunk(
+    data: Any,
+    metadata: dict | None,
+) -> dict[str, Any]:
+    payload_bytes = pickle.dumps(
+        {"data": data, "metadata": metadata},
+        protocol=pickle.HIGHEST_PROTOCOL,
+    )
+    return {
+        "_inline_cpu": True,
+        "payload_bytes": payload_bytes,
+        "payload_pickle_bytes": len(payload_bytes),
+    }
+
+
+def deserialize_inline_cpu_chunk(
+    inline_metadata: dict[str, Any],
+) -> tuple[Any, dict | None]:
+    payload = pickle.loads(inline_metadata["payload_bytes"])
+    return payload["data"], payload.get("metadata")
+
+
+def _try_serialize_inline_cpu_chunk(
+    data: Any,
+    metadata: dict | None,
+) -> dict[str, Any] | None:
+    max_bytes = _inline_cpu_stream_chunk_max_bytes()
+    if max_bytes <= 0:
+        return None
+    if _contains_cuda_tensor(data) or _contains_cuda_tensor(metadata):
+        return None
+    # Metadata tensors are often hidden states or codec-side side channels; keep
+    # them on the relay path so the control plane only carries tiny token data.
+    if _contains_cpu_tensor(metadata):
+        return None
+    try:
+        inline_metadata = serialize_inline_cpu_chunk(data, metadata)
+    except Exception:
+        return None
+    if inline_metadata["payload_pickle_bytes"] > max_bytes:
+        return None
+    return inline_metadata
+
+
 def deserialize_ipc_metadata(value: Any) -> Any:
     if isinstance(value, dict):
         if set(value) == {"_ipc_tensor"}:
@@ -365,6 +562,19 @@ def deserialize_ipc_metadata(value: Any) -> Any:
     if isinstance(value, list):
         return [deserialize_ipc_metadata(item) for item in value]
     return value
+
+
+async def _send_stream_control_message(
+    control_plane: Any,
+    target_stage: str,
+    target_endpoint: str,
+    msg: DataReadyMessage,
+) -> None:
+    send_stream = getattr(control_plane, "send_stream_to_stage", None)
+    if callable(send_stream):
+        await send_stream(target_stage, target_endpoint, msg)
+        return
+    await control_plane.send_to_stage(target_stage, target_endpoint, msg)
 
 
 async def send_stream_chunk(
@@ -379,8 +589,27 @@ async def send_stream_chunk(
     chunk_id: int,
     metadata: dict | None = None,
     same_gpu_targets: set[str] | None = None,
-) -> None:
+    await_completion: bool = True,
+    completion_timeout: float | None = _DEFAULT_RELAY_COMPLETION_TIMEOUT_S,
+) -> list[Any]:
     """Send a streaming chunk to a downstream stage."""
+    inline_metadata = _try_serialize_inline_cpu_chunk(data, metadata)
+    if inline_metadata is not None:
+        msg = DataReadyMessage(
+            request_id=request_id,
+            from_stage=from_stage,
+            to_stage=target_stage,
+            shm_metadata=inline_metadata,
+            chunk_id=chunk_id,
+        )
+        await _send_stream_control_message(
+            control_plane,
+            target_stage,
+            target_endpoint,
+            msg,
+        )
+        return []
+
     # Keep CUDA IPC limited to CUDA-dominant chunks with no CPU tensors and only
     # small inline Python metadata; otherwise the relay path keeps CPU-heavy
     # pieces out of the IPC control-plane pickle.
@@ -396,8 +625,13 @@ async def send_stream_chunk(
             shm_metadata=serialize_ipc_chunk(data, metadata),
             chunk_id=chunk_id,
         )
-        await control_plane.send_to_stage(target_stage, target_endpoint, msg)
-        return
+        await _send_stream_control_message(
+            control_plane,
+            target_stage,
+            target_endpoint,
+            msg,
+        )
+        return []
 
     if (
         same_gpu_targets
@@ -444,10 +678,11 @@ async def send_stream_chunk(
         shm_metadata=relay_metadata,
         chunk_id=chunk_id,
     )
-    await control_plane.send_to_stage(target_stage, target_endpoint, msg)
+    await _send_stream_control_message(control_plane, target_stage, target_endpoint, msg)
 
-    for pending_op in pending_ops:
-        await pending_op.wait_for_completion()
+    if await_completion:
+        await wait_for_relay_ops(pending_ops, timeout=completion_timeout)
+    return pending_ops
 
 
 async def send_stream_signal(
@@ -469,4 +704,4 @@ async def send_stream_signal(
         is_done=is_done,
         error=error,
     )
-    await control_plane.send_to_stage(target_stage, target_endpoint, msg)
+    await _send_stream_control_message(control_plane, target_stage, target_endpoint, msg)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 QWEN3_5_OMNI_THINKER_ARCH_OVERRIDE = "Qwen3OmniNextThinkerForConditionalGeneration"
@@ -11,6 +12,63 @@ QWEN3_5_OMNI_TALKER_ARCH_OVERRIDE = "Qwen3OmniNextTalkerModel"
 QWEN3_5_OMNI_DEFAULT_CAPTURE_HIDDEN_LAYERS = [0, 24]
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _subtalker_compile_warmup_batches(server_args: Any) -> list[int]:
+    configured = os.environ.get("SGLANG_OMNI_QWEN35_SUBTALKER_WARMUP_BATCHES")
+    if configured:
+        batches: list[int] = []
+        for item in configured.replace(";", ",").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            size = int(item)
+            if size > 0 and size not in batches:
+                batches.append(size)
+        return batches
+
+    max_running = max(int(getattr(server_args, "max_running_requests", 1) or 1), 1)
+    return list(range(1, max_running + 1))
+
+
+def _warmup_subtalker_code_predictor(
+    model: Any,
+    server_args: Any,
+    *,
+    phase: str,
+) -> bool:
+    if not _env_flag("SGLANG_OMNI_QWEN35_SUBTALKER_COMPILE_WARMUP", default=True):
+        return False
+
+    warmup = getattr(model, "warmup_subtalker_code_predictor", None)
+    if warmup is None:
+        logger.warning(
+            "Qwen3.5 talker torch.compile requested, but residual code "
+            "predictor warmup hook is unavailable"
+        )
+        return False
+
+    batches = _subtalker_compile_warmup_batches(server_args)
+    warmed_batches = warmup(batch_sizes=batches)
+    logger.info(
+        "Qwen3.5 residual code predictor %s compile warmup completed "
+        "batch_sizes=%s",
+        phase,
+        warmed_batches,
+    )
+    return True
+
+
+def _subtalker_code_predictor_is_compiled(model: Any) -> bool:
+    code_predictor = getattr(model, "code_predictor", None)
+    return getattr(code_predictor, "_compiled_predict_step", None) is not None
 
 
 def _load_metadata_config(model_path: str) -> Any:
@@ -60,6 +118,67 @@ def _required_config_value(config: Any, name: str) -> Any:
 def _optional_config_dict(config: Any, name: str) -> dict[str, Any]:
     value = getattr(config, name, None)
     return value if isinstance(value, dict) else {}
+
+
+def _maybe_enable_subtalker_torch_compile(model: Any, server_args: Any) -> bool:
+    if not bool(getattr(server_args, "enable_torch_compile", False)):
+        return False
+
+    hook = getattr(model, "enable_subtalker_torch_compile", None)
+    if hook is None:
+        code_predictor = getattr(model, "code_predictor", None)
+        hook = getattr(code_predictor, "enable_torch_compile", None)
+    if hook is None:
+        logger.warning(
+            "Qwen3.5 talker torch.compile requested, but residual code predictor "
+            "does not expose a compile hook"
+        )
+        return False
+
+    compile_mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "default")
+    subtalker_compile_mode = compile_mode
+    if compile_mode == "reduce-overhead" and not _env_flag(
+        "SGLANG_OMNI_QWEN35_SUBTALKER_ALLOW_REDUCE_OVERHEAD",
+        default=False,
+    ):
+        logger.warning(
+            "Qwen3.5 residual code predictor torch.compile mode "
+            "reduce-overhead is disabled for this path; using default instead"
+        )
+        subtalker_compile_mode = "default"
+
+    if subtalker_compile_mode == compile_mode:
+        hook()
+    else:
+        hook(mode=subtalker_compile_mode)
+    try:
+        _warmup_subtalker_code_predictor(
+            model,
+            server_args,
+            phase="pre-cudagraph",
+        )
+    except Exception:
+        logger.exception("Qwen3.5 residual code predictor compile warmup failed")
+        if subtalker_compile_mode != "default":
+            logger.warning(
+                "Falling back Qwen3.5 residual code predictor "
+                "torch.compile mode from %s to default",
+                subtalker_compile_mode,
+            )
+            hook(mode="default")
+            try:
+                _warmup_subtalker_code_predictor(
+                    model,
+                    server_args,
+                    phase="fallback",
+                )
+            except Exception:
+                logger.exception(
+                    "Qwen3.5 residual code predictor default compile "
+                    "warmup failed after fallback"
+                )
+    server_args.enable_torch_compile = False
+    return True
 
 
 def _normalize_hidden_layers(value: Any) -> list[int] | None:
@@ -285,9 +404,24 @@ def create_talker_scheduler(
     )
     if hasattr(model_worker.model_runner, "sampler"):
         model_worker.model_runner.model._sampler = model_worker.model_runner.sampler
+    _maybe_enable_subtalker_torch_compile(
+        model_worker.model_runner.model,
+        server_args,
+    )
     if want_cuda_graph:
         server_args.disable_cuda_graph = False
         model_worker.model_runner.init_device_graphs()
+        if _subtalker_code_predictor_is_compiled(model_worker.model_runner.model):
+            try:
+                _warmup_subtalker_code_predictor(
+                    model_worker.model_runner.model,
+                    server_args,
+                    phase="post-cudagraph",
+                )
+            except Exception:
+                logger.exception(
+                    "Qwen3.5 residual code predictor post-cudagraph warmup failed"
+                )
 
     output_proc = SGLangOutputProcessor(
         capture_hidden=False,

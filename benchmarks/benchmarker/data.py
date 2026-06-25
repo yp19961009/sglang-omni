@@ -17,6 +17,10 @@ class RequestResult:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     engine_time_s: float = 0.0
+    engine_latency_s: float | None = None
+    engine_audio_ttfp_s: float | None = None
+    engine_text_ttft_s: float | None = None
+    prompt_build_s: float | None = None
     tok_per_s: float = 0.0
     wav_path: str = ""
     error: str = ""

@@ -160,6 +160,105 @@ def test_qwen35_talker_exposes_runtime_contract(monkeypatch):
     assert model._feedback_buffer.shape == (1, 4)
 
 
+def test_qwen35_talker_warms_subtalker_code_predictor(monkeypatch):
+    _install_fakes(monkeypatch)
+    monkeypatch.setattr(talker, "_max_running_requests", lambda: 8)
+    model = talker.Qwen3OmniNextTalkerModel(_config())
+    calls = []
+
+    def _fake_code_predictor_forward(layer0_codes, talker_hidden, requests=None):
+        calls.append((tuple(layer0_codes.shape), tuple(talker_hidden.shape), requests))
+        return None
+
+    monkeypatch.setattr(
+        model,
+        "code_predictor_forward",
+        _fake_code_predictor_forward,
+    )
+
+    warmed = model.warmup_subtalker_code_predictor(
+        batch_sizes=[1, 2, 4, 8, 8, 99, 0]
+    )
+
+    def _request_temperature(reqs):
+        if reqs is None:
+            return None
+        params = reqs[0].data.req._qwen35_subtalker_sampling_params
+        return None if params is None else params.temperature
+
+    def _request_top_k(reqs):
+        if reqs is None:
+            return None
+        params = reqs[0].data.req._qwen35_subtalker_sampling_params
+        return None if params is None else params.top_k
+
+    assert warmed == [1, 2, 4, 8]
+    assert [(shape, hidden_shape, reqs is None) for shape, hidden_shape, reqs in calls] == [
+        ((1,), (1, 4), True),
+        ((1,), (1, 4), False),
+        ((1,), (1, 4), True),
+        ((1,), (1, 4), False),
+        ((2,), (2, 4), True),
+        ((2,), (2, 4), False),
+        ((2,), (2, 4), True),
+        ((2,), (2, 4), False),
+        ((4,), (4, 4), True),
+        ((4,), (4, 4), False),
+        ((4,), (4, 4), True),
+        ((4,), (4, 4), False),
+        ((8,), (8, 4), True),
+        ((8,), (8, 4), False),
+        ((8,), (8, 4), True),
+        ((8,), (8, 4), False),
+    ]
+    assert [len(reqs) for _, _, reqs in calls if reqs is not None] == [
+        1,
+        1,
+        2,
+        2,
+        4,
+        4,
+        8,
+        8,
+    ]
+    assert [_request_temperature(reqs) for _, _, reqs in calls] == [
+        None,
+        None,
+        None,
+        0.1,
+        None,
+        None,
+        None,
+        0.1,
+        None,
+        None,
+        None,
+        0.1,
+        None,
+        None,
+        None,
+        0.1,
+    ]
+    assert [_request_top_k(reqs) for _, _, reqs in calls] == [
+        None,
+        None,
+        None,
+        5,
+        None,
+        None,
+        None,
+        5,
+        None,
+        None,
+        None,
+        5,
+        None,
+        None,
+        None,
+        5,
+    ]
+
+
 def test_qwen35_talker_accepts_split_config_with_none_subconfig(monkeypatch):
     _install_fakes(monkeypatch)
     config = _split_config_with_none_talker_config()
@@ -633,6 +732,37 @@ def test_qwen35_talker_decode_allows_codec_eos_after_text_done(monkeypatch):
     sampled = model._sample_decode_tokens(logits)
 
     assert sampled.tolist() == [5]
+
+
+def test_qwen35_talker_decode_config_cache_keeps_dynamic_masks(monkeypatch):
+    _install_fakes(monkeypatch)
+    model = talker.Qwen3OmniNextTalkerModel(_config())
+    apply_calls = []
+    apply_decode_buffer_config = model._apply_decode_buffer_config
+
+    def wrapped_apply_decode_buffer_config(**kwargs):
+        apply_calls.append(kwargs)
+        return apply_decode_buffer_config(**kwargs)
+
+    model._apply_decode_buffer_config = wrapped_apply_decode_buffer_config
+    sched_req = _decode_sched_req(thinker_chunks_done=True)
+    sched_req.data.req.sampling_params.repetition_penalty = 2.0
+    sched_req.data.req.output_ids = [5]
+    logits = torch.zeros(1, 8)
+    logits[0, 5] = 10.0
+    logits[0, 4] = 8.0
+
+    model.prepare_decode_buffers([sched_req])
+    assert model._sample_decode_tokens(logits).tolist() == [4]
+
+    sched_req.data.req.output_ids = [4]
+    model.prepare_decode_buffers([sched_req])
+    assert model._sample_decode_tokens(logits).tolist() == [5]
+    assert len(apply_calls) == 1
+
+    sched_req.data.req.sampling_params.top_k = 4
+    model.prepare_decode_buffers([sched_req])
+    assert len(apply_calls) == 2
 
 
 def test_qwen35_talker_decode_uses_sglang_sampler_metadata(monkeypatch):

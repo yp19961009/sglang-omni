@@ -5,8 +5,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import OrderedDict
+from dataclasses import dataclass
 import logging
+import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +28,20 @@ from .resource_connector import global_thread_pool
 logger = logging.getLogger(__name__)
 
 _DEFAULT_IMAGE_PATCH_SIZE = 14
+_DEFAULT_VIDEO_PREPROCESS_CACHE_MAX_ENTRIES = 32
+_DEFAULT_VIDEO_PREPROCESS_CACHE_MAX_BYTES = 4 * 1024**3
+
+
+@dataclass
+class _VideoPreprocessCacheEntry:
+    value: tuple[Any, float, Any | None]
+    size_bytes: int
+
+
+_VIDEO_PREPROCESS_CACHE: OrderedDict[str, _VideoPreprocessCacheEntry] = OrderedDict()
+_VIDEO_PREPROCESS_INFLIGHT: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Task]] = {}
+_VIDEO_PREPROCESS_CACHE_LOCK = threading.Lock()
+_VIDEO_PREPROCESS_CACHE_BYTES = 0
 
 
 def _qwen_image_factor() -> int:
@@ -54,8 +72,166 @@ def _qwen_video_total_pixels() -> int:
     return int(qwen_vision.MODEL_SEQ_LEN * _qwen_image_factor() ** 2 * 0.9)
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"", "0", "false", "no", "off"}:
+        return 0
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+
+
+def _video_preprocess_cache_max_entries() -> int:
+    return _env_int(
+        "SGLANG_OMNI_VIDEO_PREPROCESS_CACHE_MAX_ENTRIES",
+        _DEFAULT_VIDEO_PREPROCESS_CACHE_MAX_ENTRIES,
+    )
+
+
+def _video_preprocess_cache_max_bytes() -> int:
+    return _env_int(
+        "SGLANG_OMNI_VIDEO_PREPROCESS_CACHE_MAX_BYTES",
+        _DEFAULT_VIDEO_PREPROCESS_CACHE_MAX_BYTES,
+    )
+
+
+def _value_size_bytes(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        return int(value.numel() * value.element_size())
+    nbytes = getattr(value, "nbytes", None)
+    if nbytes is not None:
+        try:
+            return int(nbytes)
+        except (TypeError, ValueError):
+            return 0
+    if isinstance(value, dict):
+        return sum(_value_size_bytes(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_value_size_bytes(item) for item in value)
+    return 0
+
+
+def _video_result_size_bytes(value: tuple[Any, float, Any | None]) -> int:
+    video, _, audio = value
+    return _value_size_bytes(video) + _value_size_bytes(audio)
+
+
+def _video_preprocess_cache_get(
+    cache_key: str,
+) -> tuple[Any, float, Any | None] | None:
+    max_entries = _video_preprocess_cache_max_entries()
+    max_bytes = _video_preprocess_cache_max_bytes()
+    if max_entries <= 0 or max_bytes <= 0:
+        return None
+    with _VIDEO_PREPROCESS_CACHE_LOCK:
+        entry = _VIDEO_PREPROCESS_CACHE.get(cache_key)
+        if entry is None:
+            return None
+        _VIDEO_PREPROCESS_CACHE.move_to_end(cache_key)
+        return entry.value
+
+
+def _video_preprocess_cache_put(
+    cache_key: str,
+    value: tuple[Any, float, Any | None],
+) -> None:
+    global _VIDEO_PREPROCESS_CACHE_BYTES
+
+    max_entries = _video_preprocess_cache_max_entries()
+    max_bytes = _video_preprocess_cache_max_bytes()
+    if max_entries <= 0 or max_bytes <= 0:
+        return
+    size_bytes = _video_result_size_bytes(value)
+    if size_bytes > max_bytes:
+        return
+    with _VIDEO_PREPROCESS_CACHE_LOCK:
+        old_entry = _VIDEO_PREPROCESS_CACHE.pop(cache_key, None)
+        if old_entry is not None:
+            _VIDEO_PREPROCESS_CACHE_BYTES -= old_entry.size_bytes
+        _VIDEO_PREPROCESS_CACHE[cache_key] = _VideoPreprocessCacheEntry(
+            value=value,
+            size_bytes=size_bytes,
+        )
+        _VIDEO_PREPROCESS_CACHE_BYTES += size_bytes
+        _VIDEO_PREPROCESS_CACHE.move_to_end(cache_key)
+        while len(_VIDEO_PREPROCESS_CACHE) > max_entries:
+            _, entry = _VIDEO_PREPROCESS_CACHE.popitem(last=False)
+            _VIDEO_PREPROCESS_CACHE_BYTES -= entry.size_bytes
+        while _VIDEO_PREPROCESS_CACHE_BYTES > max_bytes and _VIDEO_PREPROCESS_CACHE:
+            _, entry = _VIDEO_PREPROCESS_CACHE.popitem(last=False)
+            _VIDEO_PREPROCESS_CACHE_BYTES -= entry.size_bytes
+
+
+def clear_video_preprocess_cache() -> None:
+    """Clear the local decoded-video preprocessing cache."""
+
+    global _VIDEO_PREPROCESS_CACHE_BYTES
+    with _VIDEO_PREPROCESS_CACHE_LOCK:
+        _VIDEO_PREPROCESS_CACHE.clear()
+        _VIDEO_PREPROCESS_INFLIGHT.clear()
+        _VIDEO_PREPROCESS_CACHE_BYTES = 0
+
+
+def _local_video_preprocess_cache_key(
+    video_item: str | Path,
+    *,
+    fps: float | None,
+    max_frames: int | None,
+    min_frames: int | None,
+    min_pixels: int | None,
+    max_pixels: int | None,
+    total_pixels: int | None,
+    override_max_pixels: bool,
+    extract_audio: bool,
+    audio_target_sr: int,
+    image_mode: str,
+) -> str | None:
+    cache_key = compute_video_cache_key(
+        video_item,
+        fps=fps,
+        max_frames=max_frames,
+        min_frames=min_frames,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+        total_pixels=total_pixels,
+        override_max_pixels=override_max_pixels,
+    )
+    if cache_key is None:
+        return None
+    backend = qwen_vision.get_video_reader_backend()
+    return (
+        f"{cache_key}|backend={backend}|image_mode={image_mode}"
+        f"|extract_audio={bool(extract_audio)}|audio_target_sr={int(audio_target_sr)}"
+    )
+
+
 class VideoDecodeError(RuntimeError):
     """Raised when video decoding fails."""
+
+
+def _unpack_qwen_video_reader_output(output: Any) -> tuple[torch.Tensor, float]:
+    """Normalize qwen-vl-utils video reader outputs across versions."""
+
+    if not isinstance(output, tuple):
+        raise ValueError(
+            "Qwen video reader must return a tuple, "
+            f"got {type(output).__name__}"
+        )
+    if len(output) == 2:
+        video, sample_fps = output
+    elif len(output) >= 3:
+        video, _, sample_fps = output[:3]
+    else:
+        raise ValueError(
+            "Qwen video reader must return at least 2 values, "
+            f"got {len(output)}"
+        )
+    return video, float(sample_fps)
 
 
 class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, Any | None]]):
@@ -163,6 +339,143 @@ class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, Any | None]]):
             return video, sample_fps, None
 
 
+async def _load_local_video_uncached(
+    video_path: Path,
+    *,
+    fps: float | None,
+    max_frames: int | None,
+    min_frames: int | None,
+    min_pixels: int | None,
+    max_pixels: int | None,
+    total_pixels: int | None,
+    override_max_pixels: bool,
+    extract_audio: bool,
+    audio_target_sr: int,
+) -> tuple[Any, float, Any | None]:
+    loop = asyncio.get_running_loop()
+    if extract_audio:
+        video_task = loop.run_in_executor(
+            global_thread_pool,
+            load_video_path,
+            video_path,
+            fps,
+            max_frames,
+            min_frames,
+            min_pixels,
+            max_pixels,
+            total_pixels,
+            override_max_pixels,
+        )
+        audio_task = loop.run_in_executor(
+            global_thread_pool,
+            _extract_audio_from_path,
+            video_path,
+            audio_target_sr,
+        )
+        (video, sample_fps), audio = await asyncio.gather(video_task, audio_task)
+        return video, sample_fps, audio
+
+    video, sample_fps = await loop.run_in_executor(
+        global_thread_pool,
+        load_video_path,
+        video_path,
+        fps,
+        max_frames,
+        min_frames,
+        min_pixels,
+        max_pixels,
+        total_pixels,
+        override_max_pixels,
+    )
+    return video, sample_fps, None
+
+
+async def _load_local_video_with_cache(
+    video_path: Path,
+    *,
+    fps: float | None,
+    max_frames: int | None,
+    min_frames: int | None,
+    min_pixels: int | None,
+    max_pixels: int | None,
+    total_pixels: int | None,
+    override_max_pixels: bool,
+    image_mode: str,
+    extract_audio: bool,
+    audio_target_sr: int,
+) -> tuple[Any, float, Any | None]:
+    cache_key = _local_video_preprocess_cache_key(
+        video_path,
+        fps=fps,
+        max_frames=max_frames,
+        min_frames=min_frames,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+        total_pixels=total_pixels,
+        override_max_pixels=override_max_pixels,
+        extract_audio=extract_audio,
+        audio_target_sr=audio_target_sr,
+        image_mode=image_mode,
+    )
+    if cache_key is None:
+        return await _load_local_video_uncached(
+            video_path,
+            fps=fps,
+            max_frames=max_frames,
+            min_frames=min_frames,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+            total_pixels=total_pixels,
+            override_max_pixels=override_max_pixels,
+            extract_audio=extract_audio,
+            audio_target_sr=audio_target_sr,
+        )
+
+    cached = _video_preprocess_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    loop = asyncio.get_running_loop()
+    is_leader = False
+    with _VIDEO_PREPROCESS_CACHE_LOCK:
+        inflight = _VIDEO_PREPROCESS_INFLIGHT.get(cache_key)
+        if inflight is not None and inflight[0] is loop and not inflight[1].done():
+            task = inflight[1]
+        else:
+            task = loop.create_task(
+                _load_local_video_uncached(
+                    video_path,
+                    fps=fps,
+                    max_frames=max_frames,
+                    min_frames=min_frames,
+                    min_pixels=min_pixels,
+                    max_pixels=max_pixels,
+                    total_pixels=total_pixels,
+                    override_max_pixels=override_max_pixels,
+                    extract_audio=extract_audio,
+                    audio_target_sr=audio_target_sr,
+                )
+            )
+            _VIDEO_PREPROCESS_INFLIGHT[cache_key] = (loop, task)
+            is_leader = True
+
+    try:
+        result = await asyncio.shield(task)
+    except Exception:
+        if is_leader:
+            with _VIDEO_PREPROCESS_CACHE_LOCK:
+                if _VIDEO_PREPROCESS_INFLIGHT.get(cache_key) == (loop, task):
+                    _VIDEO_PREPROCESS_INFLIGHT.pop(cache_key, None)
+        raise
+
+    if is_leader:
+        _video_preprocess_cache_put(cache_key, result)
+        with _VIDEO_PREPROCESS_CACHE_LOCK:
+            if _VIDEO_PREPROCESS_INFLIGHT.get(cache_key) == (loop, task):
+                _VIDEO_PREPROCESS_INFLIGHT.pop(cache_key, None)
+    return result
+
+
 async def ensure_video_list_async(
     videos: Any,
     *,
@@ -227,8 +540,6 @@ async def ensure_video_list_async(
         extract_audio_for_item: bool,
     ) -> tuple[Any, float, Any | None]:
         """Load video and optionally extract audio."""
-        loop = asyncio.get_running_loop()
-
         if is_url:
             # Use fetch_video_async for URL videos, similar to fetch_image_async
             return await resource_connector.fetch_video_async(
@@ -246,44 +557,19 @@ async def ensure_video_list_async(
             )
         else:
             # Local file path
-            video_path = Path(video_item)
-            if extract_audio_for_item:
-                video_task = loop.run_in_executor(
-                    global_thread_pool,
-                    load_video_path,
-                    video_path,
-                    fps,
-                    max_frames,
-                    min_frames,
-                    min_pixels,
-                    max_pixels,
-                    total_pixels,
-                    override_max_pixels,
-                )
-                audio_task = loop.run_in_executor(
-                    global_thread_pool,
-                    _extract_audio_from_path,
-                    video_path,
-                    audio_target_sr,
-                )
-                (video, sample_fps), audio = await asyncio.gather(
-                    video_task, audio_task
-                )
-                return video, sample_fps, audio
-            else:
-                video, sample_fps = await loop.run_in_executor(
-                    global_thread_pool,
-                    load_video_path,
-                    video_path,
-                    fps,
-                    max_frames,
-                    min_frames,
-                    min_pixels,
-                    max_pixels,
-                    total_pixels,
-                    override_max_pixels,
-                )
-                return video, sample_fps, None
+            return await _load_local_video_with_cache(
+                Path(video_item),
+                fps=fps,
+                max_frames=max_frames,
+                min_frames=min_frames,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+                total_pixels=total_pixels,
+                override_max_pixels=override_max_pixels,
+                image_mode=image_mode,
+                extract_audio=extract_audio_for_item,
+                audio_target_sr=audio_target_sr,
+            )
 
     # Collect coroutines for URL and local file items
     coroutines: list[asyncio.Task[tuple[Any, float, Any | None]] | None] = []
@@ -404,7 +690,9 @@ def load_video_path(
         ele["total_pixels"] = int(total_pixels)
     backend = qwen_vision.get_video_reader_backend()
     try:
-        video, sample_fps = qwen_vision.VIDEO_READER_BACKENDS[backend](ele)
+        video, sample_fps = _unpack_qwen_video_reader_output(
+            qwen_vision.VIDEO_READER_BACKENDS[backend](ele)
+        )
     except Exception as backend_exc:
         if backend == "torchvision":
             raise VideoDecodeError(
@@ -413,7 +701,9 @@ def load_video_path(
             ) from backend_exc
         logger.warning("Video reader %s failed, falling back to torchvision", backend)
         try:
-            video, sample_fps = qwen_vision.VIDEO_READER_BACKENDS["torchvision"](ele)
+            video, sample_fps = _unpack_qwen_video_reader_output(
+                qwen_vision.VIDEO_READER_BACKENDS["torchvision"](ele)
+            )
         except Exception as fallback_exc:
             raise VideoDecodeError(
                 f"Failed to decode video path={path}; {backend} failed with "
@@ -469,6 +759,7 @@ def build_video_mm_inputs(hf_inputs: dict[str, Any]) -> dict[str, Any]:
         "pixel_values_videos": hf_inputs.get("pixel_values_videos"),
         "video_grid_thw": hf_inputs.get("video_grid_thw"),
         "video_second_per_grid": hf_inputs.get("video_second_per_grid"),
+        "video_item_pixel_present": hf_inputs.get("video_item_pixel_present"),
     }
 
 

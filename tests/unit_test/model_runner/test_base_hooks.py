@@ -53,11 +53,15 @@ class _ForwardMode:
         return self._is_prefill
 
 
-def _scheduler_output(*, is_prefill: bool):
-    model_worker_batch = SimpleNamespace(marker="worker-batch")
+def _scheduler_output(*, is_prefill: bool, is_prefill_only: bool = False):
+    model_worker_batch = SimpleNamespace(
+        input_ids=torch.tensor([1]),
+        marker="worker-batch",
+        seq_lens=[1],
+    )
     schedule_batch = SimpleNamespace(
         forward_mode=_ForwardMode(is_prefill=is_prefill),
-        is_prefill_only=False,
+        is_prefill_only=is_prefill_only,
         output_ids=None,
         get_model_worker_batch=lambda: model_worker_batch,
     )
@@ -172,3 +176,35 @@ def test_execute_falls_back_to_standard_forward_after_before_hook(
     ]
     assert output.can_run_cuda_graph is False
     assert not hasattr(ModelRunner, "prepare_prefill")
+
+
+def test_prefill_only_placeholder_token_keeps_scheduler_bookkeeping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_forward_batch_module(monkeypatch)
+    calls: list[str] = []
+    custom_result = SimpleNamespace(
+        logits_output=None,
+        next_token_ids=None,
+        can_run_cuda_graph=True,
+    )
+    scheduler_output = _scheduler_output(is_prefill=True, is_prefill_only=True)
+    runner = _runner(calls, custom_result=custom_result)
+    runner.output_processor = SimpleNamespace(
+        _capture_hidden=False,
+        process=lambda result, scheduler_output: {
+            "req-1": SimpleNamespace(
+                data=int(result.next_token_ids[0].item()),
+                extra={"hidden_states": "kept"},
+            ),
+        },
+    )
+
+    output = runner.execute(scheduler_output)
+
+    assert scheduler_output.batch_data.output_ids.tolist() == [0]
+    assert output.outputs["req-1"].data == 0
+    assert scheduler_output.requests[0].data.generation_steps == 1
+    assert scheduler_output.requests[0].data.extra_model_outputs == {
+        "hidden_states": "kept"
+    }

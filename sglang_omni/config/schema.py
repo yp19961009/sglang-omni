@@ -69,6 +69,8 @@ class SGLangServerArgsConfig(BaseModel):
 
     mem_fraction_static: float | None = None
     max_running_requests: int | None = None
+    max_mamba_cache_size: int | None = None
+    mamba_full_memory_ratio: float | None = None
 
     def model_post_init(self, __context: Any = None) -> None:
         mem_fraction_static = self.mem_fraction_static
@@ -85,6 +87,20 @@ class SGLangServerArgsConfig(BaseModel):
         ):
             raise ValueError(
                 "runtime.sglang_server_args.max_running_requests must be positive"
+            )
+        if (
+            self.max_mamba_cache_size is not None
+            and self.max_mamba_cache_size < 1
+        ):
+            raise ValueError(
+                "runtime.sglang_server_args.max_mamba_cache_size must be positive"
+            )
+        if (
+            self.mamba_full_memory_ratio is not None
+            and not 0.0 < self.mamba_full_memory_ratio <= 1.0
+        ):
+            raise ValueError(
+                "runtime.sglang_server_args.mamba_full_memory_ratio must be in (0, 1]"
             )
 
 

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import ClassVar
 
 from pydantic import Field
@@ -10,6 +11,7 @@ from pydantic import Field
 from sglang_omni.config import (
     PipelineConfig,
     PlacementConfig,
+    RelayConfig,
     SGLangServerArgsConfig,
     StageConfig,
     StageRuntimeConfig,
@@ -49,6 +51,20 @@ QWEN3_5_OMNI_MODEL_NAME_ALIASES = (
 # See the Qwen3-Omni config for the DeepGEMM rationale. Keep the default here
 # while Qwen3.5-Omni reuses the same AR scheduling envelope.
 _DEEPGEMM_PRECOMPILE_ENV_DEFAULTS = {"SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0"}
+_COLOCATE_MM_AGGREGATE_ENV = "SGLANG_OMNI_COLOCATE_MM_AGGREGATE_WITH_THINKER"
+_COLOCATE_MM_AGGREGATE_WITH_IMAGE_ENV = (
+    "SGLANG_OMNI_COLOCATE_MM_AGGREGATE_WITH_IMAGE_ENCODER"
+)
+_COLOCATE_IMAGE_ENCODER_WITH_THINKER_ENV = (
+    "SGLANG_OMNI_COLOCATE_IMAGE_ENCODER_WITH_THINKER"
+)
+_COLOCATE_PREPROCESSING_WITH_THINKER_ENV = (
+    "SGLANG_OMNI_COLOCATE_PREPROCESSING_WITH_THINKER"
+)
+_MM_AGGREGATE_RELAY_GPU_ENV = "SGLANG_OMNI_MM_AGGREGATE_RELAY_ON_THINKER_GPU"
+_MM_AGGREGATE_RELAY_TALKER_GPU_ENV = (
+    "SGLANG_OMNI_MM_AGGREGATE_RELAY_ON_TALKER_GPU"
+)
 
 # Keep architecture names aligned with the reference registry. The root model
 # uses the root architecture, while thinker-only and thinker-MTP names are
@@ -180,18 +196,30 @@ def _audio_encoder_stage(*, gpu: int, process: str) -> StageConfig:
     )
 
 
-def _aggregate_stage(*, process: str, speech_enabled: bool = False) -> StageConfig:
+def _aggregate_stage(
+    *,
+    process: str,
+    speech_enabled: bool = False,
+    gpu: int | None = None,
+    relay_device: str | None = None,
+) -> StageConfig:
+    relay = RelayConfig(device=relay_device) if relay_device is not None else None
     if speech_enabled:
         return StageConfig(
             name="mm_aggregate",
             process=process,
             factory=f"{_PKG}.stages.create_aggregate_executor",
+            gpu=gpu,
+            relay=relay,
             wait_for=["preprocessing", "image_encoder", "audio_encoder"],
             wait_for_fn=f"{_PKG}.request_builders.resolve_mm_aggregate_wait_sources",
             merge_fn=f"{_PKG}.merge.merge_for_thinker",
             next=["thinker", "talker_ar"],
             route_fn=f"{_PKG}.request_builders.resolve_mm_aggregate_next_stages",
             project_payload={
+                "thinker": (
+                    f"{_PKG}.request_builders.project_mm_aggregate_to_thinker"
+                ),
                 "talker_ar": (
                     f"{_PKG}.request_builders.project_mm_aggregate_to_talker_ar"
                 ),
@@ -201,6 +229,8 @@ def _aggregate_stage(*, process: str, speech_enabled: bool = False) -> StageConf
         name="mm_aggregate",
         process=process,
         factory=f"{_PKG}.stages.create_aggregate_executor",
+        gpu=gpu,
+        relay=relay,
         wait_for=["preprocessing", "image_encoder", "audio_encoder"],
         wait_for_fn=f"{_PKG}.request_builders.resolve_mm_aggregate_wait_sources",
         merge_fn=f"{_PKG}.merge.merge_for_thinker",
@@ -353,6 +383,15 @@ def _speech_stages(
     process_by_stage: dict[str, str],
     enable_partial_start: bool,
 ) -> list[StageConfig]:
+    if _env_enabled(_MM_AGGREGATE_RELAY_GPU_ENV):
+        mm_aggregate_gpu = thinker_gpu
+    else:
+        mm_aggregate_gpu = None
+    mm_aggregate_relay_device = (
+        f"cuda:{talker_gpu}"
+        if _env_enabled(_MM_AGGREGATE_RELAY_TALKER_GPU_ENV)
+        else None
+    )
     return [
         _preprocessing_stage(process=process_by_stage["preprocessing"]),
         _image_encoder_stage(
@@ -366,6 +405,8 @@ def _speech_stages(
         _aggregate_stage(
             process=process_by_stage["mm_aggregate"],
             speech_enabled=True,
+            gpu=mm_aggregate_gpu,
+            relay_device=mm_aggregate_relay_device,
         ),
         _thinker_stage(
             gpu=thinker_gpu,
@@ -392,6 +433,24 @@ _SPEECH_DEFAULT_PROCESSES = {
     "talker_ar": "talker_ar",
     "code2wav": "code2wav",
 }
+
+
+def _env_enabled(name: str) -> bool:
+    value = os.getenv(name, "")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _speech_default_processes() -> dict[str, str]:
+    processes = dict(_SPEECH_DEFAULT_PROCESSES)
+    if _env_enabled(_COLOCATE_PREPROCESSING_WITH_THINKER_ENV):
+        processes["preprocessing"] = processes["thinker"]
+    if _env_enabled(_COLOCATE_IMAGE_ENCODER_WITH_THINKER_ENV):
+        processes["image_encoder"] = processes["thinker"]
+    if _env_enabled(_COLOCATE_MM_AGGREGATE_ENV):
+        processes["mm_aggregate"] = processes["thinker"]
+    elif _env_enabled(_COLOCATE_MM_AGGREGATE_WITH_IMAGE_ENV):
+        processes["mm_aggregate"] = processes["image_encoder"]
+    return processes
 
 
 class Qwen35OmniPipelineConfig(PipelineConfig):
@@ -470,7 +529,7 @@ class Qwen35OmniSpeechPipelineConfig(PipelineConfig):
         default_factory=lambda: _speech_stages(
             thinker_gpu=0,
             talker_gpu=1,
-            process_by_stage=_SPEECH_DEFAULT_PROCESSES,
+            process_by_stage=_speech_default_processes(),
             enable_partial_start=True,
         )
     )
@@ -483,7 +542,7 @@ class Qwen35OmniSpeechColocatedPipelineConfig(Qwen35OmniSpeechPipelineConfig):
         default_factory=lambda: _speech_stages(
             thinker_gpu=0,
             talker_gpu=0,
-            process_by_stage=_SPEECH_DEFAULT_PROCESSES,
+            process_by_stage=_speech_default_processes(),
             enable_partial_start=False,
         )
     )

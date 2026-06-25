@@ -318,7 +318,8 @@ class ModelRunner:
         a stale-length output_ids on the running batch, which the next
         prepare_for_decode turns into an input_ids that mismatches seq_lens once
         a request finishes mid-batch (the bs>1 replay size mismatch)."""
-        if schedule_batch.is_prefill_only:
+        is_prefill_only = bool(getattr(schedule_batch, "is_prefill_only", False))
+        if is_prefill_only:
             if batch_result.next_token_ids is None:
                 batch_result.next_token_ids = torch.zeros(
                     len(model_worker_batch.seq_lens),

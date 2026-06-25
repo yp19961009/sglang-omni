@@ -47,6 +47,8 @@ PREPROCESSING_STAGE = "preprocessing"
 
 logger = logging.getLogger(__name__)
 
+_ENCODER_MAX_BATCH_WAIT_MS_ENV = "SGLANG_OMNI_ENCODER_MAX_BATCH_WAIT_MS"
+
 
 _ENCODER_IMPL_CANDIDATES: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
     IMAGE_STAGE: (
@@ -73,6 +75,21 @@ _STAGE_MODEL_SUBDIRS = {
     # auto-detecting split subdirectories.
     TALKER_STAGE: ("talker_lm", "talker"),
 }
+
+
+def _encoder_max_batch_wait_ms() -> int:
+    value = os.getenv(_ENCODER_MAX_BATCH_WAIT_MS_ENV)
+    if value is None:
+        return 50
+    try:
+        return max(int(value), 0)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using default 50ms",
+            _ENCODER_MAX_BATCH_WAIT_MS_ENV,
+            value,
+        )
+        return 50
 
 
 def _resolve_qwen35_stage_model_path(model_path: str, stage_name: str) -> str:
@@ -129,6 +146,7 @@ def create_preprocessing_executor(
     model_path: str,
     *,
     thinker_max_seq_len: int | None = None,
+    max_concurrency: int = 1,
     limit_mm_per_prompt: dict[str, int] | None = None,
     image_min_pixels: int | None = None,
     image_max_pixels: int | None = None,
@@ -176,7 +194,7 @@ def create_preprocessing_executor(
     async def _preprocess(payload: StagePayload) -> StagePayload:
         return await preprocessor(payload)
 
-    return SimpleScheduler(_preprocess)
+    return SimpleScheduler(_preprocess, max_concurrency=max_concurrency)
 
 
 def create_aggregate_executor():
@@ -276,7 +294,7 @@ def _create_batched_encoder_executor(stage_name: str, model: Any):
     kwargs: dict[str, Any] = {
         "batch_compute_fn": _encode_batch,
         "max_batch_size": 32,
-        "max_batch_wait_ms": 50,
+        "max_batch_wait_ms": _encoder_max_batch_wait_ms(),
     }
     if stage_name == IMAGE_STAGE:
         # Reuse Qwen3-Omni's calibrated visual encoder batch budget so
@@ -480,7 +498,7 @@ def create_talker_ar_executor_from_config(
     if root_model_path is None and resolved_model_path != model_path:
         # Split checkpoints commonly store unprefixed talker weights under
         # root/talker_lm or root/talker, while the root config still provides
-        # tokenizer/special token。
+        # tokenizer/special tokens.
         root_model_path = model_path
         weight_prefix = ""
 

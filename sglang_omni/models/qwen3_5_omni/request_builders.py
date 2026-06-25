@@ -102,6 +102,8 @@ _VOICE_TO_SPK_MAPPING = {
 _VOICE_CONTROL_SUFFIXES = ("prefix_caching",)
 _QWEN35_TALKER_NUM_OUTPUT_IN_CHUNK = 4
 _QWEN35_TALKER_TEXT_FEEDBACK_STRIDE = _QWEN35_TALKER_NUM_OUTPUT_IN_CHUNK - 1
+_QWEN35_RTC_TEXT_FILLER_PER_CHUNK = 20
+_QWEN35_RTC_AUDIO_ROWS_PER_CHUNK = 14
 _VOICE_PARAM_KEYS = ("speaker", "voice", "voice_type")
 _OPENAI_AUDIO_VOICE_KEYS = ("voice_type", "voice", "speaker")
 _VOICE_STYLE_PATTERN = re.compile(
@@ -1218,7 +1220,7 @@ def _compute_qwen35_mrope_positions(
     input_ids: torch.Tensor,
     model_inputs: dict[str, Any],
     thinker_config: Any,
-) -> tuple[torch.Tensor, int] | None:
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Compute Qwen3.5-Omni Next M-RoPE positions.
 
     Qwen3.5 video grids are first expanded along the temporal dimension into
@@ -1232,11 +1234,15 @@ def _compute_qwen35_mrope_positions(
             # Audio-only requests do not have Qwen3.5 Next per-frame vision
             # grids. Reuse the existing Qwen3 audio M-RoPE logic so pure-audio
             # requests do not miss positions.
-            return qwen3_request_builders._compute_mrope_positions(
+            base_result = qwen3_request_builders._compute_mrope_positions(
                 input_ids,
                 model_inputs,
                 _audio_mrope_compat_config(thinker_config),
             )
+            if base_result is None:
+                return None
+            positions, position_delta = base_result
+            return positions, _mrope_delta_tensor(position_delta)
         return None
 
     video_grid_thw = [
@@ -1375,8 +1381,16 @@ def _compute_qwen35_mrope_positions(
             "Qwen3.5-Omni M-RoPE position length mismatch: "
             f"positions={positions.shape[1]} input={len(input_tokens)}"
         )
-    position_delta = int(positions.max().item() + 1 - len(input_tokens))
+    position_delta = _mrope_delta_tensor(
+        int(positions.max().item() + 1 - len(input_tokens))
+    )
     return positions, position_delta
+
+
+def _mrope_delta_tensor(position_delta: Any) -> torch.Tensor:
+    if isinstance(position_delta, torch.Tensor):
+        return position_delta.to(dtype=torch.long).reshape(-1)
+    return torch.tensor([int(position_delta)], dtype=torch.long)
 
 
 def _has_audio_mrope_inputs(model_inputs: dict[str, Any]) -> bool:
@@ -1498,11 +1512,74 @@ def _validate_qwen35_multimodal_feature_lengths(
     _validate_qwen35_multimodal_metadata_lengths(model_inputs)
 
 
-def _limit_prefix_cache_before_media_enabled() -> bool:
+def _env_flag_enabled(raw: str | None, *, default: bool = False) -> bool:
+    if raw is None or raw == "":
+        return default
+    return raw not in {"0", "false", "False", "no", "NO", "off", "OFF"}
+
+
+def _omit_cached_visual_item_payloads_enabled() -> bool:
+    return _env_flag_enabled(
+        os.getenv("SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS"),
+    )
+
+
+def _limit_prefix_cache_before_media_enabled(request: Any | None = None) -> bool:
     raw = os.getenv("QWEN35_LIMIT_PREFIX_CACHE_BEFORE_MEDIA")
-    if raw is None:
+    if raw is not None:
+        return _env_flag_enabled(raw)
+    if (
+        request is not None
+        and (_is_qwen35_rtc_prerun(request) or _is_qwen35_rtc_actual(request))
+        and _omit_cached_visual_item_payloads_enabled()
+    ):
+        return True
+    return False
+
+
+def _mamba_media_branching_cache_enabled() -> bool:
+    raw = os.getenv("QWEN35_MAMBA_MEDIA_BRANCH_CACHE")
+    return _env_flag_enabled(raw, default=True)
+
+
+def _rtc_prerun_prefill_only_enabled() -> bool:
+    raw = os.getenv("QWEN35_RTC_PRERUN_PREFILL_ONLY")
+    return _env_flag_enabled(raw, default=True)
+
+
+def _rtc_isolate_prerun_prefill_enabled() -> bool:
+    raw = os.getenv("QWEN35_RTC_ISOLATE_PRERUN_PREFILL")
+    return _env_flag_enabled(raw, default=True)
+
+
+def _is_qwen35_rtc_prerun(request: Any) -> bool:
+    metadata = getattr(request, "metadata", None)
+    return isinstance(metadata, dict) and bool(metadata.get("pre_run"))
+
+
+def _is_qwen35_rtc_actual(request: Any) -> bool:
+    metadata = getattr(request, "metadata", None)
+    if not isinstance(metadata, dict) or bool(metadata.get("pre_run")):
         return False
-    return raw in {"1", "true", "True", "yes", "YES", "on", "ON"}
+    namespace = metadata.get("media_cache_namespace")
+    return isinstance(namespace, str) and namespace.startswith("rtc:")
+
+
+def _params_for_qwen35_prerun(params: dict[str, Any], request: Any) -> dict[str, Any]:
+    if (
+        not _rtc_prerun_prefill_only_enabled()
+        or not _is_qwen35_rtc_prerun(request)
+    ):
+        return params
+
+    # RTC pre_run is a cache-warm/prefix-extension request. Letting it generate
+    # tokens commits non-prompt tokens into the hybrid Mamba radix cache, which
+    # can poison later growing-trunk prefix hits under concurrency.
+    adjusted = dict(params)
+    adjusted["max_tokens"] = 0
+    adjusted["max_completion_tokens"] = 0
+    adjusted["max_new_tokens"] = 0
+    return adjusted
 
 
 def _metadata_length(value: Any) -> int | None:
@@ -1707,16 +1784,32 @@ def make_thinker_scheduler_adapters(
     def request_builder(payload):
         state = Qwen3OmniPipelineState.from_dict(payload.data)
         _prepare_qwen35_thinker_inputs(state, thinker_config)
+        params = _params_for_qwen35_prerun(
+            payload.request.params or {},
+            payload.request,
+        )
         req_data = qwen3_request_builders.build_sglang_thinker_request(
             state,
-            params=payload.request.params or {},
+            params=params,
             tokenizer=tokenizer,
             vocab_size=vocab_size,
             request_id=payload.request_id,
             thinker_config=thinker_config,
             mrope_position_builder=qwen35_mrope_builder,
-            limit_prefix_cache_before_media=_limit_prefix_cache_before_media_enabled(),
+            limit_prefix_cache_before_media=_limit_prefix_cache_before_media_enabled(
+                payload.request
+            ),
+            mamba_media_branching_cache=_mamba_media_branching_cache_enabled(),
         )
+        req = getattr(req_data, "req", None)
+        if (
+            _rtc_isolate_prerun_prefill_enabled()
+            and _is_qwen35_rtc_prerun(payload.request)
+            and req is not None
+        ):
+            req._omni_isolate_prefill_batch = True
+        if _is_qwen35_rtc_actual(payload.request) and req is not None:
+            req._omni_prioritize_prefill = True
         req_data.stage_payload = payload
         return req_data
 
@@ -1784,11 +1877,16 @@ def make_thinker_stream_output_builder(required_aux_hidden_key: Any = None):
             and (stage_payload.request.params or {}).get("stream", False)
         )
         if is_streaming:
+            decode_data: int | torch.Tensor
+            if qwen3_request_builders._inline_cpu_stream_chunks_enabled():
+                decode_data = token_id
+            else:
+                decode_data = torch.tensor([token_id], dtype=torch.long, device="cpu")
             messages.append(
                 OutgoingMessage(
                     request_id=request_id,
                     type="stream",
-                    data=torch.tensor([token_id], dtype=torch.long),
+                    data=decode_data,
                     target="decode",
                     metadata={"token_id": token_id},
                 )
@@ -1947,10 +2045,12 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
         speaker_system_prompt_id: dict[str, list[int]] | None = None,
         max_thinker_to_talker_mm_tokens: int | None = None,
         tokenizer: Any | None = None,
+        thinker_config: Any | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self._tokenizer = tokenizer
+        self._thinker_config = thinker_config
         self._voice_clone_cache: dict[str, dict[str, Any]] = {}
         self._voice_map = _load_voice_map(self._model_path)
         self._nl_token_id = int(nl_token_id)
@@ -2072,6 +2172,1035 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
         """Load thinker-dimension embeddings for prompt_hidden (2048d)."""
         return super()._load_prompt_token_embeddings(token_ids)
 
+    @staticmethod
+    def _signed_int64_aliases(value: Any) -> tuple[int, ...]:
+        if isinstance(value, torch.Tensor):
+            aliases: list[int] = []
+            for item in value.detach().cpu().reshape(-1).tolist():
+                aliases.extend(Qwen35TalkerPrefillBuilder._signed_int64_aliases(item))
+            return tuple(dict.fromkeys(aliases))
+        if isinstance(value, (list, tuple, set)):
+            aliases = []
+            for item in value:
+                aliases.extend(Qwen35TalkerPrefillBuilder._signed_int64_aliases(item))
+            return tuple(dict.fromkeys(aliases))
+        try:
+            raw = int(value.item() if hasattr(value, "item") else value)
+        except (TypeError, ValueError, OverflowError):
+            return ()
+        wrapped = ((raw + (1 << 63)) % (1 << 64)) - (1 << 63)
+        return (raw,) if wrapped == raw else (raw, wrapped)
+
+    def _talker_text_vocab_size(self) -> int | None:
+        text_embedding = getattr(self._model, "text_embedding", None)
+        for attr in ("num_embeddings", "org_num_embeddings"):
+            value = getattr(text_embedding, attr, None)
+            if value is not None:
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if parsed > 0:
+                    return parsed
+
+        for config in (
+            getattr(self._model, "text_config", None),
+            getattr(getattr(self._model, "config", None), "text_config", None),
+        ):
+            if config is None:
+                continue
+            for attr in ("text_vocab_size", "vocab_size"):
+                value = getattr(config, attr, None)
+                if value is None and isinstance(config, dict):
+                    value = config.get(attr)
+                if value is None:
+                    continue
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if parsed > 0:
+                    return parsed
+        return None
+
+    def _invalid_prompt_id_mask(self, prompt_ids: torch.Tensor) -> torch.Tensor:
+        invalid = prompt_ids < 0
+        vocab_size = self._talker_text_vocab_size()
+        if vocab_size is not None:
+            invalid = invalid | (prompt_ids >= int(vocab_size))
+        else:
+            # Media cache pad values are xxhash-derived int64s. In unit tests
+            # and odd configs where vocab metadata is unavailable, still catch
+            # the wrapped/large values without treating normal tokenizer ids as
+            # media placeholders.
+            invalid = invalid | (prompt_ids.abs() >= (1 << 31))
+        return invalid
+
+    def _fallback_prompt_text_token_id(self) -> int:
+        vocab_size = self._talker_text_vocab_size()
+        candidates = [
+            getattr(self._tokenizer, "pad_token_id", None),
+            getattr(self._tokenizer, "eos_token_id", None),
+            getattr(self._tokenizer, "bos_token_id", None),
+            0,
+        ]
+        for value in candidates:
+            if value is None:
+                continue
+            try:
+                token_id = int(value)
+            except (TypeError, ValueError, RuntimeError):
+                continue
+            if token_id < 0:
+                continue
+            if vocab_size is not None and token_id >= int(vocab_size):
+                continue
+            return token_id
+        return 0
+
+    @staticmethod
+    def _distribute_prompt_extra(total: int, slots: int) -> list[int]:
+        if total <= 0 or slots <= 0:
+            return [0] * max(slots, 0)
+        base, remainder = divmod(int(total), int(slots))
+        return [base + (1 if idx < remainder else 0) for idx in range(slots)]
+
+    @staticmethod
+    def _slot_lengths_from_slot_count(
+        missing_by_modality: dict[str, int],
+        slot_count: int,
+    ) -> dict[str, list[int]] | None:
+        if slot_count <= 0:
+            return None
+        inferred: dict[str, list[int]] = {}
+        for modality, rows in missing_by_modality.items():
+            if rows <= 0 or rows % slot_count != 0:
+                return None
+            inferred[modality] = [rows // slot_count] * slot_count
+        return inferred
+
+    @classmethod
+    def _infer_rtc_media_slot_lengths(
+        cls,
+        *,
+        prompt_len: int,
+        missing_by_modality: dict[str, int],
+    ) -> dict[str, list[int]] | None:
+        if set(missing_by_modality) != {"audio", "video"}:
+            return None
+
+        total_media = sum(missing_by_modality.values())
+        extra_total = int(prompt_len) - int(total_media)
+        if extra_total < 0:
+            return None
+
+        candidates: list[tuple[int, int]] = []
+
+        def add_candidate(priority: int, slot_count: int) -> None:
+            if slot_count <= 0:
+                return
+            if extra_total and extra_total % slot_count != 0:
+                return
+            if not cls._slot_lengths_from_slot_count(
+                missing_by_modality,
+                slot_count,
+            ):
+                return
+            candidates.append((priority, slot_count))
+
+        if extra_total > 0:
+            add_candidate(
+                0,
+                extra_total // _QWEN35_RTC_TEXT_FILLER_PER_CHUNK,
+            )
+
+        audio_rows = missing_by_modality.get("audio", 0)
+        if audio_rows > 0:
+            add_candidate(
+                1,
+                audio_rows // _QWEN35_RTC_AUDIO_ROWS_PER_CHUNK,
+            )
+
+        if not candidates:
+            return None
+
+        candidates = sorted(set(candidates), key=lambda item: item[0])
+        return cls._slot_lengths_from_slot_count(
+            missing_by_modality,
+            candidates[0][1],
+        )
+
+    @staticmethod
+    def _feature_rows_for_prompt_model_inputs(
+        prompt_model_inputs: dict[str, Any],
+        feature_key: str,
+    ) -> int | None:
+        feature_tensor = coerce_feature_tensor(prompt_model_inputs.get(feature_key))
+        if feature_tensor is None:
+            return None
+        return int(feature_tensor.reshape(-1, feature_tensor.shape[-1]).shape[0])
+
+    @staticmethod
+    def _int_sequence(value: Any) -> list[int]:
+        if value is None:
+            return []
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().reshape(-1).tolist()
+        if isinstance(value, (list, tuple)):
+            result: list[int] = []
+            for item in value:
+                if isinstance(item, torch.Tensor):
+                    result.extend(
+                        int(part) for part in item.detach().cpu().reshape(-1).tolist()
+                    )
+                    continue
+                if isinstance(item, (list, tuple)):
+                    result.extend(Qwen35TalkerPrefillBuilder._int_sequence(item))
+                    continue
+                try:
+                    result.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+            return result
+        try:
+            return [int(value)]
+        except (TypeError, ValueError):
+            return []
+
+    @staticmethod
+    def _matching_original_prompt_ids(
+        prompt_model_inputs: dict[str, Any],
+        prompt_ids: torch.Tensor,
+    ) -> torch.Tensor | None:
+        for key in ("original_input_ids", "prompt_original_input_ids"):
+            value = prompt_model_inputs.get(key)
+            if value is None:
+                continue
+            try:
+                original = torch.as_tensor(value, dtype=torch.long).reshape(-1).cpu()
+            except (TypeError, ValueError):
+                continue
+            if original.numel() == prompt_ids.numel():
+                return original
+        return None
+
+    def _feature_rows_by_modality(
+        self,
+        prompt_model_inputs: dict[str, Any],
+    ) -> dict[str, int]:
+        rows_by_modality: dict[str, int] = {}
+        for modality, feature_key in (
+            ("audio", "audio_embeds"),
+            ("image", "image_embeds"),
+            ("video", "video_embeds"),
+        ):
+            rows = self._feature_rows_for_prompt_model_inputs(
+                prompt_model_inputs,
+                feature_key,
+            )
+            if rows is not None and rows > 0:
+                rows_by_modality[modality] = int(rows)
+        return rows_by_modality
+
+    def _media_token_counts_match_feature_rows(
+        self,
+        prompt_ids: torch.Tensor,
+        prompt_model_inputs: dict[str, Any],
+    ) -> bool:
+        rows_by_modality = self._feature_rows_by_modality(prompt_model_inputs)
+        if not rows_by_modality:
+            return False
+        token_ids = {
+            "audio": self._audio_token_id,
+            "image": self._image_token_id,
+            "video": self._video_token_id,
+        }
+        for modality, rows in rows_by_modality.items():
+            token_id = token_ids.get(modality)
+            if token_id is None:
+                return False
+            present = int((prompt_ids == int(token_id)).sum().item())
+            if present != int(rows):
+                return False
+        return True
+
+    def _original_prompt_ids_if_valid_for_media(
+        self,
+        prompt_ids: torch.Tensor,
+        prompt_model_inputs: dict[str, Any],
+    ) -> torch.Tensor | None:
+        original_prompt_ids = self._matching_original_prompt_ids(
+            prompt_model_inputs,
+            prompt_ids,
+        )
+        if original_prompt_ids is None:
+            return None
+        if self._invalid_prompt_id_mask(original_prompt_ids).any():
+            return None
+        if not self._media_token_counts_match_feature_rows(
+            original_prompt_ids,
+            prompt_model_inputs,
+        ):
+            return None
+        return original_prompt_ids.clone()
+
+    def _vision_spatial_merge_size(self) -> int:
+        configs = [
+            self._thinker_config,
+            getattr(self._thinker_config, "vision_config", None),
+            getattr(self._model, "config", None),
+            getattr(getattr(self._model, "config", None), "thinker_config", None),
+            getattr(getattr(self._model, "config", None), "vision_config", None),
+            getattr(
+                getattr(getattr(self._model, "config", None), "thinker_config", None),
+                "vision_config",
+                None,
+            ),
+        ]
+        for config in configs:
+            if config is None:
+                continue
+            value = getattr(config, "spatial_merge_size", None)
+            if value is None and isinstance(config, dict):
+                value = config.get("spatial_merge_size")
+            if value is None:
+                continue
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                return parsed
+        return 1
+
+    @staticmethod
+    def _grid_token_lengths_for_merge(value: Any, merge: int) -> list[int]:
+        lengths: list[int] = []
+        merge = max(int(merge), 1)
+        for row in _as_grid_list(value):
+            if len(row) < 3:
+                continue
+            grid_t, grid_h, grid_w = (int(part) for part in row[:3])
+            lengths.append(grid_t * (grid_h // merge) * (grid_w // merge))
+        return [length for length in lengths if length > 0]
+
+    def _grid_token_lengths(
+        self,
+        value: Any,
+        *,
+        expected_total: int | None = None,
+    ) -> list[int]:
+        merge = self._vision_spatial_merge_size()
+        lengths = self._grid_token_lengths_for_merge(value, merge)
+        if (
+            expected_total is None
+            or expected_total <= 0
+            or sum(lengths) == int(expected_total)
+        ):
+            return lengths
+
+        # Split-model metadata can occasionally omit thinker_config. In that case
+        # the default merge=1 overestimates Qwen3.5 visual token spans by 4x. The
+        # encoder output row count is authoritative for talker prompt repair, so
+        # infer the merge that makes grid spans match the feature rows.
+        candidates = [2, 4, 8, 1, 3, 5, 6, 7, 16]
+        seen: set[int] = {merge}
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            inferred = self._grid_token_lengths_for_merge(value, candidate)
+            if inferred and sum(inferred) == int(expected_total):
+                return inferred
+        return lengths
+
+    def _media_slot_lengths(
+        self,
+        prompt_model_inputs: dict[str, Any],
+        modality: str,
+    ) -> list[int]:
+        if modality == "audio":
+            lengths = [
+                length
+                for length in self._int_sequence(
+                    prompt_model_inputs.get("audio_feature_lengths")
+                )
+                if length > 0
+            ]
+            expected_total = self._feature_rows_for_prompt_model_inputs(
+                prompt_model_inputs,
+                "audio_embeds",
+            )
+            if (
+                lengths
+                and expected_total is not None
+                and expected_total > 0
+                and sum(lengths) != int(expected_total)
+            ):
+                # Qwen3.5 runtime metadata may carry pre-projector audio lengths
+                # (for example 200 per 2s chunk) while audio_embeds has the
+                # downsampled rows consumed by talker (14 per chunk). Preserve
+                # per-item boundaries by distributing the authoritative row count.
+                if int(expected_total) % len(lengths) == 0:
+                    return [int(expected_total) // len(lengths)] * len(lengths)
+                scaled: list[int] = []
+                cumulative = 0.0
+                scale = float(expected_total) / float(sum(lengths))
+                emitted = 0
+                for idx, length in enumerate(lengths):
+                    cumulative += float(length) * scale
+                    next_total = (
+                        int(expected_total)
+                        if idx == len(lengths) - 1
+                        else int(round(cumulative))
+                    )
+                    scaled.append(max(0, next_total - emitted))
+                    emitted = next_total
+                return [length for length in scaled if length > 0]
+            return lengths
+        if modality == "image":
+            return self._grid_token_lengths(
+                prompt_model_inputs.get("image_grid_thw"),
+                expected_total=self._feature_rows_for_prompt_model_inputs(
+                    prompt_model_inputs,
+                    "image_embeds",
+                ),
+            )
+        if modality == "video":
+            return self._grid_token_lengths(
+                prompt_model_inputs.get("video_grid_thw"),
+                expected_total=self._feature_rows_for_prompt_model_inputs(
+                    prompt_model_inputs,
+                    "video_embeds",
+                ),
+            )
+        return []
+
+    @staticmethod
+    def _invalid_prompt_runs(invalid_mask: torch.Tensor) -> list[tuple[int, int, int]]:
+        positions = torch.nonzero(invalid_mask, as_tuple=False).reshape(-1).tolist()
+        if not positions:
+            return []
+
+        runs: list[tuple[int, int, int]] = []
+        start = prev = int(positions[0])
+        for raw_pos in positions[1:]:
+            pos = int(raw_pos)
+            if pos == prev + 1:
+                prev = pos
+                continue
+            runs.append((start, prev + 1, prev - start + 1))
+            start = prev = pos
+        runs.append((start, prev + 1, prev - start + 1))
+        return runs
+
+    def _thinker_token_id(self, *names: str) -> int | None:
+        aliases = {
+            "vision_start_token_id": (
+                "vision_start_token_id",
+                "vision_bos_token_id",
+                "vision_start_token",
+                "vision_bos_token",
+            ),
+            "vision_end_token_id": (
+                "vision_end_token_id",
+                "vision_eos_token_id",
+                "vision_end_token",
+                "vision_eos_token",
+            ),
+            "video_end_token_id": (
+                "video_end_token_id",
+                "vision_end_token_id",
+                "vision_eos_token_id",
+                "vision_end_token",
+                "vision_eos_token",
+            ),
+            "audio_start_token_id": (
+                "audio_start_token_id",
+                "audio_bos_token_id",
+                "audio_start_token",
+                "audio_bos_token",
+            ),
+            "audio_end_token_id": (
+                "audio_end_token_id",
+                "audio_eos_token_id",
+                "audio_end_token",
+                "audio_eos_token",
+            ),
+        }
+        candidates: list[str] = []
+        for name in names:
+            candidates.extend(aliases.get(name, (name,)))
+
+        configs = [self._thinker_config, self._tokenizer]
+        convert_tokens_to_ids = getattr(self._tokenizer, "convert_tokens_to_ids", None)
+        for config in configs:
+            if config is None:
+                continue
+            for name in candidates:
+                value = getattr(config, name, None)
+                if value is None and isinstance(config, dict):
+                    value = config.get(name)
+                if value is None:
+                    continue
+                if isinstance(value, str) and callable(convert_tokens_to_ids):
+                    value = convert_tokens_to_ids(value)
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if parsed >= 0:
+                    return parsed
+        return None
+
+    def _context_modality_for_invalid_run(
+        self,
+        prompt_ids: torch.Tensor,
+        *,
+        start: int,
+        end: int,
+        candidate_modalities: set[str],
+    ) -> str | None:
+        prev_token = int(prompt_ids[start - 1].item()) if start > 0 else None
+        next_token = int(prompt_ids[end].item()) if end < prompt_ids.numel() else None
+
+        vision_start = self._thinker_token_id("vision_start_token_id")
+        vision_end = self._thinker_token_id("vision_end_token_id", "video_end_token_id")
+        if (
+            (prev_token is not None and prev_token == vision_start)
+            or (next_token is not None and next_token == vision_end)
+        ):
+            if "video" in candidate_modalities:
+                return "video"
+            if "image" in candidate_modalities:
+                return "image"
+
+        audio_start = self._thinker_token_id("audio_start_token_id")
+        audio_end = self._thinker_token_id("audio_end_token_id")
+        if (
+            (prev_token is not None and prev_token == audio_start)
+            or (next_token is not None and next_token == audio_end)
+        ) and "audio" in candidate_modalities:
+            return "audio"
+        return None
+
+    def _canonicalize_fully_compressed_media_prompt(
+        self,
+        prompt_ids: torch.Tensor,
+        invalid_mask: torch.Tensor,
+        prompt_model_inputs: dict[str, Any],
+        missing_modalities: list[tuple[str, int, int]],
+    ) -> torch.Tensor | None:
+        if not bool(invalid_mask.all()):
+            return None
+
+        token_by_modality = {
+            modality: int(token_id) for modality, token_id, _ in missing_modalities
+        }
+        if not token_by_modality:
+            return None
+
+        slot_lengths = {
+            modality: self._media_slot_lengths(prompt_model_inputs, modality)
+            for modality in token_by_modality
+        }
+        slot_sums = {modality: sum(lengths) for modality, lengths in slot_lengths.items()}
+        missing_by_modality = {
+            modality: int(missing) for modality, _, missing in missing_modalities
+        }
+        prompt_len = int(prompt_ids.numel())
+        if any(
+            slot_sums.get(modality, 0) != missing
+            for modality, missing in missing_by_modality.items()
+        ):
+            inferred_slot_lengths = self._infer_rtc_media_slot_lengths(
+                prompt_len=prompt_len,
+                missing_by_modality=missing_by_modality,
+            )
+            if inferred_slot_lengths is not None:
+                slot_lengths = inferred_slot_lengths
+                slot_sums = {
+                    modality: sum(lengths)
+                    for modality, lengths in slot_lengths.items()
+                }
+        total_media = sum(slot_sums.values())
+        if any(
+            slot_sums.get(modality, 0) != missing
+            for modality, missing in missing_by_modality.items()
+        ):
+            return None
+        if total_media > prompt_len:
+            return None
+
+        sequence: list[tuple[str, int]] = []
+        fallback_modality = "__text_fallback__"
+        if (
+            "video" in slot_lengths
+            and "audio" in slot_lengths
+            and len(slot_lengths["video"]) == len(slot_lengths["audio"])
+            and not slot_lengths.get("image")
+        ):
+            extras = self._distribute_prompt_extra(
+                prompt_len - total_media,
+                len(slot_lengths["video"]),
+            )
+            for index, (video_len, audio_len) in enumerate(
+                zip(
+                    slot_lengths["video"],
+                    slot_lengths["audio"],
+                )
+            ):
+                extra_len = extras[index] if index < len(extras) else 0
+                if extra_len > 1:
+                    sequence.append((fallback_modality, extra_len - 1))
+                sequence.append(("video", video_len))
+                if extra_len > 0:
+                    sequence.append((fallback_modality, 1))
+                sequence.append(("audio", audio_len))
+        else:
+            extra_len = prompt_len - total_media
+            if extra_len > 0:
+                sequence.append((fallback_modality, extra_len))
+            for modality in ("image", "video", "audio"):
+                for length in slot_lengths.get(modality, []):
+                    sequence.append((modality, length))
+
+        if sum(length for _, length in sequence) != prompt_len:
+            return None
+
+        original_prompt_ids = self._matching_original_prompt_ids(
+            prompt_model_inputs,
+            prompt_ids,
+        )
+        canonical = (
+            original_prompt_ids.clone()
+            if original_prompt_ids is not None
+            else prompt_ids.clone()
+        )
+        cursor = 0
+        fallback_token_id = self._fallback_prompt_text_token_id()
+        for modality, length in sequence:
+            if length <= 0:
+                continue
+            end = cursor + int(length)
+            if modality == fallback_modality:
+                if original_prompt_ids is None:
+                    canonical[cursor:end] = fallback_token_id
+                else:
+                    segment = canonical[cursor:end]
+                    invalid_segment = self._invalid_prompt_id_mask(segment)
+                    if invalid_segment.any():
+                        segment[invalid_segment] = fallback_token_id
+            else:
+                canonical[cursor:end] = token_by_modality[modality]
+            cursor = end
+        return canonical
+
+    def _rtc_media_slot_sequence(
+        self,
+        *,
+        prompt_len: int,
+        prompt_model_inputs: dict[str, Any],
+        token_by_modality: dict[str, int],
+    ) -> list[tuple[str, int]] | None:
+        if set(token_by_modality) != {"audio", "video"}:
+            return None
+
+        slot_lengths = {
+            modality: self._media_slot_lengths(prompt_model_inputs, modality)
+            for modality in token_by_modality
+        }
+        if (
+            not slot_lengths.get("video")
+            or not slot_lengths.get("audio")
+            or len(slot_lengths["video"]) != len(slot_lengths["audio"])
+        ):
+            rows_by_modality = self._feature_rows_by_modality(prompt_model_inputs)
+            inferred_slot_lengths = self._infer_rtc_media_slot_lengths(
+                prompt_len=prompt_len,
+                missing_by_modality=rows_by_modality,
+            )
+            if inferred_slot_lengths is None:
+                return None
+            slot_lengths = inferred_slot_lengths
+
+        slot_sums = {modality: sum(lengths) for modality, lengths in slot_lengths.items()}
+        rows_by_modality = self._feature_rows_by_modality(prompt_model_inputs)
+        if any(
+            slot_sums.get(modality, 0) != rows_by_modality.get(modality, 0)
+            for modality in token_by_modality
+        ):
+            return None
+
+        total_media = sum(slot_sums.values())
+        if total_media > prompt_len:
+            return None
+
+        sequence: list[tuple[str, int]] = []
+        fallback_modality = "__text_fallback__"
+        extras = self._distribute_prompt_extra(
+            prompt_len - total_media,
+            len(slot_lengths["video"]),
+        )
+        for index, (video_len, audio_len) in enumerate(
+            zip(slot_lengths["video"], slot_lengths["audio"])
+        ):
+            extra_len = extras[index] if index < len(extras) else 0
+            if extra_len > 1:
+                sequence.append((fallback_modality, extra_len - 1))
+            sequence.append(("video", video_len))
+            if extra_len > 0:
+                sequence.append((fallback_modality, 1))
+            sequence.append(("audio", audio_len))
+
+        if sum(length for _, length in sequence) != prompt_len:
+            return None
+        return sequence
+
+    def _canonicalize_partial_rtc_media_prompt(
+        self,
+        prompt_ids: torch.Tensor,
+        invalid_mask: torch.Tensor,
+        prompt_model_inputs: dict[str, Any],
+    ) -> torch.Tensor | None:
+        rows_by_modality = self._feature_rows_by_modality(prompt_model_inputs)
+        token_ids = {
+            "audio": self._audio_token_id,
+            "video": self._video_token_id,
+        }
+        token_by_modality = {
+            modality: int(token_ids[modality])
+            for modality in ("audio", "video")
+            if rows_by_modality.get(modality, 0) > 0
+            and token_ids.get(modality) is not None
+        }
+        if set(token_by_modality) != {"audio", "video"}:
+            return None
+
+        sequence = self._rtc_media_slot_sequence(
+            prompt_len=int(prompt_ids.numel()),
+            prompt_model_inputs=prompt_model_inputs,
+            token_by_modality=token_by_modality,
+        )
+        if sequence is None:
+            return None
+
+        original_prompt_ids = self._matching_original_prompt_ids(
+            prompt_model_inputs,
+            prompt_ids,
+        )
+        canonical = (
+            original_prompt_ids.clone()
+            if original_prompt_ids is not None
+            else prompt_ids.clone()
+        )
+        fallback_token_id = self._fallback_prompt_text_token_id()
+        fallback_modality = "__text_fallback__"
+        cursor = 0
+        for modality, length in sequence:
+            if length <= 0:
+                continue
+            end = cursor + int(length)
+            invalid_segment = invalid_mask[cursor:end]
+            if invalid_segment.any():
+                segment = canonical[cursor:end]
+                if modality == fallback_modality:
+                    if original_prompt_ids is None:
+                        segment[invalid_segment] = fallback_token_id
+                    else:
+                        still_invalid = self._invalid_prompt_id_mask(segment)
+                        if still_invalid.any():
+                            segment[still_invalid] = fallback_token_id
+                else:
+                    segment[invalid_segment] = token_by_modality[modality]
+            cursor = end
+
+        if self._invalid_prompt_id_mask(canonical).any():
+            return None
+        if not self._media_token_counts_match_feature_rows(
+            canonical,
+            prompt_model_inputs,
+        ):
+            return None
+        return canonical
+
+    def _unmapped_media_debug_summary(
+        self,
+        prompt_ids: torch.Tensor,
+        invalid_mask: torch.Tensor,
+        prompt_model_inputs: dict[str, Any],
+        missing_modalities: list[tuple[str, int, int]],
+    ) -> str:
+        runs = self._invalid_prompt_runs(invalid_mask)
+        run_parts: list[str] = []
+        for start, end, length in runs[:10]:
+            prev_token = int(prompt_ids[start - 1].item()) if start > 0 else None
+            next_token = int(prompt_ids[end].item()) if end < prompt_ids.numel() else None
+            unique_count = int(torch.unique(prompt_ids[start:end]).numel())
+            run_parts.append(
+                f"{start}:{end}:len={length}:prev={prev_token}:next={next_token}:uniq={unique_count}"
+            )
+
+        slot_parts: list[str] = []
+        for modality, _, _ in missing_modalities:
+            lengths = self._media_slot_lengths(prompt_model_inputs, modality)
+            unique_lengths = sorted(set(lengths))
+            slot_parts.append(
+                f"{modality}:n={len(lengths)}:sum={sum(lengths)}:uniq={unique_lengths[:8]}"
+            )
+
+        special_ids = {
+            "vision_start": self._thinker_token_id("vision_start_token_id"),
+            "vision_end": self._thinker_token_id(
+                "vision_end_token_id", "video_end_token_id"
+            ),
+            "audio_start": self._thinker_token_id("audio_start_token_id"),
+            "audio_end": self._thinker_token_id("audio_end_token_id"),
+        }
+        return (
+            f"invalid_total={int(invalid_mask.sum().item())}; "
+            f"run_count={len(runs)}; first_runs={run_parts}; "
+            f"slots={slot_parts}; special_ids={special_ids}; "
+            f"prompt_len={prompt_ids.numel()}"
+        )
+
+    def _canonicalize_unmapped_media_pad_ids(
+        self,
+        prompt_ids: torch.Tensor,
+        prompt_model_inputs: dict[str, Any],
+    ) -> torch.Tensor:
+        invalid_mask = self._invalid_prompt_id_mask(prompt_ids)
+        if not invalid_mask.any():
+            return prompt_ids
+
+        original_prompt_ids = self._original_prompt_ids_if_valid_for_media(
+            prompt_ids,
+            prompt_model_inputs,
+        )
+        if original_prompt_ids is not None:
+            return original_prompt_ids
+
+        partial_rtc = self._canonicalize_partial_rtc_media_prompt(
+            prompt_ids,
+            invalid_mask,
+            prompt_model_inputs,
+        )
+        if partial_rtc is not None:
+            return partial_rtc
+
+        missing_modalities: list[tuple[str, int, int]] = []
+        for modality, feature_key, token_id in (
+            ("audio", "audio_embeds", self._audio_token_id),
+            ("image", "image_embeds", self._image_token_id),
+            ("video", "video_embeds", self._video_token_id),
+        ):
+            if token_id is None:
+                continue
+            rows = self._feature_rows_for_prompt_model_inputs(
+                prompt_model_inputs,
+                feature_key,
+            )
+            if rows is None or rows <= 0:
+                continue
+            present = int((prompt_ids == int(token_id)).sum().item())
+            missing = rows - present
+            if missing > 0:
+                missing_modalities.append((modality, int(token_id), missing))
+
+        canonical = prompt_ids
+        if len(missing_modalities) > 1:
+            compressed = self._canonicalize_fully_compressed_media_prompt(
+                prompt_ids,
+                invalid_mask,
+                prompt_model_inputs,
+                missing_modalities,
+            )
+            if compressed is not None:
+                return compressed
+
+            canonical = prompt_ids.clone()
+            invalid_values, invalid_counts = torch.unique(
+                prompt_ids[invalid_mask],
+                return_counts=True,
+                sorted=False,
+            )
+            slot_lengths = {
+                modality: self._media_slot_lengths(prompt_model_inputs, modality)
+                for modality, _, _ in missing_modalities
+            }
+            remaining = {
+                modality: int(missing) for modality, _, missing in missing_modalities
+            }
+            token_by_modality = {
+                modality: int(token_id)
+                for modality, token_id, _ in missing_modalities
+            }
+
+            run_mapped = False
+            for start, end, length in self._invalid_prompt_runs(invalid_mask):
+                context_modality = self._context_modality_for_invalid_run(
+                    prompt_ids,
+                    start=start,
+                    end=end,
+                    candidate_modalities=set(token_by_modality),
+                )
+                if (
+                    context_modality is not None
+                    and remaining.get(context_modality, 0) >= length
+                ):
+                    remaining[context_modality] -= length
+                    canonical[start:end] = token_by_modality[context_modality]
+                    run_mapped = True
+            if run_mapped:
+                invalid_mask = self._invalid_prompt_id_mask(canonical)
+                if not invalid_mask.any():
+                    return canonical
+                prompt_ids = canonical
+
+            mapped = False
+            for value, count_tensor in zip(
+                invalid_values.tolist(),
+                invalid_counts.tolist(),
+            ):
+                count = int(count_tensor)
+                matches = [
+                    modality
+                    for modality, lengths in slot_lengths.items()
+                    if count in lengths and remaining.get(modality, 0) >= count
+                ]
+                if len(matches) != 1:
+                    continue
+                modality = matches[0]
+                slot_lengths[modality].remove(count)
+                remaining[modality] -= count
+                canonical[canonical == int(value)] = token_by_modality[modality]
+                mapped = True
+            if mapped:
+                invalid_mask = self._invalid_prompt_id_mask(canonical)
+                if not invalid_mask.any():
+                    return canonical
+                prompt_ids = canonical
+
+            run_mapped = False
+            for start, end, length in self._invalid_prompt_runs(invalid_mask):
+                context_modality = self._context_modality_for_invalid_run(
+                    prompt_ids,
+                    start=start,
+                    end=end,
+                    candidate_modalities=set(token_by_modality),
+                )
+                if (
+                    context_modality is not None
+                    and remaining.get(context_modality, 0) >= length
+                ):
+                    remaining[context_modality] -= length
+                    canonical[start:end] = token_by_modality[context_modality]
+                    run_mapped = True
+                    continue
+                matches = [
+                    modality
+                    for modality, lengths in slot_lengths.items()
+                    if length in lengths and remaining.get(modality, 0) >= length
+                ]
+                if len(matches) != 1:
+                    continue
+                modality = matches[0]
+                slot_lengths[modality].remove(length)
+                remaining[modality] -= length
+                canonical[start:end] = token_by_modality[modality]
+                run_mapped = True
+            if run_mapped:
+                invalid_mask = self._invalid_prompt_id_mask(canonical)
+                if not invalid_mask.any():
+                    return canonical
+                prompt_ids = canonical
+
+        if len(missing_modalities) == 1:
+            _, token_id, missing = missing_modalities[0]
+            if int(invalid_mask.sum().item()) == missing:
+                canonical = prompt_ids.clone()
+                canonical[invalid_mask] = int(token_id)
+                return canonical
+
+        invalid_values = torch.unique(prompt_ids[invalid_mask]).tolist()
+        formatted = ", ".join(str(int(value)) for value in invalid_values[:8])
+        if len(invalid_values) > 8:
+            formatted += ", ..."
+        modality_state = ", ".join(
+            f"{modality}:missing={missing}"
+            for modality, _, missing in missing_modalities
+        )
+        debug_summary = self._unmapped_media_debug_summary(
+            prompt_ids,
+            invalid_mask,
+            prompt_model_inputs,
+            missing_modalities,
+        )
+        raise ValueError(
+            "Qwen3.5 talker prompt contains unmapped media cache pad ids: "
+            f"{formatted}; modality feature/token gaps: {modality_state or 'none'}; "
+            f"{debug_summary}"
+        )
+
+    def _canonicalize_video_frame_placeholders(
+        self,
+        prompt_ids: torch.Tensor,
+        prompt_model_inputs: dict[str, Any],
+    ) -> torch.Tensor:
+        if self._video_token_id is None or self._image_token_id is None:
+            return prompt_ids
+
+        video_rows = self._feature_rows_for_prompt_model_inputs(
+            prompt_model_inputs,
+            "video_embeds",
+        )
+        if video_rows is None or video_rows <= 0:
+            return prompt_ids
+        image_rows = self._feature_rows_for_prompt_model_inputs(
+            prompt_model_inputs,
+            "image_embeds",
+        )
+        if image_rows not in (None, 0):
+            return prompt_ids
+
+        video_token_id = int(self._video_token_id)
+        image_token_id = int(self._image_token_id)
+        video_count = int((prompt_ids == video_token_id).sum().item())
+        image_count = int((prompt_ids == image_token_id).sum().item())
+        missing = int(video_rows) - video_count
+        if missing <= 0 or image_count != missing:
+            return prompt_ids
+
+        canonical = prompt_ids.clone()
+        canonical[canonical == image_token_id] = video_token_id
+        return canonical
+
+    def _canonicalize_prompt_ids_for_talker(
+        self,
+        prompt_ids: torch.Tensor,
+        prompt_model_inputs: dict[str, Any],
+    ) -> torch.Tensor:
+        canonical = prompt_ids.clone()
+        pad_values = prompt_model_inputs.get("pad_values")
+        if isinstance(pad_values, dict):
+            for modality, token_id in (
+                ("audio", self._audio_token_id),
+                ("image", self._image_token_id),
+                ("video", self._video_token_id),
+            ):
+                if token_id is None or modality not in pad_values:
+                    continue
+                for pad_id in self._signed_int64_aliases(pad_values.get(modality)):
+                    canonical[canonical == int(pad_id)] = int(token_id)
+        canonical = self._canonicalize_unmapped_media_pad_ids(
+            canonical,
+            prompt_model_inputs,
+        )
+        return self._canonicalize_video_frame_placeholders(
+            canonical,
+            prompt_model_inputs,
+        )
+
     def _reconstruct_prompt_states(
         self, state: Qwen3OmniPipelineState
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
@@ -2079,11 +3208,22 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
         prompt_input_ids = prompt["input_ids"]
         if prompt_input_ids.dim() == 2:
             prompt_input_ids = prompt_input_ids[0]
-        prompt_ids = prompt_input_ids.to(dtype=torch.long).cpu()
+        raw_prompt_ids = prompt_input_ids.to(dtype=torch.long).cpu()
+        prompt_model_inputs = self._prompt_model_inputs(state)
+        prompt_original_ids = prompt.get("original_input_ids")
+        if (
+            prompt_original_ids is not None
+            and "original_input_ids" not in prompt_model_inputs
+        ):
+            prompt_model_inputs = dict(prompt_model_inputs)
+            prompt_model_inputs["original_input_ids"] = prompt_original_ids
+        prompt_ids = self._canonicalize_prompt_ids_for_talker(
+            raw_prompt_ids,
+            prompt_model_inputs,
+        )
 
         prompt_embed = self._load_prompt_token_embeddings(prompt_ids)
         prompt_hidden = self._load_thinker_hidden_embeddings(prompt_ids)
-        prompt_model_inputs = self._prompt_model_inputs(state)
 
         for modality_key, token_id in (
             ("audio_embeds", self._audio_token_id),
@@ -2409,6 +3549,40 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
                     and future_text_rows.shape[0] > 0
                 ):
                     future_text_rows = future_text_rows[:-1]
+
+        if not all_embeds:
+            assistant_result = _build_qwen35_assistant_part(
+                assistant_embed=thinker_embed.new_empty((0, thinker_embed.shape[-1])),
+                assistant_instruct_embed=assistant_instruct_embed,
+                text_projection=text_projection,
+                codec_embed_fn=codec_embed_fn,
+                tts_bos_embed=tts_bos_embed,
+                tts_eos_embed=tts_eos_embed,
+                tts_pad_embed=tts_pad_embed,
+                speaker_id=speaker_id,
+                codec_nothink_id=codec_nothink_id,
+                codec_think_id=codec_think_id,
+                codec_think_bos_id=codec_think_bos_id,
+                codec_think_eos_id=codec_think_eos_id,
+                codec_pad_id=codec_pad_id,
+                codec_bos_id=codec_bos_id,
+                tts_pad_token_id=tts_pad_token_id,
+                language_id=language_id,
+            )
+            all_embeds.append(assistant_result["input_embeds"])
+            all_ids.append(
+                assistant_result["input_ids"].to(
+                    device=thinker_input_ids.device,
+                    dtype=torch.long,
+                )
+            )
+            future_text_rows = assistant_result["future_text_rows"]
+            if (
+                not include_assistant_eos
+                and future_text_rows is not None
+                and future_text_rows.shape[0] > 0
+            ):
+                future_text_rows = future_text_rows[:-1]
 
         return {
             "input_embeds": torch.cat(all_embeds, dim=0),
@@ -2759,6 +3933,7 @@ def make_talker_scheduler_adapters(
         speaker_system_prompt_id=speaker_system_prompt_id,
         max_thinker_to_talker_mm_tokens=max_thinker_to_talker_mm_tokens,
         tokenizer=tokenizer,
+        thinker_config=thinker_config,
         audio_token_id=audio_token_id,
         image_token_id=image_token_id,
         video_token_id=video_token_id,
@@ -2832,11 +4007,10 @@ def make_talker_scheduler_adapters(
                 prefix="subtalker",
                 defaults={
                     # Residual codecs use independent sampling defaults. Do not
-                    # reuse the main request's greedy or low-top-k settings, or
-                    # the 15 residual codebooks collapse into noise.
+                    # inherit the main request or main talker sampling settings.
                     "max_new_tokens": 0,
-                    "temperature": 0.9,
-                    "top_k": 50,
+                    "temperature": 0.1,
+                    "top_k": 5,
                     "top_p": 1.0,
                     "min_p": 0.0,
                     "repetition_penalty": 1.05,

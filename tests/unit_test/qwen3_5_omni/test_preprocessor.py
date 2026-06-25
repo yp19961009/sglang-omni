@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -46,6 +48,19 @@ class _FakeProcessor:
                 {
                     "input_audio_features": torch.ones(1, 4, 3),
                     "feature_attention_mask": torch.ones(1, 3, dtype=torch.bool),
+                }
+            )
+        videos = kwargs.get("videos")
+        if videos is not None:
+            video_count = len(videos) if isinstance(videos, list) else 1
+            grid = torch.tensor(
+                [[1, 1, index + 2] for index in range(video_count)],
+                dtype=torch.long,
+            )
+            data.update(
+                {
+                    "pixel_values_videos": torch.ones(int(grid.prod(dim=-1).sum()), 3),
+                    "video_grid_thw": grid,
                 }
             )
         return data
@@ -95,6 +110,63 @@ class _ShimFakeTokenizer:
         }
 
 
+class _ShimSpecialAwareTokenizer(_ShimFakeTokenizer):
+    all_special_tokens = [
+        "<|im_start|>",
+        "<|im_end|>",
+        _ShimFakeTokenizer.image_token,
+        _ShimFakeTokenizer.audio_token,
+        _ShimFakeTokenizer.video_token,
+        _ShimFakeTokenizer.vision_bos_token,
+        _ShimFakeTokenizer.vision_eos_token,
+        _ShimFakeTokenizer.audio_bos_token,
+        _ShimFakeTokenizer.audio_eos_token,
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.token_ids = {
+            token: 1000 + index for index, token in enumerate(self.all_special_tokens)
+        }
+        self._special_pattern = re.compile(
+            "|".join(
+                re.escape(token)
+                for token in sorted(self.token_ids, key=len, reverse=True)
+            )
+        )
+
+    def convert_tokens_to_ids(self, token):
+        return self.token_ids.get(token, -1)
+
+    def __call__(self, text, **kwargs):
+        del kwargs
+        self.last_text = text
+        if isinstance(text, str):
+            return {
+                "input_ids": self._encode_one(text),
+                "attention_mask": [1] * len(self._encode_one(text)),
+            }
+        rows = [self._encode_one(sample) for sample in text]
+        return {
+            "input_ids": rows,
+            "attention_mask": [[1] * len(row) for row in rows],
+        }
+
+    def _encode_one(self, text: str) -> list[int]:
+        ids: list[int] = []
+        cursor = 0
+        for match in self._special_pattern.finditer(text):
+            ids.extend(self._encode_plain(text[cursor : match.start()]))
+            ids.append(self.token_ids[match.group(0)])
+            cursor = match.end()
+        ids.extend(self._encode_plain(text[cursor:]))
+        return ids
+
+    @staticmethod
+    def _encode_plain(text: str) -> list[int]:
+        return [ord(ch) % 251 + 10 for ch in text]
+
+
 class _ShimFakeFeatureExtractor:
     sampling_rate = 16000
     hop_length = 160
@@ -111,6 +183,58 @@ class _ShimFakeFeatureExtractor:
 class _ShimFakeImageProcessor:
     merge_size = 2
     model_input_names = ["pixel_values"]
+
+
+class _ShimFakeVideoProcessor:
+    def __init__(self) -> None:
+        self.kwargs = None
+
+    def __call__(self, videos, **kwargs):
+        del videos
+        self.kwargs = kwargs
+        return {
+            "pixel_values_videos": torch.ones(4, 1536),
+            "video_grid_thw": torch.tensor([[1, 2, 2]], dtype=torch.long),
+            "video_metadata": [SimpleNamespace(fps=2.0, frames_indices=[0])],
+        }
+
+
+class _ShimCachingVideoProcessor:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(self, videos, **kwargs):
+        self.calls.append({"videos": list(videos), "kwargs": dict(kwargs)})
+        call_value = float(len(self.calls))
+        return {
+            "pixel_values_videos": torch.full((len(videos), 2), call_value),
+            "video_grid_thw": torch.ones(len(videos), 3, dtype=torch.long),
+            "video_metadata": [
+                SimpleNamespace(fps=kwargs.get("fps", 1.0), frames_indices=[0])
+                for _ in videos
+            ],
+        }
+
+
+class _ShimCachingFeatureExtractor:
+    sampling_rate = 16000
+    hop_length = 160
+    model_input_names = ["input_features"]
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    def __call__(self, audio, **kwargs):
+        del kwargs
+        self.calls.append(len(audio))
+        lengths = [max(1, int(sample.shape[-1] // 160)) for sample in audio]
+        max_len = max(lengths)
+        features = torch.zeros(len(audio), 4, max_len)
+        mask = torch.zeros(len(audio), max_len, dtype=torch.long)
+        for index, length in enumerate(lengths):
+            features[index, :, :length] = float(len(self.calls))
+            mask[index, :length] = 1
+        return {"input_features": features, "attention_mask": mask}
 
 
 def _new_preprocessor_for_unit() -> Qwen35OmniPreprocessor:
@@ -138,8 +262,8 @@ def test_qwen35_preprocessor_loader_returns_from_pretrained_class():
 
 
 def test_qwen35_preprocessor_uses_remote_processor_fallback():
-    # 中文说明：当前测试环境可能还没有内置 qwen3_omni_next。
-    # 这里固定子类接口，保证真实模型带 remote processor 时可以兜底加载。
+    # Some test environments do not ship qwen3_omni_next locally. Keep the
+    # subclass contract pinned so real models can fall back to remote processors.
     assert Qwen35OmniPreprocessor.chat_template_fallback_model_paths == ()
 
 
@@ -186,6 +310,327 @@ def test_qwen35_processor_shim_expands_audio_tokens_and_features():
     assert tokenizer.last_text == ["<0.0 seconds>" + "<|audio_pad|>" * 7]
 
 
+def test_qwen35_processor_shim_fast_special_token_tokenizer_matches_fallback():
+    text = (
+        "<|im_start|>user\n"
+        "look "
+        "<|vision_start|><|video_pad|><|vision_end|>"
+        " listen <|audio_pad|><|im_end|>\n<|im_start|>assistant\n"
+    )
+    audio_kwargs = {
+        "sampling_rate": 16000,
+        "padding": True,
+        "return_attention_mask": True,
+        "truncation": False,
+        "timestamp_interval": 60,
+        "downsample_times": 4,
+        "downsample_chunk_size": 100,
+    }
+
+    slow_shim = _Qwen35ProcessorShim(
+        tokenizer=_ShimSpecialAwareTokenizer(),
+        image_processor=_ShimFakeImageProcessor(),
+        video_processor=_ShimFakeVideoProcessor(),
+        feature_extractor=_ShimFakeFeatureExtractor(),
+    )
+    slow_shim._tokenizer_special_pattern = None
+    slow = slow_shim(
+        text=text,
+        videos=[torch.zeros(2, 3, 32, 32)],
+        audio=[torch.zeros(16000).numpy()],
+        videos_kwargs={"return_metadata": True, "use_audio_in_video": [False]},
+        audio_kwargs=audio_kwargs,
+        add_special_tokens=False,
+        return_tensors="pt",
+    )
+
+    fast_shim = _Qwen35ProcessorShim(
+        tokenizer=_ShimSpecialAwareTokenizer(),
+        image_processor=_ShimFakeImageProcessor(),
+        video_processor=_ShimFakeVideoProcessor(),
+        feature_extractor=_ShimFakeFeatureExtractor(),
+    )
+    fast = fast_shim(
+        text=text,
+        videos=[torch.zeros(2, 3, 32, 32)],
+        audio=[torch.zeros(16000).numpy()],
+        videos_kwargs={"return_metadata": True, "use_audio_in_video": [False]},
+        audio_kwargs=audio_kwargs,
+        add_special_tokens=False,
+        return_tensors="pt",
+    )
+
+    assert torch.equal(fast["input_ids"], slow["input_ids"])
+    assert torch.equal(fast["attention_mask"], slow["attention_mask"])
+
+
+def test_qwen35_processor_shim_fast_tokenizer_caches_plain_text_runs():
+    class _CountingTokenizer(_ShimSpecialAwareTokenizer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def __call__(self, text, **kwargs):
+            self.calls += 1
+            return super().__call__(text, **kwargs)
+
+    tokenizer = _CountingTokenizer()
+    shim = _Qwen35ProcessorShim(tokenizer=tokenizer)
+    text = (
+        "tick"
+        + _ShimFakeTokenizer.audio_token * 10
+        + "tick"
+        + _ShimFakeTokenizer.audio_token * 10
+        + "tick"
+    )
+
+    result = shim._fast_tokenize_with_special_ids(
+        [text],
+        {"add_special_tokens": False, "padding": False},
+    )
+
+    assert result is not None
+    audio_token_id = tokenizer.token_ids[_ShimFakeTokenizer.audio_token]
+    assert result["input_ids"][0].count(audio_token_id) == 20
+    assert tokenizer.calls == 1
+
+
+def test_qwen35_processor_shim_strips_video_metadata_from_tensor_outputs():
+    shim = _Qwen35ProcessorShim(
+        tokenizer=_ShimFakeTokenizer(),
+        image_processor=_ShimFakeImageProcessor(),
+        video_processor=_ShimFakeVideoProcessor(),
+        feature_extractor=_ShimFakeFeatureExtractor(),
+    )
+
+    video_inputs, video_grid_thw, video_metadata = shim._process_videos(
+        [torch.zeros(2, 3, 32, 32)],
+        {"return_metadata": True, "use_audio_in_video": [False]},
+    )
+
+    assert "video_metadata" not in video_inputs
+    assert video_grid_thw.tolist() == [[1, 2, 2]]
+    assert video_metadata[0].fps == 2.0
+
+
+def test_qwen35_processor_shim_translates_video_pixels_to_size():
+    video_processor = _ShimFakeVideoProcessor()
+    video_processor.size = {"shortest_edge": 65536, "longest_edge": 16777216}
+    shim = _Qwen35ProcessorShim(
+        tokenizer=_ShimFakeTokenizer(),
+        image_processor=_ShimFakeImageProcessor(),
+        video_processor=video_processor,
+        feature_extractor=_ShimFakeFeatureExtractor(),
+    )
+
+    result = shim(
+        text="<|video_pad|>",
+        videos=["chunk-1"],
+        videos_kwargs={
+            "return_metadata": True,
+            "use_audio_in_video": [False],
+            "min_pixels": 4096,
+            "max_pixels": 786432,
+        },
+        add_special_tokens=False,
+        return_tensors="pt",
+    )
+
+    assert result["pixel_values_videos"].shape == (4, 1536)
+    assert video_processor.kwargs["size"] == {
+        "shortest_edge": 4096,
+        "longest_edge": 786432,
+    }
+
+
+def test_qwen35_processor_shim_caches_video_items():
+    video_processor = _ShimCachingVideoProcessor()
+    shim = _Qwen35ProcessorShim(
+        tokenizer=_ShimFakeTokenizer(),
+        image_processor=_ShimFakeImageProcessor(),
+        video_processor=video_processor,
+        feature_extractor=_ShimFakeFeatureExtractor(),
+    )
+
+    first_inputs, _, _ = shim._process_videos(
+        ["chunk-1"],
+        {
+            "return_metadata": True,
+            "fps": [1.0],
+            "use_audio_in_video": [False],
+            "_sglang_omni_item_cache_keys": ["video:k1"],
+        },
+    )
+    second_inputs, second_grid, _ = shim._process_videos(
+        ["chunk-1", "chunk-2"],
+        {
+            "return_metadata": True,
+            "fps": [1.0, 2.0],
+            "use_audio_in_video": [False, False],
+            "_sglang_omni_item_cache_keys": ["video:k1", "video:k2"],
+        },
+    )
+
+    assert [call["videos"] for call in video_processor.calls] == [
+        ["chunk-1"],
+        ["chunk-2"],
+    ]
+    assert video_processor.calls[1]["kwargs"]["fps"] == 2.0
+    assert first_inputs["pixel_values_videos"].tolist() == [[1.0, 1.0]]
+    assert second_inputs["pixel_values_videos"].tolist() == [
+        [1.0, 1.0],
+        [2.0, 2.0],
+    ]
+    assert second_grid.tolist() == [[1, 1, 1], [1, 1, 1]]
+
+
+def test_qwen35_processor_shim_marks_omitted_cached_video_pixels(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS", "1")
+    video_processor = _ShimCachingVideoProcessor()
+    shim = _Qwen35ProcessorShim(
+        tokenizer=_ShimFakeTokenizer(),
+        image_processor=_ShimFakeImageProcessor(),
+        video_processor=video_processor,
+        feature_extractor=_ShimFakeFeatureExtractor(),
+    )
+
+    shim._process_videos(
+        ["chunk-1"],
+        {
+            "return_metadata": True,
+            "fps": [1.0],
+            "use_audio_in_video": [False],
+            "_sglang_omni_item_cache_keys": ["video:k1"],
+        },
+    )
+    second_inputs, second_grid, _ = shim._process_videos(
+        ["chunk-1", "chunk-2"],
+        {
+            "return_metadata": True,
+            "fps": [1.0, 2.0],
+            "use_audio_in_video": [False, False],
+            "_sglang_omni_item_cache_keys": ["video:k1", "video:k2"],
+        },
+    )
+
+    assert [call["videos"] for call in video_processor.calls] == [
+        ["chunk-1"],
+        ["chunk-2"],
+    ]
+    assert second_inputs["video_item_pixel_present"] == [False, True]
+    assert second_inputs["pixel_values_videos"].tolist() == [[2.0, 2.0]]
+    assert second_grid.tolist() == [[1, 1, 1], [1, 1, 1]]
+
+
+def test_qwen35_processor_shim_caches_audio_items_with_padding():
+    feature_extractor = _ShimCachingFeatureExtractor()
+    shim = _Qwen35ProcessorShim(
+        tokenizer=_ShimFakeTokenizer(),
+        image_processor=_ShimFakeImageProcessor(),
+        feature_extractor=feature_extractor,
+    )
+    audio_kwargs = {
+        "sampling_rate": 16000,
+        "padding": True,
+        "return_attention_mask": True,
+        "truncation": False,
+        "timestamp_interval": 60,
+        "downsample_times": 4,
+        "downsample_chunk_size": 100,
+    }
+
+    shim._process_audio(
+        [np.zeros(16000, dtype=np.float32)],
+        {**audio_kwargs, "_sglang_omni_item_cache_keys": ["audio:k1"]},
+        downsample_times=4,
+        downsample_chunk_size=100,
+    )
+    audio_inputs, _ = shim._process_audio(
+        [
+            np.zeros(16000, dtype=np.float32),
+            np.zeros(32000, dtype=np.float32),
+        ],
+        {**audio_kwargs, "_sglang_omni_item_cache_keys": ["audio:k1", "audio:k2"]},
+        downsample_times=4,
+        downsample_chunk_size=100,
+    )
+
+    assert feature_extractor.calls == [1, 1]
+    assert audio_inputs["input_audio_features"].shape == (2, 4, 200)
+    assert audio_inputs["feature_attention_mask"].sum(-1).tolist() == [100, 200]
+
+
+def test_qwen35_processor_shim_loads_video_processor_from_model_config(monkeypatch):
+    import transformers
+
+    class FakeTokenizer(_ShimFakeTokenizer):
+        @classmethod
+        def from_pretrained(cls, model_dir, **kwargs):
+            del model_dir, kwargs
+            return cls()
+
+    class FakeImageProcessor(_ShimFakeImageProcessor):
+        patch_size = 16
+        temporal_patch_size = 2
+
+        @classmethod
+        def from_pretrained(cls, model_dir, **kwargs):
+            del model_dir, kwargs
+            return cls()
+
+    class FakeVideoProcessor:
+        @classmethod
+        def from_pretrained(cls, model_dir, **kwargs):
+            inst = cls()
+            inst.model_dir = model_dir
+            inst.kwargs = kwargs
+            inst.patch_size = 16
+            inst.temporal_patch_size = 2
+            inst.merge_size = 2
+            return inst
+
+    class FakeFeatureExtractor(_ShimFakeFeatureExtractor):
+        @classmethod
+        def from_pretrained(cls, model_dir, **kwargs):
+            del model_dir, kwargs
+            return cls()
+
+    monkeypatch.setattr(transformers, "AutoTokenizer", FakeTokenizer)
+    monkeypatch.setattr(transformers, "Qwen2VLImageProcessor", FakeImageProcessor)
+    monkeypatch.setattr(transformers, "Qwen2VLVideoProcessor", FakeVideoProcessor)
+    monkeypatch.setattr(transformers, "WhisperFeatureExtractor", FakeFeatureExtractor)
+
+    shim = _Qwen35ProcessorShim.from_pretrained(
+        "/models/qwen35",
+        trust_remote_code=True,
+        local_files_only=True,
+        revision="ignored",
+    )
+
+    assert shim.video_processor.model_dir == "/models/qwen35"
+    assert shim.video_processor.patch_size == 16
+    assert shim.video_processor.kwargs == {
+        "trust_remote_code": True,
+        "local_files_only": True,
+    }
+
+
+def test_qwen_video_reader_output_accepts_optional_metadata():
+    video = torch.zeros(2, 3, 16, 16)
+
+    old_video, old_fps = video_preprocessing._unpack_qwen_video_reader_output(
+        (video, 2.0)
+    )
+    new_video, new_fps = video_preprocessing._unpack_qwen_video_reader_output(
+        (video, {"frames_indices": [0, 1]}, 2.0)
+    )
+
+    assert old_video is video
+    assert new_video is video
+    assert old_fps == 2.0
+    assert new_fps == 2.0
+
+
 def test_qwen35_audio_cache_context_distinguishes_video_audio_order():
     explicit_then_video = qwen3_preprocessor._contextualize_cache_key(
         "audio:explicit|video:clip",
@@ -210,6 +655,95 @@ def test_qwen35_audio_cache_context_distinguishes_video_audio_order():
     assert "audio_is_dependent=(False, True)" in explicit_then_video
     assert "audio_is_dependent=(True, False)" in video_then_explicit
     assert "use_audio_in_video=(False, True)" in per_video_flags
+
+
+def test_qwen35_preprocessor_emits_video_item_cache_keys(monkeypatch):
+    obj = _new_preprocessor_for_unit()
+
+    async def fake_ensure_video_list_async(videos, **kwargs):
+        del kwargs
+        assert videos == ["chunk-1.mp4", "chunk-2.mp4"]
+        return [torch.zeros(1), torch.zeros(1)], [1.5, 3.0], [None, None]
+
+    monkeypatch.setattr(
+        qwen3_preprocessor,
+        "ensure_video_list_async",
+        fake_ensure_video_list_async,
+    )
+    payload = StagePayload(
+        request_id="req-video-item-cache",
+        request=OmniRequest(
+            inputs={
+                "prompt": "watch",
+                "videos": ["chunk-1.mp4", "chunk-2.mp4"],
+                "video_max_frames": 128,
+            },
+            params={"max_tokens": 8},
+        ),
+        data={},
+    )
+
+    result = asyncio.run(obj._call_impl(payload))
+
+    image_inputs = result.data["encoder_inputs"]["image_encoder"]
+    item_keys = image_inputs["video_item_cache_keys"]
+    assert len(item_keys) == 2
+    assert item_keys[0] != item_keys[1]
+    assert "fps=(1.5,)" in item_keys[0]
+    assert "fps=(3.0,)" in item_keys[1]
+    assert "max_frames=128" in item_keys[0]
+    assert image_inputs["video_grid_thw"].tolist() == [[1, 1, 2], [1, 1, 3]]
+
+
+def test_qwen35_preprocessor_can_omit_seen_video_item_pixels(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS", "1")
+    obj = _new_preprocessor_for_unit()
+
+    async def fake_ensure_video_list_async(videos, **kwargs):
+        del kwargs
+        return [torch.zeros(1) for _ in videos], [1.0 for _ in videos], []
+
+    monkeypatch.setattr(
+        qwen3_preprocessor,
+        "ensure_video_list_async",
+        fake_ensure_video_list_async,
+    )
+
+    first = asyncio.run(
+        obj._call_impl(
+            StagePayload(
+                request_id="req-video-payload-cache-1",
+                request=OmniRequest(
+                    inputs={"prompt": "watch", "videos": ["chunk-1.mp4"]},
+                    params={"max_tokens": 8},
+                ),
+                data={},
+            )
+        )
+    )
+    first_inputs = first.data["encoder_inputs"]["image_encoder"]
+    assert "video_item_pixel_present" not in first_inputs
+    assert first_inputs["pixel_values_videos"].shape[0] == 2
+
+    second = asyncio.run(
+        obj._call_impl(
+            StagePayload(
+                request_id="req-video-payload-cache-2",
+                request=OmniRequest(
+                    inputs={
+                        "prompt": "watch",
+                        "videos": ["chunk-1.mp4", "chunk-2.mp4"],
+                    },
+                    params={"max_tokens": 8},
+                ),
+                data={},
+            )
+        )
+    )
+    second_inputs = second.data["encoder_inputs"]["image_encoder"]
+    assert second_inputs["video_item_pixel_present"] == [False, True]
+    assert second_inputs["video_grid_thw"].tolist() == [[1, 1, 2], [1, 1, 3]]
+    assert second_inputs["pixel_values_videos"].shape[0] == 3
 
 
 def test_qwen_preprocessor_media_input_helpers_are_tensor_safe():
@@ -506,81 +1040,114 @@ def test_qwen_preprocessor_resolves_openai_max_tokens_for_context_check():
 def test_qwen35_preprocessor_requires_explicit_audio_in_video_for_video_inputs():
     obj = object.__new__(Qwen35OmniPreprocessor)
 
-    assert obj._resolve_use_audio_in_video(
-        {"videos": ["clip.mp4"]},
-        ["clip.mp4"],
-    ) is None
-    assert obj._resolve_use_audio_in_video(
-        {
-            "videos": ["clip.mp4"],
-            "use_audio_in_video": True,
-        },
-        ["clip.mp4"],
-    ) is True
-    assert obj._resolve_use_audio_in_video(
-        {
-            "videos": ["clip.mp4"],
-            "use_audio_in_video": False,
-        },
-        ["clip.mp4"],
-    ) is False
-    assert obj._resolve_use_audio_in_video(
-        {
-            "videos": ["clip.mp4"],
-            "use_audio_in_video": "false",
-        },
-        ["clip.mp4"],
-    ) is False
-    assert obj._resolve_use_audio_in_video(
-        {
-            "videos": ["clip.mp4"],
-            "dependent_audio": [0],
-        },
-        ["clip.mp4"],
-    ) is True
-    assert obj._resolve_use_audio_in_video(
-        {
-            "videos": ["clip.mp4"],
-            "dependent_audio": [],
-        },
-        ["clip.mp4"],
-    ) is None
-    assert obj._resolve_use_audio_in_video(
-        {
-            "videos": ["clip.mp4"],
-            "dependent_audio": [False, False],
-        },
-        ["clip.mp4"],
-    ) is None
-    assert obj._resolve_use_audio_in_video(
-        {
-            "videos": ["clip.mp4"],
-            "dependent_audio": True,
-        },
-        ["clip.mp4"],
-    ) is True
-    assert obj._resolve_use_audio_in_video(
-        {
-            "videos": ["clip.mp4"],
-            "dependent_audio": "false",
-        },
-        ["clip.mp4"],
-    ) is None
-    assert obj._resolve_use_audio_in_video(
-        {
-            "videos": ["clip.mp4"],
-            "dependent_audio": "0",
-        },
-        ["clip.mp4"],
-    ) is True
-    assert obj._resolve_use_audio_in_video(
-        {
-            "videos": ["clip.mp4"],
-            "use_audio_in_video": False,
-            "dependent_audio": [0],
-        },
-        ["clip.mp4"],
-    ) is False
+    assert (
+        obj._resolve_use_audio_in_video(
+            {"videos": ["clip.mp4"]},
+            ["clip.mp4"],
+        )
+        is None
+    )
+    assert (
+        obj._resolve_use_audio_in_video(
+            {
+                "videos": ["clip.mp4"],
+                "use_audio_in_video": True,
+            },
+            ["clip.mp4"],
+        )
+        is True
+    )
+    assert (
+        obj._resolve_use_audio_in_video(
+            {
+                "videos": ["clip.mp4"],
+                "use_audio_in_video": False,
+            },
+            ["clip.mp4"],
+        )
+        is False
+    )
+    assert (
+        obj._resolve_use_audio_in_video(
+            {
+                "videos": ["clip.mp4"],
+                "use_audio_in_video": "false",
+            },
+            ["clip.mp4"],
+        )
+        is False
+    )
+    assert (
+        obj._resolve_use_audio_in_video(
+            {
+                "videos": ["clip.mp4"],
+                "dependent_audio": [0],
+            },
+            ["clip.mp4"],
+        )
+        is True
+    )
+    assert (
+        obj._resolve_use_audio_in_video(
+            {
+                "videos": ["clip.mp4"],
+                "dependent_audio": [],
+            },
+            ["clip.mp4"],
+        )
+        is None
+    )
+    assert (
+        obj._resolve_use_audio_in_video(
+            {
+                "videos": ["clip.mp4"],
+                "dependent_audio": [False, False],
+            },
+            ["clip.mp4"],
+        )
+        is None
+    )
+    assert (
+        obj._resolve_use_audio_in_video(
+            {
+                "videos": ["clip.mp4"],
+                "dependent_audio": True,
+            },
+            ["clip.mp4"],
+        )
+        is True
+    )
+    assert (
+        obj._resolve_use_audio_in_video(
+            {
+                "videos": ["clip.mp4"],
+                "dependent_audio": "false",
+            },
+            ["clip.mp4"],
+        )
+        is None
+    )
+    assert (
+        obj._resolve_use_audio_in_video(
+            {
+                "videos": ["clip.mp4"],
+                "dependent_audio": "0",
+            },
+            ["clip.mp4"],
+        )
+        is True
+    )
+    assert (
+        obj._resolve_use_audio_in_video(
+            {
+                "videos": ["clip.mp4"],
+                "use_audio_in_video": False,
+                "dependent_audio": [0],
+            },
+            ["clip.mp4"],
+        )
+        is False
+    )
     assert obj._resolve_use_audio_in_video({"messages": []}, None) is None
 
 
@@ -616,9 +1183,7 @@ def test_qwen35_preprocessor_keeps_audio_processor_defaults_for_partial_config(
     monkeypatch.setattr(
         preprocessor,
         "load_qwen35_thinker_config",
-        lambda path: SimpleNamespace(
-            audio_config=SimpleNamespace(downsample_times=3)
-        ),
+        lambda path: SimpleNamespace(audio_config=SimpleNamespace(downsample_times=3)),
     )
 
     assert obj._load_audio_processor_defaults() == {
@@ -853,8 +1418,14 @@ def test_qwen35_preprocessor_extracts_openai_multimodal_content_parts():
             "content": [
                 {"type": "text", "text": "describe"},
                 {"type": "image_url", "image_url": {"url": "https://a/img.png"}},
-                {"type": "input_audio", "input_audio": {"data": "abc", "format": "wav"}},
-                {"type": "input_video", "input_video": {"data": "def", "format": "mp4"}},
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "abc", "format": "wav"},
+                },
+                {
+                    "type": "input_video",
+                    "input_video": {"data": "def", "format": "mp4"},
+                },
             ],
         }
     ]
@@ -1008,7 +1579,10 @@ def test_qwen35_preprocessor_restores_openai_media_part_order():
                 {"type": "text", "text": "watch"},
                 {"type": "video", "video": "clip.mp4"},
                 {"type": "text", "text": "then listen"},
-                {"type": "input_audio", "input_audio": {"data": "abc", "format": "wav"}},
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "abc", "format": "wav"},
+                },
                 {"type": "image", "image": "frame.png"},
             ],
         }
@@ -1094,8 +1668,7 @@ def test_qwen35_preprocessor_lifts_openai_video_part_options():
         {
             "role": "user",
             "content": (
-                "describe"
-                f"{preprocessor._OPENAI_MEDIA_PLACEHOLDERS['video']}"
+                "describe" f"{preprocessor._OPENAI_MEDIA_PLACEHOLDERS['video']}"
             ),
         }
     ]
@@ -1133,8 +1706,7 @@ def test_qwen35_preprocessor_lifts_openai_image_part_options():
         {
             "role": "user",
             "content": (
-                "describe"
-                f"{preprocessor._OPENAI_MEDIA_PLACEHOLDERS['image']}"
+                "describe" f"{preprocessor._OPENAI_MEDIA_PLACEHOLDERS['image']}"
             ),
         }
     ]
@@ -1864,6 +2436,73 @@ def test_video_loader_uses_per_video_audio_extraction_flags():
     ]
     assert sampled_fps == [2.0, 2.0]
     assert audios == [None, "audio:https://example.test/b.mp4"]
+
+
+def test_video_loader_reuses_local_video_preprocess_cache(monkeypatch, tmp_path):
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"sample-video" * 2048)
+    video_preprocessing.clear_video_preprocess_cache()
+    monkeypatch.setenv("SGLANG_OMNI_VIDEO_PREPROCESS_CACHE_MAX_BYTES", "1048576")
+    calls = []
+
+    def fake_load_video_path(path, *args):
+        calls.append((path, args))
+        return torch.ones(1, 3, 2, 2), 2.5
+
+    monkeypatch.setattr(video_preprocessing, "load_video_path", fake_load_video_path)
+
+    async def _run():
+        first = await video_preprocessing.ensure_video_list_async(
+            str(video_path),
+            max_frames=8,
+        )
+        second = await video_preprocessing.ensure_video_list_async(
+            str(video_path),
+            max_frames=8,
+        )
+        different_params = await video_preprocessing.ensure_video_list_async(
+            str(video_path),
+            max_frames=9,
+        )
+        return first, second, different_params
+
+    first, second, different_params = asyncio.run(_run())
+
+    assert len(calls) == 2
+    assert first[0][0] is second[0][0]
+    assert first[1] == second[1] == [2.5]
+    assert different_params[0][0] is not first[0][0]
+    video_preprocessing.clear_video_preprocess_cache()
+
+
+def test_video_loader_coalesces_inflight_local_video_loads(monkeypatch, tmp_path):
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"sample-video" * 2048)
+    video_preprocessing.clear_video_preprocess_cache()
+    monkeypatch.setenv("SGLANG_OMNI_VIDEO_PREPROCESS_CACHE_MAX_BYTES", "1048576")
+    calls = []
+
+    def fake_load_video_path(path, *args):
+        import time
+
+        calls.append((path, args))
+        time.sleep(0.05)
+        return torch.ones(1, 3, 2, 2), 3.0
+
+    monkeypatch.setattr(video_preprocessing, "load_video_path", fake_load_video_path)
+
+    async def _run():
+        return await asyncio.gather(
+            video_preprocessing.ensure_video_list_async(str(video_path)),
+            video_preprocessing.ensure_video_list_async(str(video_path)),
+        )
+
+    first, second = asyncio.run(_run())
+
+    assert len(calls) == 1
+    assert first[0][0] is second[0][0]
+    assert first[1] == second[1] == [3.0]
+    video_preprocessing.clear_video_preprocess_cache()
 
 
 def test_qwen35_preprocessor_detects_tensor_video_without_bool_error():

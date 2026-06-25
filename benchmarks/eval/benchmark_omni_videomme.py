@@ -118,6 +118,7 @@ class VideoEvalConfig:
     video_total_pixels: int | None = None
     output_dir: str | None = None
     max_concurrency: int = 1
+    sample_offset: int = 0
     warmup: int = 0
     request_rate: float = float("inf")
     timeout_s: int = 300
@@ -128,6 +129,7 @@ class VideoEvalConfig:
     audio_voice: str | None = None
     audio_language: str | None = None
     stream: bool = False
+    skip_wer: bool = False
     asr_device: str = "cuda:0"
     asr_concurrency: int = DEFAULT_ASR_TRANSCRIBE_CONCURRENCY
     lang: str = "en"
@@ -157,6 +159,7 @@ async def run_video_eval(
             repo_id=config.repo_id,
             split=config.split,
             max_samples=config.max_samples,
+            sample_offset=config.sample_offset,
         )
     logger.info("Prepared %d %s samples", len(samples), task_label)
     audio_output_dir = None
@@ -205,6 +208,7 @@ async def run_video_eval(
             "repo_id": config.repo_id,
             "split": config.split,
             "max_samples": config.max_samples,
+            "sample_offset": config.sample_offset,
             "max_tokens": config.max_tokens,
             "temperature": config.temperature,
             "video_fps": config.video_fps,
@@ -219,13 +223,14 @@ async def run_video_eval(
             "audio_voice": config.audio_voice,
             "audio_language": config.audio_language,
             "stream": config.stream,
+            "skip_wer": config.skip_wer,
             "asr_device": config.asr_device,
             "asr_concurrency": config.asr_concurrency,
             "lang": config.lang,
         },
         "per_sample": per_sample,
     }
-    if config.enable_audio and compute_wer:
+    if config.enable_audio and compute_wer and not config.skip_wer:
         results["wer"] = compute_text_audio_consistency(
             request_results,
             config.lang,
@@ -257,6 +262,7 @@ def video_eval_config_from_args(args: argparse.Namespace) -> VideoEvalConfig:
         video_total_pixels=args.video_total_pixels,
         output_dir=args.output_dir,
         max_concurrency=args.max_concurrency,
+        sample_offset=args.sample_offset,
         warmup=args.warmup,
         request_rate=args.request_rate,
         disable_tqdm=args.disable_tqdm,
@@ -266,6 +272,7 @@ def video_eval_config_from_args(args: argparse.Namespace) -> VideoEvalConfig:
         audio_voice=args.audio_voice,
         audio_language=args.audio_language,
         stream=args.stream,
+        skip_wer=args.skip_wer,
         asr_device=args.asr_device,
         asr_concurrency=args.asr_concurrency,
         lang=args.lang,
@@ -285,6 +292,15 @@ def add_video_eval_args(parser: argparse.ArgumentParser, *, repo_help: str) -> N
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument(
+        "--sample-offset",
+        type=int,
+        default=0,
+        help=(
+            "Skip this many valid samples before applying --max-samples. "
+            "Useful for non-overlapping warmup/evaluation slices."
+        ),
+    )
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--video-fps", type=float, default=None)
@@ -331,6 +347,14 @@ def add_video_eval_args(parser: argparse.ArgumentParser, *, repo_help: str) -> N
         help=(
             "Use streaming chat completions. With --enable-audio this records "
             "time-to-first-audio-chunk (TTFC), text TTFT, and audio ITL."
+        ),
+    )
+    parser.add_argument(
+        "--skip-wer",
+        action="store_true",
+        help=(
+            "Skip Whisper transcription when --enable-audio is used. This is "
+            "useful for pure serving performance sweeps and profiler runs."
         ),
     )
     parser.add_argument(

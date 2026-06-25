@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
+import os
 import types
 from typing import Any
 
@@ -24,6 +25,7 @@ from sglang_omni.utils import instantiate_module
 
 logger = logging.getLogger(__name__)
 
+_IMAGE_ENCODER_TORCH_COMPILE_ENV = "SGLANG_OMNI_IMAGE_ENCODER_TORCH_COMPILE"
 VISUAL_PREFIX = ("thinker.visual.", "visual.")
 _MODELING_MODULE_CANDIDATES = (
     "transformers.models.qwen3_omni_next.modeling_qwen3_omni_next",
@@ -63,6 +65,11 @@ def _module_dtype(module: nn.Module) -> torch.dtype:
         return dtype
     param = next(module.parameters(), None)
     return param.dtype if param is not None else torch.bfloat16
+
+
+def _image_encoder_torch_compile_enabled() -> bool:
+    value = os.getenv(_IMAGE_ENCODER_TORCH_COMPILE_ENV, "")
+    return value.lower() not in ("", "0", "false", "no", "off")
 
 
 def _patch_embed_forward(self: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -302,6 +309,10 @@ class Qwen35OmniImageEncoder(nn.Module):
         self.deepstack_layers = len(
             getattr(vision_cfg, "deepstack_visual_indexes", []) or []
         )
+        self._compiled_visual = None
+        if _image_encoder_torch_compile_enabled():
+            self._compiled_visual = torch.compile(self._visual_forward)
+            logger.info("Qwen3.5 image encoder visual forward torch.compile enabled")
 
     @property
     def visual_dtype_bytes(self) -> int:
@@ -315,7 +326,12 @@ class Qwen35OmniImageEncoder(nn.Module):
         grid_thw = grid_thw.to(self._device, dtype=torch.long)
         visual_dtype = _module_dtype(self.visual)
         pixel_values = pixel_values.to(device=self._device, dtype=visual_dtype)
-        outputs = _call_visual(self.visual, pixel_values, grid_thw)
+        with torch.inference_mode():
+            visual_forward = getattr(self, "_compiled_visual", None)
+            if visual_forward is None:
+                outputs = self._visual_forward(pixel_values, grid_thw)
+            else:
+                outputs = visual_forward(pixel_values, grid_thw)
         embeds, multiscale = _split_visual_output(outputs)
         embeds, multiscale = _split_packed_deepstack_output(
             embeds,
@@ -325,6 +341,13 @@ class Qwen35OmniImageEncoder(nn.Module):
         )
         token_counts = grid_thw.prod(-1) // (self.spatial_merge_size**2)
         return embeds, multiscale, token_counts.to(device=self._device)
+
+    def _visual_forward(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> Any:
+        return _call_visual(self.visual, pixel_values, grid_thw)
 
     def forward(
         self,

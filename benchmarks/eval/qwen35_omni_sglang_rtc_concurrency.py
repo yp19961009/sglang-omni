@@ -1,0 +1,548 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Run concurrent SGLang Qwen3.5-Omni RTC-style sessions.
+
+Each session mirrors the vLLM RTC client shape: pre_run trunk 1..T to warm
+prefix/MM caches, then one measured actual_run at trunk T.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import statistics
+import time
+import traceback
+import uuid
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
+
+import aiohttp
+
+from benchmarks.eval.qwen35_omni_sglang_rtc_profile import (
+    _apply_video_request_options,
+    make_rtc_messages,
+    post_chat,
+)
+
+
+def _percentile(values: list[float], pct: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    idx = int(round((len(ordered) - 1) * pct / 100.0))
+    return ordered[max(0, min(idx, len(ordered) - 1))]
+
+
+def _mean(values: list[float]) -> float | None:
+    return statistics.fmean(values) if values else None
+
+
+def _compact_error(exc: BaseException) -> str:
+    return "".join(traceback.format_exception_only(type(exc), exc)).strip()
+
+
+def _is_pure_bang_text(text: str | None) -> bool:
+    stripped = (text or "").strip()
+    return bool(stripped) and set(stripped) <= {"!"}
+
+
+def _session_offsets(args: argparse.Namespace, sample_idx: int) -> dict[str, int]:
+    return {
+        "batch_idx": sample_idx % args.num_batches,
+        "sil_start_idx": (args.sil_offset + sample_idx) * args.trunk_size,
+        "video_start_idx": (
+            (args.sil_offset + sample_idx) * args.trunk_size * args.video_fps
+            if not args.audio_only
+            else 0
+        ),
+        "question_idx": args.question_offset + sample_idx,
+    }
+
+
+def _session_context(
+    args: argparse.Namespace, out_dir: Path, sample_idx: int
+) -> dict[str, Any]:
+    request_id = f"sg_c{args.concurrency}_s{sample_idx:03d}_{uuid.uuid4()}"
+    sample_dir = out_dir / f"sample_{sample_idx:02d}"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "sample_idx": sample_idx,
+        "request_id": request_id,
+        "media_cache_namespace": f"rtc:{request_id}",
+        "offsets": _session_offsets(args, sample_idx),
+        "sample_dir": sample_dir,
+    }
+
+
+async def _run_preruns(
+    *,
+    session: aiohttp.ClientSession,
+    args: argparse.Namespace,
+    api_url: str,
+    context: dict[str, Any],
+) -> list[float]:
+    request_id = context["request_id"]
+    media_cache_namespace = context["media_cache_namespace"]
+    offsets = context["offsets"]
+    pre_run_times: list[float] = []
+    for trunk in range(1, args.trunk_size + 1):
+        messages = make_rtc_messages(
+            test_dir=Path(args.rtc_test_dir),
+            trunk_size=trunk,
+            batch_idx=offsets["batch_idx"],
+            pre_run=True,
+            audio_only=args.audio_only,
+            video_fps=args.video_fps,
+            max_chunks_per_turn=args.max_chunks_per_turn,
+            sil_start_idx=offsets["sil_start_idx"],
+            video_start_idx=offsets["video_start_idx"],
+            question_idx=offsets["question_idx"],
+            visual_mode=args.visual_mode,
+        )
+        payload: dict[str, Any] = {
+            "model": args.model,
+            "messages": messages,
+            "modalities": ["text"],
+            "max_tokens": args.prerun_max_tokens,
+            "temperature": args.temperature,
+            "stream": False,
+            "video_fps": args.video_fps,
+            "metadata": {
+                "request_id": f"__pr__{request_id}_t{trunk}",
+                "media_cache_namespace": media_cache_namespace,
+                "trunk_size": trunk,
+                "pre_run": True,
+            },
+        }
+        _apply_video_request_options(payload, args)
+        t0 = time.perf_counter()
+        await post_chat(session, api_url=api_url, payload=payload, stream=False)
+        pre_run_times.append((time.perf_counter() - t0) * 1000.0)
+    return pre_run_times
+
+
+async def _run_actual(
+    *,
+    session: aiohttp.ClientSession,
+    args: argparse.Namespace,
+    api_url: str,
+    context: dict[str, Any],
+    pre_run_times: list[float],
+) -> dict[str, Any]:
+    request_id = context["request_id"]
+    media_cache_namespace = context["media_cache_namespace"]
+    offsets = context["offsets"]
+    sample_idx = int(context["sample_idx"])
+    sample_dir = context["sample_dir"]
+
+    messages = make_rtc_messages(
+        test_dir=Path(args.rtc_test_dir),
+        trunk_size=args.trunk_size,
+        batch_idx=offsets["batch_idx"],
+        pre_run=False,
+        audio_only=args.audio_only,
+        video_fps=args.video_fps,
+        max_chunks_per_turn=args.max_chunks_per_turn,
+        sil_start_idx=offsets["sil_start_idx"],
+        video_start_idx=offsets["video_start_idx"],
+        question_idx=offsets["question_idx"],
+        visual_mode=args.visual_mode,
+    )
+    payload = {
+        "model": args.model,
+        "messages": messages,
+        "modalities": ["text"] if args.text_only else ["text", "audio"],
+        "max_tokens": args.max_tokens,
+        "temperature": args.temperature,
+        "stream": True,
+        "video_fps": args.video_fps,
+        "metadata": {
+            "request_id": request_id,
+            "media_cache_namespace": media_cache_namespace,
+            "trunk_size": args.trunk_size,
+            "pre_run": False,
+        },
+    }
+    if not args.text_only:
+        payload["audio"] = {"format": "wav", "voice": args.voice}
+    _apply_video_request_options(payload, args)
+
+    measured = await post_chat(
+        session,
+        api_url=api_url,
+        payload=payload,
+        stream=True,
+        output_wav=sample_dir / f"{request_id}.wav" if not args.text_only else None,
+    )
+    row = {
+        **asdict(measured),
+        "sample_idx": sample_idx,
+        "success": True,
+        "error": None,
+        "pre_run_total_ms": sum(pre_run_times),
+        "pre_run_avg_ms": _mean(pre_run_times),
+        "batch_idx": offsets["batch_idx"],
+        "sil_start_idx": offsets["sil_start_idx"],
+        "video_start_idx": offsets["video_start_idx"],
+        "question_idx": offsets["question_idx"],
+    }
+    (sample_dir / "result.json").write_text(
+        json.dumps(row, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return row
+
+
+async def _run_session(
+    *,
+    session: aiohttp.ClientSession,
+    args: argparse.Namespace,
+    api_url: str,
+    out_dir: Path,
+    sample_idx: int,
+) -> dict[str, Any]:
+    context = _session_context(args, out_dir, sample_idx)
+    pre_run_times = await _run_preruns(
+        session=session, args=args, api_url=api_url, context=context
+    )
+    if args.post_prerun_sleep_ms > 0:
+        await asyncio.sleep(args.post_prerun_sleep_ms / 1000.0)
+    return await _run_actual(
+        session=session,
+        args=args,
+        api_url=api_url,
+        context=context,
+        pre_run_times=pre_run_times,
+    )
+
+
+async def run(args: argparse.Namespace) -> dict[str, Any]:
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    api_url = args.base_url.rstrip("/") + "/v1/chat/completions"
+
+    rows: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    lock = asyncio.Lock()
+
+    async def actual_worker(
+        *,
+        session: aiohttp.ClientSession,
+        queue: asyncio.Queue[dict[str, Any] | None],
+        pre_run_by_sample: dict[int, list[float]],
+        worker_idx: int,
+    ) -> None:
+        if worker_idx and args.stagger_ms > 0:
+            await asyncio.sleep(worker_idx * args.stagger_ms / 1000.0)
+        while True:
+            context = await queue.get()
+            if context is None:
+                return
+            sample_idx = int(context["sample_idx"])
+            try:
+                row = await _run_actual(
+                    session=session,
+                    args=args,
+                    api_url=api_url,
+                    context=context,
+                    pre_run_times=pre_run_by_sample.get(sample_idx, []),
+                )
+                async with lock:
+                    rows.append(row)
+                    print(
+                        f"completed {len(rows)}/{args.total_samples} "
+                        f"sample={sample_idx}",
+                        flush=True,
+                    )
+            except Exception as exc:
+                err = {
+                    "sample_idx": sample_idx,
+                    "success": False,
+                    "error": _compact_error(exc),
+                }
+                async with lock:
+                    errors.append(err)
+                    print(f"failed sample={sample_idx}: {err['error']}", flush=True)
+
+    timeout = aiohttp.ClientTimeout(total=args.timeout_s)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        if args.serialize_prerun or args.barrier_prerun:
+            contexts = [
+                _session_context(args, out_dir, sample_idx)
+                for sample_idx in range(args.total_samples)
+            ]
+            pre_run_by_sample: dict[int, list[float]] = {}
+
+            pre_t0 = time.perf_counter()
+            if args.serialize_prerun:
+                for context in contexts:
+                    sample_idx = int(context["sample_idx"])
+                    pre_run_by_sample[sample_idx] = await _run_preruns(
+                        session=session,
+                        args=args,
+                        api_url=api_url,
+                        context=context,
+                    )
+                    print(
+                        f"prerun completed sample={sample_idx} "
+                        f"total_ms={sum(pre_run_by_sample[sample_idx]):.3f}",
+                        flush=True,
+                    )
+            else:
+                pre_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+                for context in contexts:
+                    pre_queue.put_nowait(context)
+                for _ in range(args.concurrency):
+                    pre_queue.put_nowait(None)
+
+                async def prerun_worker(worker_idx: int) -> None:
+                    if worker_idx and args.stagger_ms > 0:
+                        await asyncio.sleep(worker_idx * args.stagger_ms / 1000.0)
+                    while True:
+                        context = await pre_queue.get()
+                        if context is None:
+                            return
+                        sample_idx = int(context["sample_idx"])
+                        try:
+                            times = await _run_preruns(
+                                session=session,
+                                args=args,
+                                api_url=api_url,
+                                context=context,
+                            )
+                        except Exception as exc:
+                            err = {
+                                "sample_idx": sample_idx,
+                                "success": False,
+                                "error": _compact_error(exc),
+                            }
+                            async with lock:
+                                errors.append(err)
+                                print(
+                                    f"failed prerun sample={sample_idx}: "
+                                    f"{err['error']}",
+                                    flush=True,
+                                )
+                            continue
+                        async with lock:
+                            pre_run_by_sample[sample_idx] = times
+                            print(
+                                f"prerun completed {len(pre_run_by_sample)}/"
+                                f"{args.total_samples} sample={sample_idx} "
+                                f"total_ms={sum(times):.3f}",
+                                flush=True,
+                            )
+
+                await asyncio.gather(
+                    *(prerun_worker(i) for i in range(args.concurrency))
+                )
+            pre_elapsed_s = time.perf_counter() - pre_t0
+
+            queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+            for context in contexts:
+                if int(context["sample_idx"]) not in pre_run_by_sample:
+                    continue
+                queue.put_nowait(context)
+            for _ in range(args.concurrency):
+                queue.put_nowait(None)
+
+            t0 = time.perf_counter()
+            if args.post_prerun_sleep_ms > 0:
+                await asyncio.sleep(args.post_prerun_sleep_ms / 1000.0)
+            await asyncio.gather(
+                *(
+                    actual_worker(
+                        session=session,
+                        queue=queue,
+                        pre_run_by_sample=pre_run_by_sample,
+                        worker_idx=i,
+                    )
+                    for i in range(args.concurrency)
+                )
+            )
+            actual_elapsed_s = time.perf_counter() - t0
+            elapsed_s = pre_elapsed_s + actual_elapsed_s
+        else:
+            queue: asyncio.Queue[int | None] = asyncio.Queue()
+            for sample_idx in range(args.total_samples):
+                queue.put_nowait(sample_idx)
+            for _ in range(args.concurrency):
+                queue.put_nowait(None)
+
+            async def session_worker(worker_idx: int) -> None:
+                if worker_idx and args.stagger_ms > 0:
+                    await asyncio.sleep(worker_idx * args.stagger_ms / 1000.0)
+                while True:
+                    sample_idx = await queue.get()
+                    if sample_idx is None:
+                        return
+                    try:
+                        row = await _run_session(
+                            session=session,
+                            args=args,
+                            api_url=api_url,
+                            out_dir=out_dir,
+                            sample_idx=sample_idx,
+                        )
+                        async with lock:
+                            rows.append(row)
+                            print(
+                                f"completed {len(rows)}/{args.total_samples} "
+                                f"sample={sample_idx}",
+                                flush=True,
+                            )
+                    except Exception as exc:
+                        err = {
+                            "sample_idx": sample_idx,
+                            "success": False,
+                            "error": _compact_error(exc),
+                        }
+                        async with lock:
+                            errors.append(err)
+                            print(
+                                f"failed sample={sample_idx}: {err['error']}",
+                                flush=True,
+                            )
+
+            t0 = time.perf_counter()
+            await asyncio.gather(
+                *(session_worker(i) for i in range(args.concurrency))
+            )
+            elapsed_s = time.perf_counter() - t0
+            actual_elapsed_s = None
+
+    rows.sort(key=lambda item: int(item["sample_idx"]))
+    errors.sort(key=lambda item: int(item["sample_idx"]))
+    completed = len(rows)
+    failed = len(errors)
+    ttft = [float(row["ttft_ms"]) for row in rows if row.get("ttft_ms") is not None]
+    ttfa = [float(row["ttfa_ms"]) for row in rows if row.get("ttfa_ms") is not None]
+    e2e = [float(row["e2e_total_ms"]) for row in rows]
+    audio_dur = [
+        float(row["audio_duration_s"])
+        for row in rows
+        if row.get("audio_duration_s") is not None
+    ]
+    bang_sample_indices = [
+        int(row["sample_idx"]) for row in rows if _is_pure_bang_text(row.get("text"))
+    ]
+    metrics = {
+        "trunk_size": args.trunk_size,
+        "concurrency": args.concurrency,
+        "total_samples": args.total_samples,
+        "completed": completed,
+        "failed": failed,
+        "elapsed_s": elapsed_s,
+        "actual_elapsed_s": actual_elapsed_s,
+        "serialize_prerun": bool(args.serialize_prerun),
+        "barrier_prerun": bool(args.barrier_prerun),
+        "qps": completed / elapsed_s if elapsed_s > 0 else None,
+        "mode": "text" if args.text_only else "text_audio",
+        "max_tokens": args.max_tokens,
+        "prerun_max_tokens": args.prerun_max_tokens,
+        "bang_count": len(bang_sample_indices),
+        "bang_sample_indices": bang_sample_indices,
+        "ttft_avg_ms": _mean(ttft),
+        "ttft_p50_ms": _percentile(ttft, 50),
+        "ttft_p95_ms": _percentile(ttft, 95),
+        "ttft_p99_ms": _percentile(ttft, 99),
+        "ttfa_avg_ms": _mean(ttfa),
+        "ttfa_p50_ms": _percentile(ttfa, 50),
+        "ttfa_p95_ms": _percentile(ttfa, 95),
+        "ttfa_p99_ms": _percentile(ttfa, 99),
+        "e2e_avg_ms": _mean(e2e),
+        "e2e_p50_ms": _percentile(e2e, 50),
+        "e2e_p95_ms": _percentile(e2e, 95),
+        "e2e_p99_ms": _percentile(e2e, 99),
+        "audio_duration_avg_s": _mean(audio_dur),
+        "prompt_tokens_avg": _mean([float(row["prompt_tokens"]) for row in rows]),
+        "completion_tokens_avg": _mean(
+            [float(row["completion_tokens"]) for row in rows]
+        ),
+        "errors": errors,
+    }
+    (out_dir / "metrics.json").write_text(
+        json.dumps(metrics, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (out_dir / "per_request.json").write_text(
+        json.dumps(rows, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    if errors:
+        (out_dir / "errors.json").write_text(
+            json.dumps(errors, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    print(json.dumps(metrics, indent=2, ensure_ascii=False), flush=True)
+    return metrics
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-url", default="http://127.0.0.1:8161")
+    parser.add_argument("--model", default="qwen3_5-omni")
+    parser.add_argument("--rtc-test-dir", default="/myapp/data/share-data-6batch")
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--trunk-size", type=int, default=40)
+    parser.add_argument("--concurrency", type=int, default=12)
+    parser.add_argument("--total-samples", type=int, default=12)
+    parser.add_argument("--stagger-ms", type=int, default=300)
+    parser.add_argument("--num-batches", type=int, default=6)
+    parser.add_argument("--sil-offset", type=int, default=0)
+    parser.add_argument("--question-offset", type=int, default=0)
+    parser.add_argument("--video-fps", type=int, default=1)
+    parser.add_argument(
+        "--visual-mode",
+        choices=("image_frames", "video_frames"),
+        default="video_frames",
+    )
+    parser.add_argument("--video-max-frames", type=int, default=0)
+    parser.add_argument("--video-min-pixels", type=int, default=0)
+    parser.add_argument("--video-max-pixels", type=int, default=0)
+    parser.add_argument("--video-total-pixels", type=int, default=0)
+    parser.add_argument(
+        "--video-override-max-pixels",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--max-chunks-per-turn", type=int, default=6)
+    parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument("--prerun-max-tokens", type=int, default=0)
+    parser.add_argument("--post-prerun-sleep-ms", type=int, default=0)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--voice", default="f245")
+    parser.add_argument("--audio-only", action="store_true")
+    parser.add_argument("--text-only", action="store_true")
+    parser.add_argument(
+        "--serialize-prerun",
+        action="store_true",
+        help=(
+            "Run all RTC pre-run cache population requests serially, then launch "
+            "the measured actual requests at the requested concurrency."
+        ),
+    )
+    parser.add_argument(
+        "--barrier-prerun",
+        action="store_true",
+        help=(
+            "Run RTC pre-run cache population requests concurrently at the requested "
+            "concurrency, wait for all of them, then launch measured actual requests."
+        ),
+    )
+    parser.add_argument("--timeout-s", type=float, default=1800)
+    args = parser.parse_args()
+    if args.serialize_prerun and args.barrier_prerun:
+        parser.error("--serialize-prerun and --barrier-prerun are mutually exclusive")
+    return args
+
+
+def main() -> None:
+    asyncio.run(run(parse_args()))
+
+
+if __name__ == "__main__":
+    main()

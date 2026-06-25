@@ -45,6 +45,8 @@ class VideoMMERecord(TypedDict):
     task_type: str
     expected: str
     latency_s: float
+    engine_latency_s: float | None
+    prompt_build_s: float | None
     prompt_tokens: int
     completion_tokens: int
     output_token_rate: float | None
@@ -52,6 +54,8 @@ class VideoMMERecord(TypedDict):
     rtf: float | None
     audio_ttfp_s: float | None
     text_ttft_s: float | None
+    engine_audio_ttfp_s: float | None
+    engine_text_ttft_s: float | None
     audio_chunks: int
     inter_chunk_mean_s: float | None
     wav_path: str
@@ -266,6 +270,7 @@ async def _apply_chat_completion_stream_response(
     if first_text_at is not None:
         result.text_ttft_s = first_text_at - start_time
     result.inter_chunk_s = inter_chunk_s
+    result.audio_chunk_count = audio_chunks
     if audio_duration_s > 0:
         result.audio_duration_s = round(audio_duration_s, 4)
     if usage:
@@ -276,9 +281,9 @@ async def _apply_chat_completion_stream_response(
         result.error = "No audio chunks in streaming response"
         return False
     if audio_output_dir and full_audio_wav is None and delta_audio_chunks:
-        # 中文说明：sglang-omni 的 streaming chat audio 走 delta.audio，
-        # 每个 delta 是一个独立 WAV chunk。这里只在 WAV 参数一致时拼接
-        # PCM，保证 streaming benchmark 也能保存音频用于 WER/人工检查。
+        # Streaming chat audio arrives through delta.audio. Each delta is an
+        # independent WAV chunk; concatenate PCM only when WAV parameters match
+        # so streaming benchmarks can save audio for WER or manual checks.
         full_audio_wav = _combine_wav_chunks(delta_audio_chunks)
     if audio_output_dir and full_audio_wav is not None:
         try:
@@ -340,8 +345,7 @@ def make_video_send_fn(
 
         payload: dict[str, Any] = {
             "model": model_name,
-            # 中文说明：使用 OpenAI content parts，和服务端 chat
-            # completions 入口保持一致。
+            # Use OpenAI content parts to match the chat completions entrypoint.
             "messages": [{"role": "user", "content": content_parts}],
             "modalities": modalities,
             "max_tokens": max_tokens,
@@ -351,9 +355,8 @@ def make_video_send_fn(
         }
         if audio_output_dir:
             audio_config = {"format": audio_format}
-            # 中文说明：Qwen3.5-Omni talker 支持通过 OpenAI audio 字段
-            # 选择 voice/language。benchmark 只透传显式参数，默认行为仍和
-            # Qwen3-Omni 旧压测一致。
+            # Pass voice/language only when explicitly requested. Defaults stay
+            # owned by the model-specific OpenAI-compatible request path.
             if audio_voice:
                 audio_config["voice"] = audio_voice
             if audio_language:
@@ -434,6 +437,16 @@ def build_videomme_result_records(
             "task_type": sample.task_type,
             "expected": sample.answer,
             "latency_s": round(result.latency_s, 4),
+            "engine_latency_s": (
+                round(result.engine_latency_s, 4)
+                if getattr(result, "engine_latency_s", None) is not None
+                else None
+            ),
+            "prompt_build_s": (
+                round(result.prompt_build_s, 4)
+                if getattr(result, "prompt_build_s", None) is not None
+                else None
+            ),
             "prompt_tokens": result.prompt_tokens,
             "completion_tokens": result.completion_tokens,
             "output_token_rate": (
@@ -453,6 +466,16 @@ def build_videomme_result_records(
             "text_ttft_s": (
                 round(result.text_ttft_s, 4)
                 if getattr(result, "text_ttft_s", None) is not None
+                else None
+            ),
+            "engine_audio_ttfp_s": (
+                round(result.engine_audio_ttfp_s, 4)
+                if getattr(result, "engine_audio_ttfp_s", None) is not None
+                else None
+            ),
+            "engine_text_ttft_s": (
+                round(result.engine_text_ttft_s, 4)
+                if getattr(result, "engine_text_ttft_s", None) is not None
                 else None
             ),
             "audio_chunks": (

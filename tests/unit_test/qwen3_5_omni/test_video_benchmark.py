@@ -324,6 +324,8 @@ def test_qwen35_video_benchmark_cli_accepts_audio_request_config():
         [
             "--model",
             "qwen3.5-omni",
+            "--sample-offset",
+            "50",
             "--enable-audio",
             "--audio-format",
             "wav",
@@ -337,6 +339,7 @@ def test_qwen35_video_benchmark_cli_accepts_audio_request_config():
     config = video_eval_config_from_args(args)
 
     assert config.model == "qwen3.5-omni"
+    assert config.sample_offset == 50
     assert config.enable_audio is True
     assert config.audio_format == "wav"
     assert config.audio_voice == "Cherry"

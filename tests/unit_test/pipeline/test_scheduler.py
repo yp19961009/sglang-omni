@@ -10,12 +10,72 @@ import pytest
 import torch
 
 from sglang_omni.scheduling import omni_scheduler as omni_scheduler_module
-from sglang_omni.scheduling.messages import IncomingMessage
+from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.stage_cache import StageOutputCache
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
 from tests.unit_test.pipeline.helpers import run_scheduler
+
+
+def test_priority_first_stream_queue_promotes_first_stream_batch() -> None:
+    queue = omni_scheduler_module._PriorityFirstStreamQueue()
+
+    old_a = OutgoingMessage("old-a", "stream", data="old-a")
+    old_b = OutgoingMessage("old-b", "stream", data="old-b")
+    first_a = OutgoingMessage("new-a", "stream", data="first-a")
+    first_b = OutgoingMessage("new-b", "stream", data="first-b")
+    setattr(first_a, omni_scheduler_module._PRIORITY_MARKER_ATTR, True)
+    setattr(first_b, omni_scheduler_module._PRIORITY_MARKER_ATTR, True)
+
+    queue.put(old_a)
+    queue.put(old_b)
+    queue.put(first_a)
+    queue.put(first_b)
+
+    assert queue.get_nowait() is first_a
+    assert queue.get_nowait() is first_b
+    assert queue.get_nowait() is old_a
+    assert queue.get_nowait() is old_b
+
+
+def test_omni_scheduler_marks_first_emit_batch_as_priority(monkeypatch) -> None:
+    events: list[dict] = []
+    monkeypatch.setattr(
+        "sglang_omni.scheduling.omni_scheduler._emit_event",
+        lambda **kwargs: events.append(kwargs),
+    )
+
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.outbox = omni_scheduler_module._PriorityFirstStreamQueue()
+    scheduler._first_emit_done = set()
+
+    old = OutgoingMessage("old", "stream", data="old")
+    scheduler.outbox.put(old)
+
+    first_text = OutgoingMessage("req-new", "stream", data="text", target="decode")
+    first_aux = OutgoingMessage("req-new", "stream", data="aux", target="talker_ar")
+
+    def builder(_rid, _data, _output):
+        yield first_text
+        yield first_aux
+
+    scheduler._stream_output_builder = builder
+    sched_output = SimpleNamespace(
+        requests=[SimpleNamespace(request_id="req-new", data=object())],
+    )
+    mr_output = SimpleNamespace(outputs={"req-new": object()})
+
+    scheduler._emit_stream_output(sched_output, mr_output)
+
+    assert scheduler.outbox.get_nowait() is first_text
+    assert scheduler.outbox.get_nowait() is first_aux
+    assert scheduler.outbox.get_nowait() is old
+    assert scheduler._first_emit_done == {"req-new"}
+    assert [event["event_name"] for event in events] == [
+        "scheduler_first_emit",
+        "scheduler_first_stream_outbox_put",
+    ]
 
 
 def test_simple_scheduler_batch_and_error_contracts() -> None:

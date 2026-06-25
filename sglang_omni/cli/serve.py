@@ -803,6 +803,10 @@ def apply_ar_server_args_cli_overrides(
     talker_dtype: str | None = None,
     mamba_ssm_dtype: str | None = None,
     max_prefill_tokens: int | None = None,
+    max_mamba_cache_size: int | None = None,
+    thinker_max_mamba_cache_size: int | None = None,
+    talker_max_mamba_cache_size: int | None = None,
+    mamba_full_memory_ratio: float | None = None,
     page_size: int | None = None,
 ) -> PipelineConfig:
     prefix_mode = _normalize_stage_toggle_mode("prefix_caching", prefix_caching)
@@ -838,6 +842,26 @@ def apply_ar_server_args_cli_overrides(
             "--mamba-ssm-dtype",
             mamba_ssm_dtype,
         )
+    max_mamba_cache_size = _validate_positive_int(
+        "--max-mamba-cache-size",
+        max_mamba_cache_size,
+    )
+    if max_mamba_cache_size is not None:
+        shared_updates["max_mamba_cache_size"] = max_mamba_cache_size
+    thinker_max_mamba_cache_size = _validate_positive_int(
+        "--thinker-max-mamba-cache-size",
+        thinker_max_mamba_cache_size,
+    )
+    talker_max_mamba_cache_size = _validate_positive_int(
+        "--talker-max-mamba-cache-size",
+        talker_max_mamba_cache_size,
+    )
+    mamba_full_memory_ratio = _validate_unit_interval_float(
+        "--mamba-full-memory-ratio",
+        mamba_full_memory_ratio,
+    )
+    if mamba_full_memory_ratio is not None:
+        shared_updates["mamba_full_memory_ratio"] = mamba_full_memory_ratio
     page_size = _validate_positive_int("--page-size", page_size)
     if page_size is not None:
         shared_updates["page_size"] = page_size
@@ -859,6 +883,26 @@ def apply_ar_server_args_cli_overrides(
                 updates=shared_updates,
                 reason="AR ServerArgs override",
             )
+
+    if thinker_max_mamba_cache_size is not None:
+        _apply_stage_server_args_override(
+            pipeline_config,
+            stage_name="thinker",
+            updates={"max_mamba_cache_size": thinker_max_mamba_cache_size},
+            reason="thinker max_mamba_cache_size override",
+        )
+    if talker_max_mamba_cache_size is not None:
+        talker_stage = type(pipeline_config).talker_sglang_role_to_stage().get(
+            "talker"
+        )
+        if talker_stage is None:
+            _raise_unsupported_flag(pipeline_config, "--talker-max-mamba-cache-size")
+        _apply_stage_server_args_override(
+            pipeline_config,
+            stage_name=talker_stage,
+            updates={"max_mamba_cache_size": talker_max_mamba_cache_size},
+            reason="talker max_mamba_cache_size override",
+        )
 
     if thinker_dtype is not None:
         _apply_stage_server_args_override(
@@ -1041,10 +1085,16 @@ def apply_partial_start_cli_overrides(
     pipeline_config: PipelineConfig,
     *,
     talker_partial_start: str,
+    talker_partial_start_min_chunks: int | None = None,
 ) -> PipelineConfig:
     mode = _normalize_stage_toggle_mode("talker_partial_start", talker_partial_start)
-    if mode == "default":
+    if mode == "default" and talker_partial_start_min_chunks is None:
         return pipeline_config
+    if (
+        talker_partial_start_min_chunks is not None
+        and int(talker_partial_start_min_chunks) < 3
+    ):
+        raise typer.BadParameter("--talker-partial-start-min-chunks must be >= 3")
     stage_name = _resolve_talker_stage(
         pipeline_config,
         flag_name="--talker-partial-start",
@@ -1060,12 +1110,17 @@ def apply_partial_start_cli_overrides(
                 "--talker-partial-start currently supports only Qwen Omni "
                 f"talker; stage {stage.name!r} uses factory {stage.factory!r}"
             )
+    updates: dict[str, object] = {}
+    if mode != "default":
+        updates["enable_partial_start"] = mode == "on"
+    if talker_partial_start_min_chunks is not None:
+        updates["partial_start_min_chunks"] = int(talker_partial_start_min_chunks)
     _apply_stage_factory_args_override(
         pipeline_config,
         stage_name=stage_name,
-        updates={"enable_partial_start": mode == "on"},
-        reason=f"talker partial-start mode to {mode!r}",
-        flag_name="--talker-partial-start",
+        updates=updates,
+        reason="talker partial-start override",
+        flag_name="--talker-partial-start/--talker-partial-start-min-chunks",
     )
     return pipeline_config
 
@@ -1144,6 +1199,18 @@ def _validate_positive_float(flag_name: str, value: float | None) -> float | Non
     if float(value) <= 0:
         raise typer.BadParameter(f"{flag_name} must be > 0")
     return float(value)
+
+
+def _validate_unit_interval_float(
+    flag_name: str,
+    value: float | None,
+) -> float | None:
+    if value is None:
+        return None
+    value = float(value)
+    if not 0.0 < value <= 1.0:
+        raise typer.BadParameter(f"{flag_name} must be in (0, 1], got {value}")
+    return value
 
 
 def _parse_limit_mm_per_prompt(
@@ -2010,6 +2077,44 @@ def serve(
             ),
         ),
     ] = None,
+    max_mamba_cache_size: Annotated[
+        int | None,
+        typer.Option(
+            "--max-mamba-cache-size",
+            "--max_mamba_cache_size",
+            help="Set SGLang max_mamba_cache_size for supported AR stages.",
+        ),
+    ] = None,
+    thinker_max_mamba_cache_size: Annotated[
+        int | None,
+        typer.Option(
+            "--thinker-max-mamba-cache-size",
+            "--thinker_max_mamba_cache_size",
+            help=(
+                "Set SGLang max_mamba_cache_size for the thinker stage. "
+                "Overrides --max-mamba-cache-size for thinker."
+            ),
+        ),
+    ] = None,
+    talker_max_mamba_cache_size: Annotated[
+        int | None,
+        typer.Option(
+            "--talker-max-mamba-cache-size",
+            "--talker_max_mamba_cache_size",
+            help=(
+                "Set SGLang max_mamba_cache_size for supported talker AR stage. "
+                "Overrides --max-mamba-cache-size for talker."
+            ),
+        ),
+    ] = None,
+    mamba_full_memory_ratio: Annotated[
+        float | None,
+        typer.Option(
+            "--mamba-full-memory-ratio",
+            "--mamba_full_memory_ratio",
+            help="Set SGLang mamba_full_memory_ratio for supported AR stages.",
+        ),
+    ] = None,
     page_size: Annotated[
         int | None,
         typer.Option(
@@ -2424,6 +2529,18 @@ def serve(
             ),
         ),
     ] = "default",
+    talker_partial_start_min_chunks: Annotated[
+        int | None,
+        typer.Option(
+            "--talker-partial-start-min-chunks",
+            "--talker_partial_start_min_chunks",
+            help=(
+                "Minimum thinker stream chunks required before the Qwen Omni "
+                "talker partial-start request is built. The minimum supported "
+                "value is 3."
+            ),
+        ),
+    ] = None,
     thinker_torch_compile: Annotated[
         str,
         typer.Option(
@@ -2867,6 +2984,10 @@ def serve(
         talker_dtype=talker_dtype,
         mamba_ssm_dtype=mamba_ssm_dtype,
         max_prefill_tokens=max_prefill_tokens,
+        max_mamba_cache_size=max_mamba_cache_size,
+        thinker_max_mamba_cache_size=thinker_max_mamba_cache_size,
+        talker_max_mamba_cache_size=talker_max_mamba_cache_size,
+        mamba_full_memory_ratio=mamba_full_memory_ratio,
         page_size=page_size,
     )
     merged_config = apply_torch_compile_cli_overrides(
@@ -2923,6 +3044,7 @@ def serve(
     merged_config = apply_partial_start_cli_overrides(
         merged_config,
         talker_partial_start=talker_partial_start,
+        talker_partial_start_min_chunks=talker_partial_start_min_chunks,
     )
 
     if preflight:

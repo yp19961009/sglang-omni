@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -34,9 +35,22 @@ DECODE_STAGE = "decode"
 TALKER_STAGE = "talker_ar"
 CODE2WAV_STAGE = "code2wav"
 MM_AGGREGATE_STAGE = "mm_aggregate"
+_INLINE_CPU_STREAM_CHUNK_MAX_BYTES_ENV = (
+    "SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES"
+)
 
 # Note(Chenchen Hong): PyTorch sampling_seed must fit a positive int32.
 MAX_INT32_POSITIVE = 0x7FFFFFFF
+
+
+def _inline_cpu_stream_chunks_enabled() -> bool:
+    raw = os.getenv(_INLINE_CPU_STREAM_CHUNK_MAX_BYTES_ENV)
+    if raw is None or raw == "":
+        return False
+    try:
+        return int(raw) > 0
+    except ValueError:
+        return False
 
 _MEDIA_MODEL_INPUT_KEYS = (
     "audio_embeds",
@@ -114,6 +128,19 @@ def _input_embeds_radix_extra_key(prefix: str, request_id: str, embeds: Any) -> 
     return f"{prefix}:{request_id}:{id(embeds):x}"
 
 
+def _media_cache_radix_extra_key(media_cache_keys: dict[str, Any]) -> str | None:
+    if not media_cache_keys:
+        return None
+    parts = [
+        f"{modality}={media_cache_keys[modality]}"
+        for modality in sorted(media_cache_keys)
+        if media_cache_keys.get(modality) is not None
+    ]
+    if not parts:
+        return None
+    return "media-cache:" + "|".join(parts)
+
+
 def _install_prefix_cache_limit_patch(Req: Any) -> None:
     if getattr(Req, "_omni_prefix_cache_limit_patched", False):
         return
@@ -130,9 +157,7 @@ def _install_prefix_cache_limit_patch(Req: Any) -> None:
             try:
                 self.return_logprob = True
                 if old_return_logprob and old_logprob_start_len >= 0:
-                    self.logprob_start_len = min(
-                        int(old_logprob_start_len), int(limit)
-                    )
+                    self.logprob_start_len = min(int(old_logprob_start_len), int(limit))
                 else:
                     self.logprob_start_len = int(limit)
                 result = original(self, tree_cache)
@@ -144,6 +169,32 @@ def _install_prefix_cache_limit_patch(Req: Any) -> None:
     Req._omni_original_init_next_round_input = original
     Req.init_next_round_input = _init_next_round_input_with_omni_limit
     Req._omni_prefix_cache_limit_patched = True
+
+
+def _install_mamba_branching_hint_patch(Req: Any) -> None:
+    if getattr(Req, "_omni_mamba_branching_hint_patched", False):
+        return
+
+    original = Req.init_next_round_input
+
+    def _init_next_round_input_with_omni_mamba_hint(self, tree_cache=None):
+        result = original(self, tree_cache)
+        hint = getattr(self, "_omni_mamba_branching_seqlen", None)
+        if hint is None or getattr(self, "mamba_branching_seqlen", None) is not None:
+            return result
+        try:
+            hint = int(hint)
+        except (TypeError, ValueError):
+            return result
+        prefix_indices = getattr(self, "prefix_indices", None)
+        prefix_len = len(prefix_indices) if prefix_indices is not None else 0
+        if hint > prefix_len:
+            self.mamba_branching_seqlen = hint
+        return result
+
+    Req._omni_original_init_next_round_input_for_mamba_hint = original
+    Req.init_next_round_input = _init_next_round_input_with_omni_mamba_hint
+    Req._omni_mamba_branching_hint_patched = True
 
 
 def _first_multimodal_token_index(
@@ -169,6 +220,89 @@ def _first_multimodal_token_index(
             continue
         first_index = index if first_index is None else min(first_index, index)
     return first_index
+
+
+def _first_modality_token_index(
+    input_ids: list[int],
+    *,
+    modality: str,
+    model_inputs: dict[str, Any],
+    thinker_config: Any,
+    pad_values: dict[str, int],
+) -> int | None:
+    if not _has_modality_model_inputs(model_inputs, modality):
+        return None
+    token_id = pad_values.get(
+        modality, getattr(thinker_config, f"{modality}_token_id", None)
+    )
+    if token_id is None:
+        return None
+    try:
+        return input_ids.index(int(token_id))
+    except ValueError:
+        return None
+
+
+def _mamba_branching_chunk_size() -> int | None:
+    try:
+        from sglang.srt.layers.attention.fla.chunk_delta_h import (
+            CHUNK_SIZE as fla_chunk_size,
+        )
+    except Exception:
+        return None
+    try:
+        chunk_size = int(fla_chunk_size)
+    except (TypeError, ValueError):
+        return None
+    return chunk_size if chunk_size > 0 else None
+
+
+def _media_mamba_branching_seqlen(
+    input_ids: list[int],
+    model_inputs: dict[str, Any],
+    thinker_config: Any,
+    pad_values: dict[str, int],
+) -> int | None:
+    """Aligned visual-prefix boundary for hybrid-SSM prefix cache reuse."""
+
+    first_audio = _first_modality_token_index(
+        input_ids,
+        modality="audio",
+        model_inputs=model_inputs,
+        thinker_config=thinker_config,
+        pad_values=pad_values,
+    )
+    if first_audio is None:
+        return None
+
+    visual_indices = [
+        idx
+        for idx in (
+            _first_modality_token_index(
+                input_ids,
+                modality="image",
+                model_inputs=model_inputs,
+                thinker_config=thinker_config,
+                pad_values=pad_values,
+            ),
+            _first_modality_token_index(
+                input_ids,
+                modality="video",
+                model_inputs=model_inputs,
+                thinker_config=thinker_config,
+                pad_values=pad_values,
+            ),
+        )
+        if idx is not None
+    ]
+    if not visual_indices or min(visual_indices) >= first_audio:
+        return None
+
+    chunk_size = _mamba_branching_chunk_size()
+    if chunk_size is None:
+        return None
+    aligned = first_audio // chunk_size * chunk_size
+    return aligned if aligned > 0 else None
 
 
 def output_modalities(request: OmniRequest | None) -> set[str] | None:
@@ -300,6 +434,8 @@ class EncoderRequestData:
     model_inputs: dict[str, Any]
     cache_key: str | None = None
     skip_result: dict[str, Any] | None = None
+    item_cache_keys: dict[str, tuple[str | None, ...]] = field(default_factory=dict)
+    item_pixel_present: dict[str, tuple[bool, ...]] = field(default_factory=dict)
 
 
 def build_encoder_request(
@@ -315,12 +451,44 @@ def build_encoder_request(
             skip_result=skip_result if isinstance(skip_result, dict) else {},
         )
     cache_key = inputs.get("cache_key")
+    item_cache_keys: dict[str, tuple[str | None, ...]] = {}
+    item_pixel_present: dict[str, tuple[bool, ...]] = {}
+    for modality, key_name in (
+        ("image", "image_item_cache_keys"),
+        ("video", "video_item_cache_keys"),
+        ("audio", "audio_item_cache_keys"),
+    ):
+        raw_keys = inputs.get(key_name)
+        if isinstance(raw_keys, (list, tuple)):
+            item_cache_keys[modality] = tuple(
+                str(item) if item is not None else None for item in raw_keys
+            )
+    for modality, key_name in (
+        ("image", "image_item_pixel_present"),
+        ("video", "video_item_pixel_present"),
+    ):
+        raw_mask = inputs.get(key_name)
+        if isinstance(raw_mask, (list, tuple)):
+            item_pixel_present[modality] = tuple(bool(item) for item in raw_mask)
     model_inputs = {
-        k: v for k, v in inputs.items() if k not in ("cache_key", "_active")
+        k: v
+        for k, v in inputs.items()
+        if k
+        not in (
+            "cache_key",
+            "_active",
+            "image_item_cache_keys",
+            "video_item_cache_keys",
+            "audio_item_cache_keys",
+            "image_item_pixel_present",
+            "video_item_pixel_present",
+        )
     }
     return EncoderRequestData(
         model_inputs=model_inputs,
         cache_key=str(cache_key) if cache_key is not None else None,
+        item_cache_keys=item_cache_keys,
+        item_pixel_present=item_pixel_present,
     )
 
 
@@ -371,10 +539,10 @@ def project_preprocessing_to_audio_encoder(payload: StagePayload) -> StagePayloa
 def project_preprocessing_to_mm_aggregate(payload: StagePayload) -> StagePayload:
     state = Qwen3OmniPipelineState.from_dict(payload.data)
     projected = Qwen3OmniPipelineState(
-        prompt=dict(state.prompt) if isinstance(state.prompt, dict) else None,
+        prompt=_copy_mutable_containers(state.prompt),
         mm_inputs=build_lightweight_mm_inputs(state.mm_inputs),
         encoder_inputs=_project_encoder_input_metadata(state.encoder_inputs),
-        stream_state=dict(state.stream_state),
+        stream_state=_copy_mutable_containers(state.stream_state),
     )
     return _payload_with_state(payload, projected)
 
@@ -387,14 +555,23 @@ def project_encoder_to_mm_aggregate(payload: StagePayload) -> StagePayload:
     return _payload_with_state(payload, projected)
 
 
+def project_mm_aggregate_to_thinker(payload: StagePayload) -> StagePayload:
+    """Fan-out projection: give thinker its own prompt and model input containers."""
+    state = Qwen3OmniPipelineState.from_dict(payload.data)
+    projected = Qwen3OmniPipelineState(
+        prompt=_copy_mutable_containers(state.prompt),
+        thinker_inputs=_copy_mutable_containers(state.thinker_inputs),
+        stream_state=_copy_mutable_containers(state.stream_state),
+    )
+    return _payload_with_state(payload, projected)
+
+
 def project_mm_aggregate_to_talker_ar(payload: StagePayload) -> StagePayload:
     """Early-submit projection: ship prompt + thinker_inputs to the talker."""
     state = Qwen3OmniPipelineState.from_dict(payload.data)
     projected = Qwen3OmniPipelineState(
-        prompt=dict(state.prompt) if isinstance(state.prompt, dict) else None,
-        thinker_inputs=(
-            dict(state.thinker_inputs) if isinstance(state.thinker_inputs, dict) else {}
-        ),
+        prompt=_copy_mutable_containers(state.prompt),
+        thinker_inputs=_copy_mutable_containers(state.thinker_inputs),
     )
     return _payload_with_state(payload, projected)
 
@@ -418,8 +595,16 @@ def _payload_with_state(
 ) -> StagePayload:
     return StagePayload(
         request_id=payload.request_id,
-        request=payload.request,
+        request=_lightweight_downstream_request(payload.request),
         data=state.to_dict(),
+    )
+
+
+def _lightweight_downstream_request(request: Any) -> Any:
+    return request.__class__(
+        inputs={},
+        params=dict(request.params or {}),
+        metadata=dict(request.metadata or {}),
     )
 
 
@@ -447,7 +632,7 @@ def _select_encoder_inputs(
     stage_inputs = encoder_inputs.get(stage_name)
     if not isinstance(stage_inputs, dict):
         return {}
-    return {stage_name: dict(stage_inputs)}
+    return {stage_name: _copy_mutable_containers(stage_inputs)}
 
 
 def _project_encoder_input_metadata(
@@ -634,10 +819,11 @@ def build_sglang_thinker_request(
     vocab_size: int,
     request_id: str | None = None,
     thinker_config: Any = None,
-    mrope_position_builder: Callable[
-        [torch.Tensor, dict[str, Any], Any], Any
-    ] | None = None,
+    mrope_position_builder: (
+        Callable[[torch.Tensor, dict[str, Any], Any], Any] | None
+    ) = None,
     limit_prefix_cache_before_media: bool = False,
+    mamba_media_branching_cache: bool = False,
 ) -> "SGLangARRequestData":
     """Build SGLangARRequestData from pipeline state.
 
@@ -666,10 +852,15 @@ def build_sglang_thinker_request(
         }
     capture_keys = thinker_inputs.get("capture_model_output_keys", ())
     media_cache_keys = thinker_inputs.get("media_cache_keys", {})
+    if (model_inputs or media_cache_keys) and "original_input_ids" not in model_inputs:
+        prompt_original_ids = prompt.get("original_input_ids")
+        if prompt_original_ids is not None:
+            model_inputs["original_input_ids"] = prompt_original_ids
+        else:
+            model_inputs["original_input_ids"] = original_input_ids
     pad_values: dict[str, int] = {}
-    if (
-        thinker_config is not None
-        and (media_cache_keys or _has_multimodal_model_inputs(model_inputs))
+    if thinker_config is not None and (
+        media_cache_keys or _has_multimodal_model_inputs(model_inputs)
     ):
         token_id_map: dict[int, int] = {}
         for modality, orig_token_id in [
@@ -732,8 +923,8 @@ def build_sglang_thinker_request(
     sampling_params.verify(vocab_size)
 
     # Build SGLang Req
-    extra_key = None
-    if _has_multimodal_model_inputs(model_inputs) and not pad_values:
+    extra_key = _media_cache_radix_extra_key(media_cache_keys)
+    if extra_key is None and _has_multimodal_model_inputs(model_inputs) and not pad_values:
         extra_key = _input_embeds_radix_extra_key("media-inputs", rid, model_inputs)
     req = Req(
         rid=rid,
@@ -750,6 +941,13 @@ def build_sglang_thinker_request(
         if prefix_cache_limit is not None:
             _install_prefix_cache_limit_patch(Req)
             req._omni_max_prefix_cache_len = int(prefix_cache_limit)
+    if mamba_media_branching_cache and thinker_config is not None:
+        branching_seqlen = _media_mamba_branching_seqlen(
+            input_ids_list, model_inputs, thinker_config, pad_values
+        )
+        if branching_seqlen is not None:
+            _install_mamba_branching_hint_patch(Req)
+            req._omni_mamba_branching_seqlen = int(branching_seqlen)
     req.tokenizer = tokenizer
 
     # Compute M-RoPE positions and attach multimodal_inputs to Req
@@ -816,9 +1014,9 @@ def build_sglang_talker_request(
     thinker_config: Any = None,
     talker_model_inputs: dict[str, Any] | None = None,
     seed: int | None = None,
-    mrope_position_builder: Callable[
-        [torch.Tensor, dict[str, Any], Any], Any
-    ] | None = None,
+    mrope_position_builder: (
+        Callable[[torch.Tensor, dict[str, Any], Any], Any] | None
+    ) = None,
 ) -> "SGLangARRequestData":
     """Build SGLang AR request for the Talker from thinker hidden states.
 
@@ -1030,12 +1228,19 @@ def make_thinker_stream_output_builder():
             and (stage_payload.request.params or {}).get("stream", False)
         )
         if is_streaming:
-            # Wrap int — relay_io.write_blob is tensor-only.
+            # Inline CPU stream chunks keep tiny text-token deltas off the relay
+            # tensor path. Preserve the old tensor payload when inline is not
+            # enabled because relay_io.write_blob is tensor-only.
+            decode_data: int | torch.Tensor
+            if _inline_cpu_stream_chunks_enabled():
+                decode_data = token_id
+            else:
+                decode_data = torch.tensor([token_id], dtype=torch.long)
             messages.append(
                 OutgoingMessage(
                     request_id=request_id,
                     type="stream",
-                    data=torch.tensor([token_id], dtype=torch.long),
+                    data=decode_data,
                     target="decode",
                     metadata={"token_id": token_id},
                 )
@@ -1083,9 +1288,9 @@ def make_thinker_scheduler_adapters(
     vocab_size: int,
     thinker_config: Any = None,
     stage_name: str = "thinker",
-    mrope_position_builder: Callable[
-        [torch.Tensor, dict[str, Any], Any], Any
-    ] | None = None,
+    mrope_position_builder: (
+        Callable[[torch.Tensor, dict[str, Any], Any], Any] | None
+    ) = None,
 ):
     """Build model-specific StagePayload <-> scheduler adapters for thinker."""
 
@@ -1143,9 +1348,9 @@ def make_talker_scheduler_adapters(
     user_token_id: int = 872,
     assistant_token_id: int = 77091,
     speaker_map: dict[str, int] | None = None,
-    mrope_position_builder: Callable[
-        [torch.Tensor, dict[str, Any], Any], Any
-    ] | None = None,
+    mrope_position_builder: (
+        Callable[[torch.Tensor, dict[str, Any], Any], Any] | None
+    ) = None,
 ):
     """Build model-specific StagePayload <-> scheduler adapters for talker."""
     prefill_builder = TalkerPrefillBuilder(
@@ -1232,9 +1437,9 @@ def _build_talker_request_data(
     video_token_id: int | None,
     thinker_config: Any,
     resolve_sampling_config: Callable[[dict[str, Any]], dict[str, Any]],
-    mrope_position_builder: Callable[
-        [torch.Tensor, dict[str, Any], Any], Any
-    ] | None = None,
+    mrope_position_builder: (
+        Callable[[torch.Tensor, dict[str, Any], Any], Any] | None
+    ) = None,
 ) -> SGLangARRequestData:
     params = payload.request.params
     sampling_cfg = resolve_sampling_config(params)

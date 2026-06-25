@@ -37,7 +37,11 @@ def test_typed_runtime_maps_to_factory_args_and_sglang_overrides() -> None:
             resources=StageResourceConfig(total_gpu_memory_fraction=0.25),
             max_seq_len=32768,
             video_fps=2.0,
-            sglang_server_args=SGLangServerArgsConfig(mem_fraction_static=0.72),
+            sglang_server_args=SGLangServerArgsConfig(
+                mem_fraction_static=0.72,
+                max_mamba_cache_size=24,
+                mamba_full_memory_ratio=0.95,
+            ),
         ),
         runtime_arg_map={
             "max_seq_len": "thinker_max_seq_len",
@@ -61,6 +65,8 @@ def test_typed_runtime_maps_to_factory_args_and_sglang_overrides() -> None:
     assert args["server_args_overrides"] == {
         "disable_cuda_graph": True,
         "mem_fraction_static": 0.72,
+        "max_mamba_cache_size": 24,
+        "mamba_full_memory_ratio": 0.95,
     }
     assert args["total_gpu_memory_fraction"] == 0.25
 

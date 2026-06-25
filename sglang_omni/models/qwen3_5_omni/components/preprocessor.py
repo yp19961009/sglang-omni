@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 import logging
 import math
+import os
 import re
 from typing import Any
 
@@ -18,6 +20,7 @@ from sglang_omni.models.qwen3_5_omni.components.audio_encoder import (
 from sglang_omni.models.qwen3_5_omni.components.common import (
     load_qwen35_thinker_config,
 )
+from sglang_omni.profiler.event_recorder import emit as _emit_event
 
 logger = logging.getLogger(__name__)
 DEFAULT_AUDIO_TIMESTAMP_INTERVAL = 60
@@ -73,6 +76,13 @@ _AUDIO_REQUEST_INPUT_ALIASES = (
     "audio",
 )
 _AUDIO_REQUEST_PARAM_INPUT_ALIASES = _AUDIO_REQUEST_INPUT_ALIASES[:-1]
+_PROCESSOR_ITEM_CACHE_KEYS = "_sglang_omni_item_cache_keys"
+_PROCESSOR_PROFILE_REQUEST_ID = "_sglang_omni_profile_request_id"
+_PROCESSOR_ITEM_CACHE_MAX_ENTRIES = 512
+_PLAIN_TEXT_TOKEN_CACHE_MAX_ENTRIES = 4096
+_OMIT_CACHED_VISUAL_ITEM_PAYLOADS_ENV = (
+    "SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS"
+)
 _IMAGE_REQUEST_INPUT_ALIASES = (
     "images",
     "input_images",
@@ -150,6 +160,152 @@ def _request_bool_value_or_list(value: Any) -> Any:
     return _request_bool_value(value)
 
 
+def _freeze_processor_cache_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return tuple(
+            sorted(
+                (key, _freeze_processor_cache_value(item))
+                for key, item in value.items()
+            )
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_processor_cache_value(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze_processor_cache_value(item) for item in value)
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    return repr(value)
+
+
+def _is_torch_tensor(value: Any) -> bool:
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch is required in serving.
+        return False
+    return isinstance(value, torch.Tensor)
+
+
+def _first_dim_len(value: Any) -> int | None:
+    if _is_torch_tensor(value) or isinstance(value, np.ndarray):
+        return int(value.shape[0]) if getattr(value, "ndim", 0) > 0 else None
+    return None
+
+
+def _slice_first_dim(value: Any, start: int, end: int) -> Any:
+    if _is_torch_tensor(value) or isinstance(value, np.ndarray):
+        return value[start:end]
+    if isinstance(value, list):
+        return value[start:end]
+    return value
+
+
+def _concat_first_dim(values: list[Any]) -> Any:
+    if not values:
+        return None
+    if all(_is_torch_tensor(value) for value in values):
+        import torch
+
+        return torch.cat(values, dim=0)
+    if all(isinstance(value, np.ndarray) for value in values):
+        return np.concatenate(values, axis=0)
+    if all(isinstance(value, list) for value in values):
+        merged: list[Any] = []
+        for value in values:
+            merged.extend(value)
+        return merged
+    return values[0]
+
+
+def _pad_last_dim(value: Any, target_size: int, *, pad_value: int = 0) -> Any:
+    current = int(value.shape[-1])
+    if current >= target_size:
+        return value
+    pad_width = target_size - current
+    if _is_torch_tensor(value):
+        import torch.nn.functional as F
+
+        return F.pad(value, (0, pad_width), value=pad_value)
+    if isinstance(value, np.ndarray):
+        widths = [(0, 0)] * value.ndim
+        widths[-1] = (0, pad_width)
+        return np.pad(value, widths, constant_values=pad_value)
+    return value
+
+
+def _combine_entry_dicts(
+    entries: list[dict[str, Any]],
+    *,
+    pad_last_dim: bool = False,
+) -> dict[str, Any]:
+    if not entries:
+        return {}
+    combined: dict[str, Any] = {}
+    keys: list[str] = []
+    for entry in entries:
+        for key in entry:
+            if key not in keys:
+                keys.append(key)
+    for key in keys:
+        values = [entry[key] for entry in entries if key in entry]
+        if pad_last_dim and values and all(
+            (_is_torch_tensor(value) or isinstance(value, np.ndarray))
+            and getattr(value, "ndim", 0) > 0
+            for value in values
+        ):
+            target_size = max(int(value.shape[-1]) for value in values)
+            values = [_pad_last_dim(value, target_size) for value in values]
+        combined[key] = _concat_first_dim(values)
+    return combined
+
+
+def _prod_value(value: Any) -> int:
+    if _is_torch_tensor(value):
+        return int(value.prod().item())
+    if isinstance(value, np.ndarray):
+        return int(value.prod().item())
+    product = 1
+    for item in value:
+        product *= int(item)
+    return product
+
+
+def _metadata_at(video_metadata: Any, index: int) -> Any:
+    if isinstance(video_metadata, list) and index < len(video_metadata):
+        return video_metadata[index]
+    return None
+
+
+def _omit_cached_visual_item_payloads_enabled() -> bool:
+    value = os.getenv(_OMIT_CACHED_VISUAL_ITEM_PAYLOADS_ENV, "")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _video_entry_with_empty_pixels(
+    entry: tuple[dict[str, Any], Any],
+) -> tuple[dict[str, Any], Any]:
+    video_inputs, metadata = entry
+    pixels = video_inputs.get("pixel_values_videos")
+    if pixels is None:
+        return entry
+    trimmed = dict(video_inputs)
+    trimmed["pixel_values_videos"] = _slice_first_dim(pixels, 0, 0)
+    return trimmed, metadata
+
+
+def _emit_processor_profile_event(
+    request_id: str | None,
+    event_name: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    if request_id:
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name=f"qwen35_processor_{event_name}",
+            metadata=metadata,
+        )
+
+
 class _Qwen35ProcessorShim:
     """Local Qwen3.5-Omni processor fallback.
 
@@ -157,6 +313,8 @@ class _Qwen35ProcessorShim:
     fallback must still process audio; otherwise the audio placeholder is
     tokenized as ordinary text and the thinker never receives audio embeddings.
     """
+
+    supports_item_cache_keys = True
 
     def __init__(
         self,
@@ -179,12 +337,60 @@ class _Qwen35ProcessorShim:
         self.vision_eos_token = tokenizer.vision_eos_token
         self.audio_bos_token = tokenizer.audio_bos_token
         self.audio_eos_token = tokenizer.audio_eos_token
+        self.video_token_block = (
+            self.vision_bos_token + self.video_token + self.vision_eos_token
+        )
         self.mm_token_pattern = re.compile(
             "|".join(
                 re.escape(tok)
-                for tok in (self.audio_token, self.image_token, self.video_token)
+                for tok in (
+                    self.video_token_block,
+                    self.audio_token,
+                    self.image_token,
+                    self.video_token,
+                )
                 if tok
             )
+        )
+        self._tokenizer_special_ids: dict[str, int] = {}
+        convert_tokens_to_ids = getattr(tokenizer, "convert_tokens_to_ids", None)
+        if callable(convert_tokens_to_ids):
+            special_tokens = [
+                *getattr(tokenizer, "all_special_tokens", ()),
+                self.audio_token,
+                self.image_token,
+                self.video_token,
+                self.vision_bos_token,
+                self.vision_eos_token,
+                self.audio_bos_token,
+                self.audio_eos_token,
+            ]
+            for token in special_tokens:
+                if not token or token in self._tokenizer_special_ids:
+                    continue
+                token_id = convert_tokens_to_ids(token)
+                if isinstance(token_id, int) and token_id >= 0:
+                    self._tokenizer_special_ids[token] = token_id
+        self._tokenizer_special_pattern = (
+            re.compile(
+                "|".join(
+                    re.escape(token)
+                    for token in sorted(
+                        self._tokenizer_special_ids, key=len, reverse=True
+                    )
+                )
+            )
+            if self._tokenizer_special_ids
+            else None
+        )
+        self._audio_item_processor_cache: OrderedDict[Any, dict[str, Any]] = (
+            OrderedDict()
+        )
+        self._video_item_processor_cache: OrderedDict[
+            Any, tuple[dict[str, Any], Any]
+        ] = OrderedDict()
+        self._plain_text_token_cache: OrderedDict[str, tuple[int, ...]] = (
+            OrderedDict()
         )
 
     @classmethod
@@ -210,10 +416,11 @@ class _Qwen35ProcessorShim:
             )
         except (OSError, ValueError):
             feature_extractor = WhisperFeatureExtractor()
+        video_processor = Qwen2VLVideoProcessor.from_pretrained(model_dir, **kw)
         return cls(
             tokenizer=tokenizer,
             image_processor=image_processor,
-            video_processor=Qwen2VLVideoProcessor(),
+            video_processor=video_processor,
             feature_extractor=feature_extractor,
             chat_template=tokenizer.chat_template,
         )
@@ -234,46 +441,210 @@ class _Qwen35ProcessorShim:
         if text is None:
             raise ValueError("You need to specify a `text` input to process.")
 
+        profile_request_id = kwargs.pop(_PROCESSOR_PROFILE_REQUEST_ID, None)
+        profile_metadata = {
+            "num_text": len(text) if isinstance(text, list) else int(text is not None),
+            "num_images": len(images) if isinstance(images, list) else int(images is not None),
+            "num_videos": len(videos) if isinstance(videos, list) else int(videos is not None),
+            "num_audios": len(audio) if isinstance(audio, list) else int(audio is not None),
+        }
+        _emit_processor_profile_event(
+            profile_request_id, "call_start", profile_metadata
+        )
         output_kwargs = self._merge_processor_kwargs(kwargs, videos=videos)
-        audio_inputs, audio_lengths = self._process_audio(
-            audio,
-            output_kwargs["audio_kwargs"],
-            downsample_times=output_kwargs["downsample_times"],
-            downsample_chunk_size=output_kwargs["downsample_chunk_size"],
-        )
-        image_inputs, image_grid_thw = self._process_images(
-            images,
-            output_kwargs["images_kwargs"],
-        )
-        video_inputs, video_grid_thw, video_metadata = self._process_videos(
-            videos,
-            output_kwargs["videos_kwargs"],
-        )
+        try:
+            _emit_processor_profile_event(
+                profile_request_id, "audio_start", profile_metadata
+            )
+            audio_inputs, audio_lengths = self._process_audio(
+                audio,
+                output_kwargs["audio_kwargs"],
+                downsample_times=output_kwargs["downsample_times"],
+                downsample_chunk_size=output_kwargs["downsample_chunk_size"],
+            )
+            _emit_processor_profile_event(
+                profile_request_id, "audio_end", profile_metadata
+            )
 
-        if not isinstance(text, list):
-            text = [text]
-        text = self.replace_multimodal_special_tokens(
+            _emit_processor_profile_event(
+                profile_request_id, "image_start", profile_metadata
+            )
+            image_inputs, image_grid_thw = self._process_images(
+                images,
+                output_kwargs["images_kwargs"],
+            )
+            _emit_processor_profile_event(
+                profile_request_id, "image_end", profile_metadata
+            )
+
+            _emit_processor_profile_event(
+                profile_request_id, "video_start", profile_metadata
+            )
+            video_inputs, video_grid_thw, video_metadata = self._process_videos(
+                videos,
+                output_kwargs["videos_kwargs"],
+            )
+            _emit_processor_profile_event(
+                profile_request_id, "video_end", profile_metadata
+            )
+
+            if not isinstance(text, list):
+                text = [text]
+            _emit_processor_profile_event(
+                profile_request_id, "replace_tokens_start", profile_metadata
+            )
+            text = self.replace_multimodal_special_tokens(
+                text,
+                iter(audio_lengths),
+                iter(image_grid_thw),
+                iter(video_grid_thw),
+                video_metadata=iter(video_metadata),
+                audio_tokens_per_second=math.ceil(
+                    self.feature_extractor.sampling_rate
+                    / self.feature_extractor.hop_length
+                    / 2**output_kwargs["downsample_times"]
+                ),
+                audio_timestamp_interval=output_kwargs["audio_timestamp_interval"],
+                use_audio_in_video=iter(video_inputs.pop("use_audio_in_video", [])),
+            )
+            _emit_processor_profile_event(
+                profile_request_id, "replace_tokens_end", profile_metadata
+            )
+
+            _emit_processor_profile_event(
+                profile_request_id, "tokenize_start", profile_metadata
+            )
+            text_inputs = self._fast_tokenize_with_special_ids(
+                text,
+                output_kwargs["text_kwargs"],
+            )
+            tokenize_metadata = dict(profile_metadata)
+            tokenize_metadata["fast_special_token_path"] = text_inputs is not None
+            if text_inputs is None:
+                text_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
+            _emit_processor_profile_event(
+                profile_request_id, "tokenize_end", tokenize_metadata
+            )
+            from transformers.feature_extraction_utils import BatchFeature
+
+            return BatchFeature(
+                data={**text_inputs, **image_inputs, **video_inputs, **audio_inputs},
+                tensor_type=return_tensors,
+            )
+        finally:
+            _emit_processor_profile_event(
+                profile_request_id, "call_end", profile_metadata
+            )
+
+    def _fast_tokenize_with_special_ids(
+        self,
+        text: list[str],
+        text_kwargs: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if self._tokenizer_special_pattern is None:
+            return None
+        if not isinstance(text, list) or len(text) != 1:
+            return None
+        if text_kwargs.get("add_special_tokens", False):
+            return None
+        if text_kwargs.get("padding") not in (None, False):
+            return None
+        unsupported = set(text_kwargs) - {
+            "add_special_tokens",
+            "padding",
+            "padding_side",
+            "return_attention_mask",
+            "truncation",
+        }
+        if unsupported:
+            return None
+        if text_kwargs.get("truncation") not in (None, False):
+            return None
+
+        token_ids: list[int] = []
+        sample = text[0]
+        cursor = 0
+        while True:
+            match = self._tokenizer_special_pattern.search(sample, cursor)
+            if match is None:
+                break
+            if match.start() > cursor:
+                plain_ids = self._tokenize_plain_text_ids(sample[cursor : match.start()])
+                if plain_ids is None:
+                    return None
+                token_ids.extend(plain_ids)
+            special_token = match.group(0)
+            token_id = self._tokenizer_special_ids.get(special_token)
+            if token_id is None:
+                return None
+            run_count, run_end = self._special_token_run(
+                sample,
+                start=match.start(),
+                token=special_token,
+            )
+            token_ids.extend([token_id] * run_count)
+            cursor = run_end
+        if cursor < len(sample):
+            plain_ids = self._tokenize_plain_text_ids(sample[cursor:])
+            if plain_ids is None:
+                return None
+            token_ids.extend(plain_ids)
+        return {
+            "input_ids": [token_ids],
+            "attention_mask": [[1] * len(token_ids)],
+        }
+
+    @staticmethod
+    def _special_token_run(
+        sample: str,
+        *,
+        start: int,
+        token: str,
+    ) -> tuple[int, int]:
+        token_len = len(token)
+        if token_len <= 0:
+            return 1, start
+        cursor = start
+        count = 0
+        sample_len = len(sample)
+        while cursor + token_len <= sample_len and sample.startswith(token, cursor):
+            count += 1
+            cursor += token_len
+        return max(count, 1), cursor
+
+    def _tokenize_plain_text_ids(self, text: str) -> list[int] | None:
+        if not text:
+            return []
+        cached = self._plain_text_token_cache.get(text)
+        if cached is not None:
+            self._plain_text_token_cache.move_to_end(text)
+            return list(cached)
+        encoded = self.tokenizer(
             text,
-            iter(audio_lengths),
-            iter(image_grid_thw),
-            iter(video_grid_thw),
-            video_metadata=iter(video_metadata),
-            audio_tokens_per_second=math.ceil(
-                self.feature_extractor.sampling_rate
-                / self.feature_extractor.hop_length
-                / 2**output_kwargs["downsample_times"]
-            ),
-            audio_timestamp_interval=output_kwargs["audio_timestamp_interval"],
-            use_audio_in_video=iter(video_inputs.pop("use_audio_in_video", [])),
+            add_special_tokens=False,
+            padding=False,
         )
-
-        text_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
-        from transformers.feature_extraction_utils import BatchFeature
-
-        return BatchFeature(
-            data={**text_inputs, **image_inputs, **video_inputs, **audio_inputs},
-            tensor_type=return_tensors,
-        )
+        try:
+            input_ids = encoded["input_ids"]
+        except (KeyError, TypeError):
+            return None
+        if _is_torch_tensor(input_ids):
+            input_ids = input_ids.reshape(-1).tolist()
+        if isinstance(input_ids, list) and input_ids and isinstance(input_ids[0], list):
+            if len(input_ids) != 1:
+                return None
+            input_ids = input_ids[0]
+        if not isinstance(input_ids, list):
+            return None
+        try:
+            token_ids = tuple(int(token_id) for token_id in input_ids)
+        except (TypeError, ValueError):
+            return None
+        self._plain_text_token_cache[text] = token_ids
+        self._plain_text_token_cache.move_to_end(text)
+        while len(self._plain_text_token_cache) > _PLAIN_TEXT_TOKEN_CACHE_MAX_ENTRIES:
+            self._plain_text_token_cache.popitem(last=False)
+        return list(token_ids)
 
     def _merge_processor_kwargs(
         self,
@@ -302,6 +673,7 @@ class _Qwen35ProcessorShim:
 
         video_kwargs = {"use_audio_in_video": False, "return_metadata": True}
         video_kwargs.update(kwargs.get("videos_kwargs") or {})
+        video_kwargs = self._with_effective_video_resize_size(video_kwargs)
         use_audio_in_video = video_kwargs.get("use_audio_in_video", False)
         if not isinstance(use_audio_in_video, list):
             video_count = (
@@ -320,6 +692,42 @@ class _Qwen35ProcessorShim:
             "audio_timestamp_interval": audio_timestamp_interval,
         }
 
+    def _with_effective_video_resize_size(
+        self,
+        video_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "size" in video_kwargs:
+            return video_kwargs
+        min_pixels = video_kwargs.get("min_pixels")
+        max_pixels = video_kwargs.get("max_pixels")
+        if min_pixels is None and max_pixels is None:
+            return video_kwargs
+        if isinstance(min_pixels, (list, tuple)) or isinstance(max_pixels, (list, tuple)):
+            return video_kwargs
+
+        default_size = getattr(self.video_processor, "size", None) or {}
+        shortest_edge = (
+            int(min_pixels)
+            if min_pixels is not None
+            else default_size.get("shortest_edge")
+        )
+        longest_edge = (
+            int(max_pixels)
+            if max_pixels is not None
+            else default_size.get("longest_edge")
+        )
+        if shortest_edge is None or longest_edge is None:
+            return video_kwargs
+
+        updated = dict(video_kwargs)
+        # The current transformers Qwen2VLVideoProcessor ignores min_pixels and
+        # max_pixels during _preprocess, but does honor size.shortest/longest.
+        updated["size"] = {
+            "shortest_edge": int(shortest_edge),
+            "longest_edge": int(longest_edge),
+        }
+        return updated
+
     def _process_audio(
         self,
         audio,
@@ -332,23 +740,19 @@ class _Qwen35ProcessorShim:
             return {}, []
         if not isinstance(audio, list):
             audio = [audio]
+        item_cache_keys = audio_kwargs.pop(_PROCESSOR_ITEM_CACHE_KEYS, None)
         sampling_rate = int(audio_kwargs.get("sampling_rate", 16000))
-        padded_audio = []
-        for sample in audio:
-            remainder = sample.shape[-1] % sampling_rate
-            if remainder:
-                sample = np.pad(sample, (0, sampling_rate - remainder))
-            padded_audio.append(sample)
-
-        audio_inputs = self.feature_extractor(padded_audio, **audio_kwargs)
-        if "attention_mask" in audio_inputs:
-            audio_inputs["feature_attention_mask"] = audio_inputs.pop(
-                "attention_mask"
+        padded_audio = self._pad_audio_for_feature_extractor(audio, sampling_rate)
+        if self._can_use_item_cache(item_cache_keys, len(padded_audio)):
+            audio_inputs = self._process_audio_with_item_cache(
+                padded_audio,
+                audio_kwargs,
+                item_cache_keys,
+                downsample_times=downsample_times,
+                downsample_chunk_size=downsample_chunk_size,
             )
-        if "input_features" in audio_inputs:
-            audio_inputs["input_audio_features"] = audio_inputs.pop(
-                "input_features"
-            )
+        else:
+            audio_inputs = self._extract_audio_features(padded_audio, audio_kwargs)
 
         feature_attention_mask = audio_inputs.get("feature_attention_mask")
         if feature_attention_mask is None:
@@ -360,6 +764,74 @@ class _Qwen35ProcessorShim:
         )
         return audio_inputs, audio_lengths.tolist()
 
+    def _pad_audio_for_feature_extractor(self, audio, sampling_rate: int):
+        padded_audio = []
+        for sample in audio:
+            remainder = sample.shape[-1] % sampling_rate
+            if remainder:
+                sample = np.pad(sample, (0, sampling_rate - remainder))
+            padded_audio.append(sample)
+        return padded_audio
+
+    def _extract_audio_features(self, padded_audio, audio_kwargs: dict[str, Any]):
+        audio_inputs = self.feature_extractor(padded_audio, **audio_kwargs)
+        if "attention_mask" in audio_inputs:
+            audio_inputs["feature_attention_mask"] = audio_inputs.pop(
+                "attention_mask"
+            )
+        if "input_features" in audio_inputs:
+            audio_inputs["input_audio_features"] = audio_inputs.pop(
+                "input_features"
+            )
+        return audio_inputs
+
+    def _process_audio_with_item_cache(
+        self,
+        padded_audio,
+        audio_kwargs: dict[str, Any],
+        item_cache_keys,
+        *,
+        downsample_times: int,
+        downsample_chunk_size: int,
+    ) -> dict[str, Any]:
+        entries: list[dict[str, Any] | None] = [None] * len(padded_audio)
+        miss_indices: list[int] = []
+        miss_audio: list[Any] = []
+        cache_keys_by_index: list[Any | None] = []
+        for index, sample in enumerate(padded_audio):
+            del sample
+            cache_key = self._processor_item_cache_key(
+                "audio",
+                item_cache_keys[index],
+                audio_kwargs,
+                extra=(downsample_times, downsample_chunk_size),
+            )
+            cache_keys_by_index.append(cache_key)
+            cached = self._processor_cache_get(
+                self._audio_item_processor_cache, cache_key
+            )
+            if cached is not None:
+                entries[index] = cached
+                continue
+            miss_indices.append(index)
+            miss_audio.append(padded_audio[index])
+
+        if miss_audio:
+            miss_inputs = self._extract_audio_features(miss_audio, audio_kwargs)
+            miss_entries = self._split_batch_inputs(miss_inputs, len(miss_audio))
+            for miss_pos, index in enumerate(miss_indices):
+                entry = miss_entries[miss_pos]
+                entries[index] = entry
+                self._processor_cache_set(
+                    self._audio_item_processor_cache,
+                    cache_keys_by_index[index],
+                    entry,
+                )
+
+        return self._combine_audio_entries(
+            [entry for entry in entries if entry is not None]
+        )
+
     def _process_images(self, images, images_kwargs: dict[str, Any]):
         if images is None:
             return {}, []
@@ -369,13 +841,218 @@ class _Qwen35ProcessorShim:
     def _process_videos(self, videos, video_kwargs: dict[str, Any]):
         if videos is None:
             return {}, [], []
+        videos = _wrap_video_frame_path_items(videos)
+        if not isinstance(videos, list):
+            videos = [videos]
+        if video_kwargs.get("device") is None:
+            video_kwargs["device"] = "cpu"
+        item_cache_keys = video_kwargs.pop(_PROCESSOR_ITEM_CACHE_KEYS, None)
         use_audio_in_video = video_kwargs.pop("use_audio_in_video", [])
-        video_inputs = self.video_processor(videos=videos, **video_kwargs)
-        video_metadata = video_inputs.get("video_metadata", [])
-        if not video_kwargs.get("return_metadata", True):
+        if self._can_use_item_cache(item_cache_keys, len(videos)):
+            video_inputs, video_metadata = self._process_videos_with_item_cache(
+                videos,
+                video_kwargs,
+                item_cache_keys,
+            )
+        else:
+            video_inputs = self.video_processor(videos=videos, **video_kwargs)
+            video_metadata = video_inputs.get("video_metadata", [])
             video_inputs.pop("video_metadata", None)
         video_inputs["use_audio_in_video"] = use_audio_in_video
         return video_inputs, video_inputs.get("video_grid_thw", []), video_metadata
+
+    def _process_videos_with_item_cache(
+        self,
+        videos,
+        video_kwargs: dict[str, Any],
+        item_cache_keys,
+    ) -> tuple[dict[str, Any], list[Any]]:
+        entries: list[tuple[dict[str, Any], Any] | None] = [None] * len(videos)
+        miss_indices: list[int] = []
+        miss_videos: list[Any] = []
+        cache_keys_by_index: list[Any | None] = []
+        omit_cached_pixels = _omit_cached_visual_item_payloads_enabled()
+        pixel_present: list[bool] = []
+        for index, video in enumerate(videos):
+            per_item_kwargs = self._select_item_processor_kwargs(
+                video_kwargs,
+                index,
+                len(videos),
+            )
+            cache_key = self._processor_item_cache_key(
+                "video",
+                item_cache_keys[index],
+                per_item_kwargs,
+            )
+            cache_keys_by_index.append(cache_key)
+            cached = self._processor_cache_get(
+                self._video_item_processor_cache, cache_key
+            )
+            if cached is not None:
+                pixel_present.append(not omit_cached_pixels)
+                entries[index] = (
+                    _video_entry_with_empty_pixels(cached)
+                    if omit_cached_pixels
+                    else cached
+                )
+                continue
+            pixel_present.append(True)
+            miss_indices.append(index)
+            miss_videos.append(video)
+
+        if miss_videos:
+            miss_kwargs = self._select_item_processor_kwargs(
+                video_kwargs,
+                miss_indices,
+                len(videos),
+            )
+            miss_inputs = self.video_processor(videos=miss_videos, **miss_kwargs)
+            miss_metadata = miss_inputs.get("video_metadata", [])
+            miss_inputs.pop("video_metadata", None)
+            miss_entries = self._split_video_inputs(
+                miss_inputs,
+                miss_metadata,
+                len(miss_videos),
+            )
+            for miss_pos, index in enumerate(miss_indices):
+                entry = miss_entries[miss_pos]
+                entries[index] = entry
+                self._processor_cache_set(
+                    self._video_item_processor_cache,
+                    cache_keys_by_index[index],
+                    entry,
+                )
+
+        combined, metadata = self._combine_video_entries(
+            [entry for entry in entries if entry is not None]
+        )
+        if pixel_present and not all(pixel_present):
+            combined["video_item_pixel_present"] = pixel_present
+        return combined, metadata
+
+    def _can_use_item_cache(self, item_cache_keys, item_count: int) -> bool:
+        return (
+            isinstance(item_cache_keys, list)
+            and len(item_cache_keys) == item_count
+            and any(item_cache_keys)
+        )
+
+    def _processor_cache_get(self, cache: OrderedDict, cache_key: Any):
+        if cache_key is None:
+            return None
+        try:
+            value = cache.pop(cache_key)
+        except KeyError:
+            return None
+        cache[cache_key] = value
+        return value
+
+    def _processor_cache_set(
+        self,
+        cache: OrderedDict,
+        cache_key: Any,
+        value: Any,
+    ) -> None:
+        if cache_key is None:
+            return
+        cache[cache_key] = value
+        cache.move_to_end(cache_key)
+        while len(cache) > _PROCESSOR_ITEM_CACHE_MAX_ENTRIES:
+            cache.popitem(last=False)
+
+    def _processor_item_cache_key(
+        self,
+        modality: str,
+        item_cache_key: Any,
+        processor_kwargs: dict[str, Any],
+        *,
+        extra: tuple[Any, ...] = (),
+    ):
+        if item_cache_key is None:
+            return None
+        return (
+            modality,
+            item_cache_key,
+            _freeze_processor_cache_value(processor_kwargs),
+            _freeze_processor_cache_value(extra),
+        )
+
+    def _select_item_processor_kwargs(
+        self,
+        kwargs: dict[str, Any],
+        indices,
+        item_count: int,
+    ) -> dict[str, Any]:
+        selected: dict[str, Any] = {}
+        index_list = indices if isinstance(indices, list) else [indices]
+        for key, value in kwargs.items():
+            if isinstance(value, list) and len(value) == item_count:
+                values = [value[index] for index in index_list]
+                selected[key] = values[0] if len(values) == 1 else values
+            else:
+                selected[key] = value
+        return selected
+
+    def _split_batch_inputs(
+        self,
+        batch_inputs: dict[str, Any],
+        item_count: int,
+    ) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = [dict() for _ in range(item_count)]
+        for key, value in batch_inputs.items():
+            for index in range(item_count):
+                entries[index][key] = _slice_first_dim(value, index, index + 1)
+        return entries
+
+    def _split_video_inputs(
+        self,
+        video_inputs: dict[str, Any],
+        video_metadata,
+        item_count: int,
+    ) -> list[tuple[dict[str, Any], Any]]:
+        grid_thw = video_inputs.get("video_grid_thw")
+        if grid_thw is None:
+            return [
+                (entry, _metadata_at(video_metadata, index))
+                for index, entry in enumerate(
+                    self._split_batch_inputs(video_inputs, item_count)
+                )
+            ]
+        patch_lengths = [int(_prod_value(row)) for row in grid_thw]
+        pixel_offset = 0
+        entries: list[tuple[dict[str, Any], Any]] = []
+        for index, patch_length in enumerate(patch_lengths):
+            entry: dict[str, Any] = {}
+            for key, value in video_inputs.items():
+                if key == "pixel_values_videos":
+                    entry[key] = _slice_first_dim(
+                        value,
+                        pixel_offset,
+                        pixel_offset + patch_length,
+                    )
+                elif key == "video_grid_thw":
+                    entry[key] = _slice_first_dim(value, index, index + 1)
+                elif _first_dim_len(value) == item_count:
+                    entry[key] = _slice_first_dim(value, index, index + 1)
+                elif isinstance(value, list) and len(value) == item_count:
+                    entry[key] = [value[index]]
+                else:
+                    entry[key] = value
+            entries.append((entry, _metadata_at(video_metadata, index)))
+            pixel_offset += patch_length
+        return entries
+
+    def _combine_video_entries(
+        self,
+        entries: list[tuple[dict[str, Any], Any]],
+    ) -> tuple[dict[str, Any], list[Any]]:
+        return (
+            _combine_entry_dicts([entry for entry, _metadata in entries]),
+            [metadata for _entry, metadata in entries],
+        )
+
+    def _combine_audio_entries(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        return _combine_entry_dicts(entries, pad_last_dim=True)
 
     def replace_multimodal_special_tokens(
         self,
@@ -392,47 +1069,37 @@ class _Qwen35ProcessorShim:
         merge_length_image = self.image_processor.merge_size**2
         processed_text = []
         for sample in text:
-            for special_token in self.mm_token_pattern.findall(sample):
+            def _replace_special_token(match: re.Match[str]) -> str:
+                special_token = match.group(0)
                 if special_token == self.audio_token:
-                    sample = sample.replace(
-                        self.audio_token,
-                        self._get_audio_tokens(
-                            next(audio_lengths),
-                            audio_tokens_per_second,
-                            audio_timestamp_interval,
-                        ),
-                        1,
+                    return self._get_audio_tokens(
+                        next(audio_lengths),
+                        audio_tokens_per_second,
+                        audio_timestamp_interval,
                     )
-                elif special_token == self.image_token:
+                if special_token == self.image_token:
                     image_seq_length = next(image_grid_thw).prod() // merge_length_image
-                    sample = sample.replace(
-                        self.image_token,
-                        "<|image_placeholder|>" * int(image_seq_length),
-                        1,
-                    )
-                elif special_token == self.video_token:
+                    return self.image_token * int(image_seq_length)
+                if special_token in (self.video_token_block, self.video_token):
                     metadata = next(video_metadata)
                     use_audio = next(use_audio_in_video)
                     if getattr(metadata, "fps", None) is None:
                         metadata.fps = 24
-                    sample = sample.replace(
-                        self.vision_bos_token
-                        + self.video_token
-                        + self.vision_eos_token,
-                        self._get_video_tokens(
-                            metadata.frames_indices,
-                            metadata.fps,
-                            next(video_grid_thw),
-                            self.image_processor.merge_size,
-                            audio_tokens_per_second if use_audio else None,
-                            next(audio_lengths) if use_audio else None,
-                        ),
-                        1,
+                    return self._get_video_tokens(
+                        metadata.frames_indices,
+                        metadata.fps,
+                        next(video_grid_thw),
+                        self.image_processor.merge_size,
+                        audio_tokens_per_second if use_audio else None,
+                        next(audio_lengths) if use_audio else None,
                     )
+                return special_token
 
-            sample = sample.replace("<|audio_placeholder|>", self.audio_token)
-            sample = sample.replace("<|image_placeholder|>", self.image_token)
-            sample = sample.replace("<|video_placeholder|>", self.video_token)
+            sample = self.mm_token_pattern.sub(_replace_special_token, sample)
+            if "_placeholder|>" in sample:
+                sample = sample.replace("<|audio_placeholder|>", self.audio_token)
+                sample = sample.replace("<|image_placeholder|>", self.image_token)
+                sample = sample.replace("<|video_placeholder|>", self.video_token)
             processed_text.append(sample)
         return processed_text
 
@@ -448,12 +1115,12 @@ class _Qwen35ProcessorShim:
         audio_placeholders = ""
         for i in range(num_full_chunks):
             audio_placeholders += f"<{i * timestamp_interval:.1f} seconds>"
-            audio_placeholders += "<|audio_placeholder|>" * tokens_interval
+            audio_placeholders += self.audio_token * tokens_interval
         if num_residual_tokens > 0:
             audio_placeholders += (
                 f"<{num_full_chunks * timestamp_interval:.1f} seconds>"
             )
-            audio_placeholders += "<|audio_placeholder|>" * int(num_residual_tokens)
+            audio_placeholders += self.audio_token * int(num_residual_tokens)
         return audio_placeholders
 
     def _get_video_tokens(
@@ -484,7 +1151,7 @@ class _Qwen35ProcessorShim:
             video_placeholders.append(
                 f"<{timestamps[frame_idx]:.1f} seconds>"
                 + self.vision_bos_token
-                + "<|video_placeholder|>" * int(frame_seqlen)
+                + self.video_token * int(frame_seqlen)
                 + self.vision_eos_token
             )
 
@@ -500,11 +1167,11 @@ class _Qwen35ProcessorShim:
                     (i + 1) * video_second_per_chunk * audio_tokens_per_second
                 ) - math.floor(i * video_second_per_chunk * audio_tokens_per_second)
                 audio_token = min(audio_token, audio_length - audio_tokens)
-                with_audio.append(video_chunk + "<|audio_placeholder|>" * audio_token)
+                with_audio.append(video_chunk + self.audio_token * audio_token)
                 audio_tokens += audio_token
             with_audio.append(
                 video_placeholders[-1]
-                + "<|audio_placeholder|>" * (audio_length - audio_tokens)
+                + self.audio_token * (audio_length - audio_tokens)
             )
             with_audio.append(self.audio_eos_token)
             video_placeholders = with_audio
@@ -595,16 +1262,33 @@ class Qwen35OmniPreprocessor(Qwen3OmniPreprocessor):
         return _load_qwen3_omni_next_processor()
 
     async def _call_impl(self, payload):
-        request_inputs = _merge_request_params_into_inputs(
-            payload.request.inputs,
-            payload.request.params,
-        )
-        normalized_inputs = _normalize_openai_multimodal_inputs(request_inputs)
-        normalized_inputs = _normalize_request_level_media_aliases(normalized_inputs)
-        self._validate_limit_mm_per_prompt(
-            normalized_inputs,
+        normalize_metadata: dict[str, Any] = {}
+        _emit_event(
             request_id=payload.request_id,
+            stage=None,
+            event_name="preprocess_normalize_start",
+            metadata=normalize_metadata,
         )
+        try:
+            request_inputs = _merge_request_params_into_inputs(
+                payload.request.inputs,
+                payload.request.params,
+            )
+            normalized_inputs = _normalize_openai_multimodal_inputs(request_inputs)
+            normalized_inputs = _normalize_request_level_media_aliases(normalized_inputs)
+            self._validate_limit_mm_per_prompt(
+                normalized_inputs,
+                request_id=payload.request_id,
+            )
+            normalize_metadata["changed"] = normalized_inputs is not request_inputs
+            normalize_metadata["input_type"] = type(normalized_inputs).__name__
+        finally:
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="preprocess_normalize_end",
+                metadata=normalize_metadata,
+            )
         if (
             request_inputs is payload.request.inputs
             and normalized_inputs is request_inputs
@@ -867,6 +1551,24 @@ def _first_config_value(config: Any, aliases: tuple[str, ...]) -> Any | None:
         if value is not None:
             return value
     return None
+
+
+def _is_frame_path_video_item(item: Any) -> bool:
+    return isinstance(item, list) and bool(item) and all(isinstance(x, str) for x in item)
+
+
+def _wrap_video_frame_path_items(videos: Any) -> Any:
+    """Preserve ``[frame.jpg, ...]`` as one video item for HF processing.
+
+    The transformers version in this image recursively flattens a two-level
+    ``[[frame1, frame2]]`` input into independent video paths.  A three-level
+    ``[[[frame1, frame2]]]`` input keeps the frame list together and lets the
+    video processor treat it as a single decoded video.
+    """
+
+    if not isinstance(videos, list):
+        return videos
+    return [[item] if _is_frame_path_video_item(item) else item for item in videos]
 
 
 def _normalize_openai_multimodal_inputs(inputs: Any) -> Any:

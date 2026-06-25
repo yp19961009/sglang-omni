@@ -51,6 +51,10 @@ def test_invalid_total_gpu_memory_fraction_raises() -> None:
 def test_invalid_sglang_mem_fraction_static_raises() -> None:
     with pytest.raises(ValueError, match="mem_fraction_static"):
         SGLangServerArgsConfig(mem_fraction_static=1.0)
+    with pytest.raises(ValueError, match="max_mamba_cache_size"):
+        SGLangServerArgsConfig(max_mamba_cache_size=0)
+    with pytest.raises(ValueError, match="mamba_full_memory_ratio"):
+        SGLangServerArgsConfig(mamba_full_memory_ratio=0.0)
 
 
 def test_invalid_stage_runtime_values_raise() -> None:

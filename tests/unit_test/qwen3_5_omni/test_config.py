@@ -82,6 +82,58 @@ def test_qwen35_omni_stage_factories_are_model_specific():
     )
 
 
+def test_qwen35_omni_can_colocate_mm_aggregate_with_thinker(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_COLOCATE_MM_AGGREGATE_WITH_THINKER", "1")
+    config = Qwen35OmniSpeechPipelineConfig(model_path="dummy")
+
+    assert _stage(config, "mm_aggregate").process == _stage(config, "thinker").process
+    assert (
+        _stage(config, "mm_aggregate").project_payload["thinker"]
+        == "sglang_omni.models.qwen3_5_omni.request_builders.project_mm_aggregate_to_thinker"
+    )
+
+
+def test_qwen35_omni_can_stage_mm_aggregate_relay_on_talker_gpu(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_COLOCATE_MM_AGGREGATE_WITH_THINKER", "1")
+    monkeypatch.setenv("SGLANG_OMNI_MM_AGGREGATE_RELAY_ON_TALKER_GPU", "1")
+    config = Qwen35OmniSpeechPipelineConfig(model_path="dummy")
+
+    assert _stage(config, "mm_aggregate").process == _stage(config, "thinker").process
+    assert _stage(config, "mm_aggregate").gpu is None
+    assert _stage(config, "mm_aggregate").relay is not None
+    assert _stage(config, "mm_aggregate").relay.device == "cuda:1"
+
+
+def test_qwen35_omni_can_colocate_mm_aggregate_with_image_encoder(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_COLOCATE_MM_AGGREGATE_WITH_IMAGE_ENCODER", "1")
+    config = Qwen35OmniSpeechPipelineConfig(model_path="dummy")
+
+    assert (
+        _stage(config, "mm_aggregate").process
+        == _stage(config, "image_encoder").process
+    )
+
+
+def test_qwen35_omni_can_colocate_visual_path_with_thinker(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_COLOCATE_IMAGE_ENCODER_WITH_THINKER", "1")
+    monkeypatch.setenv("SGLANG_OMNI_COLOCATE_MM_AGGREGATE_WITH_THINKER", "1")
+    config = Qwen35OmniSpeechPipelineConfig(model_path="dummy")
+
+    assert _stage(config, "image_encoder").process == _stage(config, "thinker").process
+    assert _stage(config, "mm_aggregate").process == _stage(config, "thinker").process
+
+
+def test_qwen35_omni_can_colocate_preprocessing_visual_path_with_thinker(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_COLOCATE_PREPROCESSING_WITH_THINKER", "1")
+    monkeypatch.setenv("SGLANG_OMNI_COLOCATE_IMAGE_ENCODER_WITH_THINKER", "1")
+    monkeypatch.setenv("SGLANG_OMNI_COLOCATE_MM_AGGREGATE_WITH_THINKER", "1")
+    config = Qwen35OmniSpeechPipelineConfig(model_path="dummy")
+
+    assert _stage(config, "preprocessing").process == _stage(config, "thinker").process
+    assert _stage(config, "image_encoder").process == _stage(config, "thinker").process
+    assert _stage(config, "mm_aggregate").process == _stage(config, "thinker").process
+
+
 def test_qwen35_omni_defaults_match_native_context_envelope():
     config = Qwen35OmniSpeechPipelineConfig(model_path="dummy")
 

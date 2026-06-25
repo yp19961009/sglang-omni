@@ -6,6 +6,7 @@ visual embeddings for Qwen3-Omni's thinker stage.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Callable
 from typing import Any
@@ -356,18 +357,35 @@ class ThinkerModelRunner(ModelRunner):
             full_ds[visual_pos_masks] = ds_input
             ds_input = full_ds
 
-        hidden_states = outer.model(
-            input_ids=None,
-            positions=positions,
-            forward_batch=forward_batch,
-            inputs_embeds=input_embeds,
-            deepstack_input_embeds=ds_input,
+        forward_params = inspect.signature(outer.model.forward).parameters
+        accepts_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in forward_params.values()
         )
+        model_kwargs = {
+            "input_ids": None,
+            "positions": positions,
+            "forward_batch": forward_batch,
+        }
+        if "inputs_embeds" in forward_params or accepts_kwargs:
+            model_kwargs["inputs_embeds"] = input_embeds
+        else:
+            model_kwargs["input_embeds"] = input_embeds
+        if ds_input is not None:
+            if "deepstack_input_embeds" in forward_params or accepts_kwargs:
+                model_kwargs["deepstack_input_embeds"] = ds_input
+            elif "input_deepstack_embeds" in forward_params:
+                model_kwargs["input_deepstack_embeds"] = ds_input
 
-        logits_output = outer.language_model.logits_processor(
+        hidden_states = outer.model(**model_kwargs)
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+
+        logits_model = getattr(outer, "language_model", outer)
+        logits_output = logits_model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
-            outer.language_model.lm_head,
+            logits_model.lm_head,
             forward_batch,
         )
 

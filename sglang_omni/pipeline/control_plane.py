@@ -3,6 +3,7 @@
 
 import asyncio
 import logging
+import os
 
 import msgpack
 import zmq
@@ -21,6 +22,13 @@ from sglang_omni.proto import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
 
 def serialize_message(
@@ -167,11 +175,38 @@ class PullSocket:
         """Try to receive a message (non-blocking)."""
         if self._socket is None:
             raise RuntimeError("Socket not started")
-        try:
-            data = await asyncio.wait_for(self._socket.recv(), timeout=0)
-            return deserialize_message(data)
-        except asyncio.TimeoutError:
+        ready = await self._socket.poll(timeout=0)
+        if not ready:
             return None
+        data = await self._socket.recv()
+        return deserialize_message(data)
+
+    async def recv_wait(
+        self,
+        timeout_ms: int,
+    ) -> (
+        DataReadyMessage
+        | AbortMessage
+        | CompleteMessage
+        | StreamMessage
+        | ShutdownMessage
+        | SubmitMessage
+        | None
+    ):
+        """Wait up to timeout_ms for a message."""
+        if self._socket is None:
+            raise RuntimeError("Socket not started")
+        ready = await self._socket.poll(timeout=timeout_ms)
+        if not ready:
+            return None
+        data = await self._socket.recv()
+        return deserialize_message(data)
+
+    @property
+    def socket(self) -> zmq.asyncio.Socket:
+        if self._socket is None:
+            raise RuntimeError("Socket not started")
+        return self._socket
 
     def close(self) -> None:
         """Close the socket."""
@@ -266,26 +301,43 @@ class StageControlPlane:
         recv_endpoint: str,
         coordinator_endpoint: str,
         abort_endpoint: str,
+        stream_recv_endpoint: str | None = None,
     ):
         self.stage_name = stage_name
         self.recv_endpoint = recv_endpoint
+        self.stream_recv_endpoint = stream_recv_endpoint
         self.coordinator_endpoint = coordinator_endpoint
         self.abort_endpoint = abort_endpoint
 
         self._recv_socket: PullSocket | None = None
+        self._stream_recv_socket: PullSocket | None = None
         self._coordinator_socket: PushSocket | None = None
+        self._coordinator_low_priority_socket: PushSocket | None = None
         self._abort_socket: SubSocket | None = None
         self._next_stage_sockets: dict[str, PushSocket] = {}
+        self._next_stage_stream_sockets: dict[str, PushSocket] = {}
+        self._stream_priority_burst = max(
+            1, _env_int("SGLANG_OMNI_STREAM_PRIORITY_BURST", 4)
+        )
+        self._stream_priority_normal_wait_ms = max(
+            0, _env_int("SGLANG_OMNI_STREAM_PRIORITY_NORMAL_WAIT_MS", 2)
+        )
+        self._consecutive_stream_receives = 0
 
     async def start(self) -> None:
         """Initialize all sockets."""
         # Socket to receive work
         self._recv_socket = PullSocket(self.recv_endpoint, bind=True)
         await self._recv_socket.start()
+        if self.stream_recv_endpoint:
+            self._stream_recv_socket = PullSocket(self.stream_recv_endpoint, bind=True)
+            await self._stream_recv_socket.start()
 
         # Socket to send completions to coordinator
         self._coordinator_socket = PushSocket(self.coordinator_endpoint)
         await self._coordinator_socket.connect()
+        self._coordinator_low_priority_socket = PushSocket(self.coordinator_endpoint)
+        await self._coordinator_low_priority_socket.connect()
 
         # Socket to receive abort broadcasts
         self._abort_socket = SubSocket(self.abort_endpoint)
@@ -305,7 +357,7 @@ class StageControlPlane:
         """Receive work from previous stage or coordinator."""
         if self._recv_socket is None:
             raise RuntimeError("Control plane not started")
-        msg = await self._recv_socket.recv()
+        msg = await self._recv_any()
         if isinstance(
             msg,
             (
@@ -319,6 +371,60 @@ class StageControlPlane:
             return msg
         raise ValueError(f"Unexpected message type: {type(msg)}")
 
+    async def _recv_any(
+        self,
+    ) -> (
+        DataReadyMessage
+        | AbortMessage
+        | CompleteMessage
+        | StreamMessage
+        | ShutdownMessage
+        | SubmitMessage
+    ):
+        if self._recv_socket is None:
+            raise RuntimeError("Control plane not started")
+        if self._stream_recv_socket is None:
+            return await self._recv_socket.recv()
+
+        if self._consecutive_stream_receives >= self._stream_priority_burst:
+            normal_msg = await self._recv_socket.recv_nowait()
+            if normal_msg is not None:
+                self._consecutive_stream_receives = 0
+                return normal_msg
+            if self._stream_priority_normal_wait_ms > 0:
+                normal_msg = await self._recv_socket.recv_wait(
+                    self._stream_priority_normal_wait_ms
+                )
+                if normal_msg is not None:
+                    self._consecutive_stream_receives = 0
+                    return normal_msg
+
+        # Prefer stream notifications when already queued. The burst cap above
+        # prevents a long stream from starving normal payload notifications.
+        stream_msg = await self._stream_recv_socket.recv_nowait()
+        if stream_msg is not None:
+            self._consecutive_stream_receives += 1
+            return stream_msg
+
+        normal_msg = await self._recv_socket.recv_nowait()
+        if normal_msg is not None:
+            self._consecutive_stream_receives = 0
+            return normal_msg
+
+        poller = zmq.asyncio.Poller()
+        normal_socket = self._recv_socket.socket
+        stream_socket = self._stream_recv_socket.socket
+        poller.register(normal_socket, zmq.POLLIN)
+        poller.register(stream_socket, zmq.POLLIN)
+        events = dict(await poller.poll())
+        if stream_socket in events:
+            data = await stream_socket.recv()
+            self._consecutive_stream_receives += 1
+            return deserialize_message(data)
+        data = await normal_socket.recv()
+        self._consecutive_stream_receives = 0
+        return deserialize_message(data)
+
     async def send_to_stage(
         self, next_stage: str, next_stage_endpoint: str, msg: DataReadyMessage
     ) -> None:
@@ -330,11 +436,29 @@ class StageControlPlane:
 
         await self._next_stage_sockets[next_stage].send(msg)
 
+    async def send_stream_to_stage(
+        self, next_stage: str, next_stage_endpoint: str, msg: DataReadyMessage
+    ) -> None:
+        """Send a high-priority stream notification to a stage stream endpoint."""
+        if next_stage not in self._next_stage_stream_sockets:
+            sock = PushSocket(next_stage_endpoint)
+            await sock.connect()
+            self._next_stage_stream_sockets[next_stage] = sock
+
+        await self._next_stage_stream_sockets[next_stage].send(msg)
+
     async def send_complete(self, msg: CompleteMessage) -> None:
         """Send completion notification to coordinator."""
         if self._coordinator_socket is None:
             raise RuntimeError("Control plane not started")
         await self._coordinator_socket.send(msg)
+
+    async def send_complete_low_priority(self, msg: CompleteMessage) -> None:
+        """Send a low-priority completion without blocking stream sends."""
+        if self._coordinator_low_priority_socket is None:
+            await self.send_complete(msg)
+            return
+        await self._coordinator_low_priority_socket.send(msg)
 
     async def send_stream(self, msg: StreamMessage) -> None:
         """Send a stream chunk to coordinator."""
@@ -355,13 +479,20 @@ class StageControlPlane:
         """Close all sockets."""
         if self._recv_socket:
             self._recv_socket.close()
+        if self._stream_recv_socket:
+            self._stream_recv_socket.close()
         if self._coordinator_socket:
             self._coordinator_socket.close()
+        if self._coordinator_low_priority_socket:
+            self._coordinator_low_priority_socket.close()
         if self._abort_socket:
             self._abort_socket.close()
         for sock in self._next_stage_sockets.values():
             sock.close()
         self._next_stage_sockets.clear()
+        for sock in self._next_stage_stream_sockets.values():
+            sock.close()
+        self._next_stage_stream_sockets.clear()
 
 
 class CoordinatorControlPlane:
