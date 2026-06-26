@@ -32,6 +32,7 @@ MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-}"
 THINKER_MEM_FRACTION_STATIC="${THINKER_MEM_FRACTION_STATIC:-}"
 TALKER_MEM_FRACTION_STATIC="${TALKER_MEM_FRACTION_STATIC:-}"
 ENCODER_MEM_RESERVE="${ENCODER_MEM_RESERVE:-}"
+TALKER_PARTIAL_START_MIN_CHUNKS="${TALKER_PARTIAL_START_MIN_CHUNKS:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 # Qwen3.5 RTC emits tiny decode-token stream chunks alongside larger talker
@@ -86,6 +87,10 @@ if [[ -n "$ENCODER_MEM_RESERVE" ]]; then
   server_args+=(--encoder-mem-reserve "$ENCODER_MEM_RESERVE")
 fi
 
+if [[ -n "$TALKER_PARTIAL_START_MIN_CHUNKS" ]]; then
+  server_args+=(--talker-partial-start-min-chunks "$TALKER_PARTIAL_START_MIN_CHUNKS")
+fi
+
 if [[ -n "$EXTRA_ARGS" ]]; then
   # shellcheck disable=SC2206
   extra_args_array=($EXTRA_ARGS)
@@ -107,6 +112,7 @@ printf -v quoted_server_cmd "%q " "${server_args[@]}"
 echo "[qwen35] launching SGLang server in container=$CONTAINER"
 echo "[qwen35] model=$MODEL_PATH"
 echo "[qwen35] listen=http://$HOST:$PORT voice=$VOICE_TYPE prefix_caching=$PREFIX_CACHING"
+echo "[qwen35] talker_partial_start_min_chunks=${TALKER_PARTIAL_START_MIN_CHUNKS:-pipeline_default}"
 echo "[qwen35] stream_inline_cpu_max_bytes=$SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES decode_stream_token_batch_size=$SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE decode_stream_immediate_token_count=$SGLANG_OMNI_DECODE_STREAM_IMMEDIATE_TOKEN_COUNT decode_stream_priority_burst=$SGLANG_OMNI_STREAM_PRIORITY_BURST_DECODE decode_stream_priority_normal_wait_ms=$SGLANG_OMNI_STREAM_PRIORITY_NORMAL_WAIT_MS_DECODE defer_prefill_during_priority_decode=$SGLANG_OMNI_DEFER_PREFILL_DURING_PRIORITY_DECODE"
 
 docker exec "${docker_env_args[@]}" "$CONTAINER" bash -lc \
