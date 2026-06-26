@@ -98,7 +98,9 @@ class _PriorityFirstStreamInbox:
             item = msg.data
             return 0 if getattr(item, "chunk_id", None) == 0 else 1
         if msg.type == "stream_done":
-            return 2
+            return 1
+        if _is_streaming_actual_payload(msg):
+            return 1
         return 3
 
     def put(
@@ -125,6 +127,18 @@ class _PriorityFirstStreamInbox:
 
     def qsize(self) -> int:
         return self._queue.qsize()
+
+
+def _is_streaming_actual_payload(msg: IncomingMessage) -> bool:
+    if msg.type != "new_request":
+        return False
+    payload = msg.data
+    request = getattr(payload, "request", None)
+    params = getattr(request, "params", None)
+    if not bool((params or {}).get("stream", False)):
+        return False
+    metadata = getattr(request, "metadata", None)
+    return not (isinstance(metadata, dict) and bool(metadata.get("pre_run")))
 
 
 class _PriorityStreamOutbox:
@@ -581,15 +595,23 @@ class StreamingDetokenizeScheduler:
         if finish_reason is not None:
             result.setdefault("finish_reason", finish_reason)
 
-        input_ids = (
-            state.prompt.get("input_ids") if isinstance(state.prompt, dict) else None
+        prompt_tokens_value = (
+            state.prompt.get("prompt_tokens") if isinstance(state.prompt, dict) else None
         )
-        if input_ids is None:
-            prompt_tokens = 0
-        elif hasattr(input_ids, "numel"):
-            prompt_tokens = int(input_ids.numel())
+        if prompt_tokens_value is not None:
+            prompt_tokens = int(prompt_tokens_value)
         else:
-            prompt_tokens = len(input_ids)
+            input_ids = (
+                state.prompt.get("input_ids") if isinstance(state.prompt, dict) else None
+            )
+            if input_ids is None:
+                prompt_tokens = 0
+            elif hasattr(input_ids, "numel"):
+                prompt_tokens = int(input_ids.numel())
+            else:
+                prompt_tokens = len(input_ids)
+        if prompt_tokens < 0:
+            prompt_tokens = 0
 
         completion_ids = thinker_out.get("output_ids") or []
         completion_tokens = len(completion_ids)

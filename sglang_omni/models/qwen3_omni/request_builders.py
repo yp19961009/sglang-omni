@@ -485,6 +485,7 @@ def resolve_mm_aggregate_wait_sources(
 def project_thinker_to_decode(payload: StagePayload) -> StagePayload:
     """Keep decode payload focused on text detokenization state."""
     state = Qwen3OmniPipelineState.from_dict(payload.data)
+    state.prompt = _prompt_token_count_only(state.prompt)
     state.thinker_inputs = {}
     state.stream_state = _copy_mutable_containers(state.stream_state)
 
@@ -509,6 +510,30 @@ def project_thinker_to_decode(payload: StagePayload) -> StagePayload:
         request=payload.request,
         data=state.to_dict(),
     )
+
+
+def _prompt_token_count_only(prompt: Any) -> dict[str, Any] | None:
+    if not isinstance(prompt, dict):
+        return None
+    prompt_tokens = _sequence_length(prompt.get("input_ids"))
+    if prompt_tokens is None:
+        return None
+    return {"prompt_tokens": prompt_tokens}
+
+
+def _sequence_length(value: Any) -> int | None:
+    if value is None:
+        return None
+    numel = getattr(value, "numel", None)
+    if callable(numel):
+        try:
+            return int(numel())
+        except (TypeError, ValueError):
+            return None
+    try:
+        return len(value)
+    except TypeError:
+        return None
 
 
 def project_talker_to_code2wav(payload: StagePayload) -> StagePayload:

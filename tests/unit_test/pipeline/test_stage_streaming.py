@@ -33,6 +33,7 @@ class _FakeControlPlane:
     def __init__(self) -> None:
         self.streams = []
         self.stage_messages = []
+        self.stream_stage_messages = []
         self.completions = []
 
     async def start(self) -> None:
@@ -46,6 +47,16 @@ class _FakeControlPlane:
 
     async def send_to_stage(self, target, endpoint, msg) -> None:
         self.stage_messages.append((target, endpoint, msg))
+
+    async def send_stream_to_stage(self, target, endpoint, msg) -> None:
+        if (
+            getattr(msg, "chunk_id", None) is None
+            and not getattr(msg, "is_done", False)
+            and not getattr(msg, "error", None)
+        ):
+            self.stream_stage_messages.append((target, endpoint, msg))
+        else:
+            self.stage_messages.append((target, endpoint, msg))
 
     async def send_complete(self, msg) -> None:
         self.completions.append(msg)
@@ -691,6 +702,108 @@ def test_stage_cross_process_payload_does_not_block_on_relay_completion() -> Non
         assert len(relay.puts) == 1
         assert len(stage._stream_relay_completion_tasks) == 1
         assert relay.ops[0].started.is_set()
+
+        for task in list(stage._stream_relay_completion_tasks):
+            task.cancel()
+        await asyncio.gather(
+            *stage._stream_relay_completion_tasks,
+            return_exceptions=True,
+        )
+
+    asyncio.run(_run())
+
+
+def test_stage_streaming_payload_to_stream_target_uses_stream_endpoint() -> None:
+    async def _run() -> None:
+        control_plane = _FakeControlPlane()
+        relay = _HangingRelay()
+        stage = Stage(
+            name="thinker",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={"decode": "inproc://decode"},
+            stream_endpoints={"decode": "inproc://decode-stream"},
+            control_plane=control_plane,
+            relay=relay,
+            scheduler=SimpleNamespace(),
+        )
+        payload = StagePayload(
+            request_id="req",
+            request=OmniRequest(inputs="hello", params={"stream": True}),
+            data={"value": torch.arange(4, dtype=torch.float32)},
+        )
+
+        await asyncio.wait_for(
+            stage._send_to_stage(
+                "req",
+                "decode",
+                payload,
+                stream_targets_for_request={"decode"},
+            ),
+            timeout=0.5,
+        )
+        await asyncio.sleep(0)
+
+        assert control_plane.stage_messages == []
+        assert len(control_plane.stream_stage_messages) == 1
+        target, endpoint, msg = control_plane.stream_stage_messages[0]
+        assert target == "decode"
+        assert endpoint == "inproc://decode-stream"
+        assert isinstance(msg, DataReadyMessage)
+        assert len(relay.puts) == 1
+        assert len(stage._stream_relay_completion_tasks) == 1
+
+        for task in list(stage._stream_relay_completion_tasks):
+            task.cancel()
+        await asyncio.gather(
+            *stage._stream_relay_completion_tasks,
+            return_exceptions=True,
+        )
+
+    asyncio.run(_run())
+
+
+def test_stage_non_streaming_payload_to_stream_target_uses_normal_endpoint() -> None:
+    async def _run() -> None:
+        control_plane = _FakeControlPlane()
+        relay = _HangingRelay()
+        stage = Stage(
+            name="thinker",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={"decode": "inproc://decode"},
+            stream_endpoints={"decode": "inproc://decode-stream"},
+            control_plane=control_plane,
+            relay=relay,
+            scheduler=SimpleNamespace(),
+        )
+        payload = StagePayload(
+            request_id="req",
+            request=OmniRequest(inputs="hello", params={"stream": False}),
+            data={"value": torch.arange(4, dtype=torch.float32)},
+        )
+
+        await asyncio.wait_for(
+            stage._send_to_stage(
+                "req",
+                "decode",
+                payload,
+                stream_targets_for_request={"decode"},
+            ),
+            timeout=0.5,
+        )
+        await asyncio.sleep(0)
+
+        assert control_plane.stream_stage_messages == []
+        assert len(control_plane.stage_messages) == 1
+        target, endpoint, msg = control_plane.stage_messages[0]
+        assert target == "decode"
+        assert endpoint == "inproc://decode"
+        assert isinstance(msg, DataReadyMessage)
+        assert len(relay.puts) == 1
+        assert len(stage._stream_relay_completion_tasks) == 1
 
         for task in list(stage._stream_relay_completion_tasks):
             task.cancel()

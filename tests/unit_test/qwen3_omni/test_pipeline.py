@@ -206,6 +206,7 @@ def test_qwen_thinker_to_decode_projection_drops_multimodal_tensors() -> None:
     state = Qwen3OmniPipelineState.from_dict(projected.data)
 
     assert state.thinker_inputs == {}
+    assert state.prompt == {"prompt_tokens": 2}
     assert state.thinker_out["output_ids"] == [3]
     assert state.thinker_out["extra_model_outputs"] == {}
     assert state.engine_outputs["thinker"]["output_ids"] == [3]

@@ -47,6 +47,7 @@ _STREAM_RELAY_COMPLETION_DEFAULT_TIMEOUT_S = 300.0
 _DEFER_NONSTREAM_COMPLETES_ENV = "SGLANG_OMNI_DEFER_NONSTREAM_COMPLETES"
 _STAGE_IO_YIELD_EVERY_MESSAGES_ENV = "SGLANG_OMNI_STAGE_IO_YIELD_EVERY_MESSAGES"
 _ASYNC_STREAM_INGEST_ENV = "SGLANG_OMNI_ASYNC_STREAM_INGEST"
+_STREAM_PAYLOAD_ON_STREAM_ENDPOINT_ENV = "SGLANG_OMNI_STREAM_PAYLOAD_ON_STREAM_ENDPOINT"
 
 
 def _stream_relay_completion_timeout() -> float | None:
@@ -89,6 +90,13 @@ def _stage_io_yield_every_messages() -> int:
         )
         return 1
     return max(0, value)
+
+
+def _stream_payload_on_stream_endpoint_enabled() -> bool:
+    raw = os.getenv(_STREAM_PAYLOAD_ON_STREAM_ENDPOINT_ENV)
+    if raw is None or raw == "":
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _async_stream_ingest_enabled() -> bool:
@@ -1201,13 +1209,45 @@ class Stage:
                 "payload_pickle_bytes": metadata.get("payload_pickle_bytes"),
             },
         )
-        await self.control_plane.send_to_stage(target, endpoint, msg)
+        stream_payload_endpoint = self._payload_stream_endpoint(
+            target,
+            projected_payload,
+            stream_targets_for_request=stream_targets_for_request,
+        )
+        if stream_payload_endpoint is not None:
+            await self.control_plane.send_stream_to_stage(
+                target,
+                stream_payload_endpoint,
+                msg,
+            )
+        else:
+            await self.control_plane.send_to_stage(target, endpoint, msg)
         self._track_relay_completion(
             kind="payload",
             request_id=request_id,
             target=target,
             pending_ops=[op],
         )
+
+    def _payload_stream_endpoint(
+        self,
+        target: str,
+        payload: Any,
+        *,
+        stream_targets_for_request: set[str] | None,
+    ) -> str | None:
+        if not _stream_payload_on_stream_endpoint_enabled():
+            return None
+        if stream_targets_for_request is None or target not in stream_targets_for_request:
+            return None
+        endpoint = self.stream_endpoints.get(target)
+        if endpoint is None:
+            return None
+        request = getattr(payload, "request", None)
+        params = getattr(request, "params", None)
+        if not bool((params or {}).get("stream", False)):
+            return None
+        return endpoint
 
     @staticmethod
     def _is_isolated_projected_payload(

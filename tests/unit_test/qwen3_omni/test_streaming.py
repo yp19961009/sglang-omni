@@ -107,6 +107,12 @@ def _make_payload(stream: bool) -> StagePayload:
     )
 
 
+def _make_prerun_payload(stream: bool) -> StagePayload:
+    payload = _make_payload(stream)
+    payload.request.metadata["pre_run"] = True
+    return payload
+
+
 def _drain_outbox(scheduler: StreamingDetokenizeScheduler) -> list[OutgoingMessage]:
     out: list[OutgoingMessage] = []
     while not scheduler.outbox.empty():
@@ -139,6 +145,65 @@ def test_decode_priority_first_stream_inbox_promotes_first_chunk():
     assert inbox.get_nowait() is first_chunk
     assert inbox.get_nowait() is old_chunk
     assert inbox.get_nowait() is old_payload
+
+
+def test_decode_priority_first_stream_inbox_promotes_streaming_actual_payload():
+    inbox = _PriorityFirstStreamInbox()
+    prerun_payload = IncomingMessage(
+        request_id="prerun",
+        type="new_request",
+        data=_make_prerun_payload(stream=True),
+    )
+    actual_payload = IncomingMessage(
+        request_id="actual",
+        type="new_request",
+        data=_make_payload(stream=True),
+    )
+    stream_done = IncomingMessage(
+        request_id="actual",
+        type="stream_done",
+    )
+
+    inbox.put(prerun_payload)
+    inbox.put(actual_payload)
+    inbox.put(stream_done)
+
+    assert inbox.get_nowait() is actual_payload
+    assert inbox.get_nowait() is stream_done
+    assert inbox.get_nowait() is prerun_payload
+
+
+def test_decode_priority_first_stream_inbox_keeps_payload_done_ahead_of_later_chunks():
+    inbox = _PriorityFirstStreamInbox()
+    old_chunk = IncomingMessage(
+        request_id="old",
+        type="stream_chunk",
+        data=StreamItem(chunk_id=1, data=1, from_stage="thinker"),
+    )
+    actual_payload = IncomingMessage(
+        request_id="actual",
+        type="new_request",
+        data=_make_payload(stream=True),
+    )
+    stream_done = IncomingMessage(
+        request_id="actual",
+        type="stream_done",
+    )
+    later_chunk = IncomingMessage(
+        request_id="later",
+        type="stream_chunk",
+        data=StreamItem(chunk_id=2, data=2, from_stage="thinker"),
+    )
+
+    inbox.put(old_chunk)
+    inbox.put(actual_payload)
+    inbox.put(stream_done)
+    inbox.put(later_chunk)
+
+    assert inbox.get_nowait() is old_chunk
+    assert inbox.get_nowait() is actual_payload
+    assert inbox.get_nowait() is stream_done
+    assert inbox.get_nowait() is later_chunk
 
 
 def test_decode_priority_first_stream_inbox_can_be_disabled(monkeypatch):
