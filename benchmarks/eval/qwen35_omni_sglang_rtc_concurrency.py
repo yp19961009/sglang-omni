@@ -40,6 +40,13 @@ def _mean(values: list[float]) -> float | None:
     return statistics.fmean(values) if values else None
 
 
+def _last_audio_ms(row: dict[str, Any]) -> float | None:
+    ttfa_ms = row.get("ttfa_ms")
+    if ttfa_ms is None:
+        return None
+    return float(ttfa_ms) + sum(float(v) for v in row.get("inter_chunk_ms") or [])
+
+
 def _compact_error(exc: BaseException) -> str:
     return "".join(traceback.format_exception_only(type(exc), exc)).strip()
 
@@ -213,6 +220,7 @@ async def _run_actual(
         "video_start_idx": offsets["video_start_idx"],
         "question_idx": offsets["question_idx"],
     }
+    row["last_audio_ms"] = _last_audio_ms(row)
     (sample_dir / "result.json").write_text(
         json.dumps(row, indent=2, ensure_ascii=False),
         encoding="utf-8",
@@ -444,6 +452,11 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     failed = len(errors)
     ttft = [float(row["ttft_ms"]) for row in rows if row.get("ttft_ms") is not None]
     ttfa = [float(row["ttfa_ms"]) for row in rows if row.get("ttfa_ms") is not None]
+    last_audio = [
+        float(row["last_audio_ms"])
+        for row in rows
+        if row.get("last_audio_ms") is not None
+    ]
     e2e = [float(row["e2e_total_ms"]) for row in rows]
     audio_dur = [
         float(row["audio_duration_s"])
@@ -477,6 +490,10 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "ttfa_p50_ms": _percentile(ttfa, 50),
         "ttfa_p95_ms": _percentile(ttfa, 95),
         "ttfa_p99_ms": _percentile(ttfa, 99),
+        "last_audio_avg_ms": _mean(last_audio),
+        "last_audio_p50_ms": _percentile(last_audio, 50),
+        "last_audio_p95_ms": _percentile(last_audio, 95),
+        "last_audio_p99_ms": _percentile(last_audio, 99),
         "e2e_avg_ms": _mean(e2e),
         "e2e_p50_ms": _percentile(e2e, 50),
         "e2e_p95_ms": _percentile(e2e, 95),

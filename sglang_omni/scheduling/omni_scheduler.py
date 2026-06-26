@@ -462,6 +462,7 @@ class OmniScheduler:
         self._defer_prefill_during_priority_decode = (
             _defer_prefill_during_priority_decode_enabled()
         )
+        self._priority_prefill_rids: set[str] = set()
 
     def _init_upstream_compat_flags(self, server_args: Any) -> None:
         self.enable_hisparse = bool(getattr(server_args, "enable_hisparse", False))
@@ -675,6 +676,13 @@ class OmniScheduler:
         """Keep RTC actual prefill ahead of background pre-run cache writes."""
 
         if (
+            self._defer_prefill_during_priority_decode
+            and self.waiting_queue
+            and self._running_batch_has_priority_prefill_req()
+        ):
+            return None
+
+        if (
             self._prioritize_stream_prefill
             and self.chunked_req is None
             and self.waiting_queue
@@ -704,6 +712,7 @@ class OmniScheduler:
                 if not bool(getattr(req, _PRIORITIZE_PREFILL_ATTR, False))
             ]
             self.waiting_queue = selected_priority_reqs
+            self._remember_priority_prefill_reqs(selected_priority_reqs)
             try:
                 return _Upstream.get_new_batch_prefill(self)
             finally:
@@ -712,17 +721,6 @@ class OmniScheduler:
                     *deferred_priority_reqs,
                     *hidden_reqs,
                 ]
-
-        if (
-            self._defer_prefill_during_priority_decode
-            and self.waiting_queue
-            and self.running_batch is not None
-            and any(
-                bool(getattr(req, _PRIORITIZE_PREFILL_ATTR, False))
-                for req in getattr(self.running_batch, "reqs", [])
-            )
-        ):
-            return None
 
         if (
             not self._isolate_prefill_only_batches
@@ -749,6 +747,26 @@ class OmniScheduler:
             return _Upstream.get_new_batch_prefill(self)
         finally:
             self.waiting_queue = [*self.waiting_queue, *hidden_reqs]
+
+    def _remember_priority_prefill_reqs(self, reqs: list[Any]) -> None:
+        priority_rids = self.__dict__.setdefault("_priority_prefill_rids", set())
+        for req in reqs:
+            rid = getattr(req, "rid", None)
+            if rid is not None:
+                priority_rids.add(rid)
+
+    def _forget_priority_prefill_rid(self, rid: str) -> None:
+        self.__dict__.setdefault("_priority_prefill_rids", set()).discard(rid)
+
+    def _running_batch_has_priority_prefill_req(self) -> bool:
+        if self.running_batch is None:
+            return False
+        priority_rids = self.__dict__.setdefault("_priority_prefill_rids", set())
+        return any(
+            bool(getattr(req, _PRIORITIZE_PREFILL_ATTR, False))
+            or getattr(req, "rid", None) in priority_rids
+            for req in getattr(self.running_batch, "reqs", [])
+        )
 
     def _prepare_request_limits(self, req_data: Any) -> str | None:
         req = req_data.req
@@ -1027,6 +1045,7 @@ class OmniScheduler:
             finally:
                 data.prefill_input_embeds = None
                 data.decode_input_embeds = None
+                self._forget_priority_prefill_rid(rid)
 
             self._first_emit_done.discard(rid)
             self._prefill_start_done.discard(rid)
@@ -1100,6 +1119,7 @@ class OmniScheduler:
         self._dirty_deferred_request_ids.discard(request_id)
         self.__dict__.setdefault("_first_emit_done", set()).discard(request_id)
         self.__dict__.setdefault("_prefill_start_done", set()).discard(request_id)
+        self._forget_priority_prefill_rid(request_id)
         self.waiting_queue = [
             req for req in self.waiting_queue if req.rid != request_id
         ]

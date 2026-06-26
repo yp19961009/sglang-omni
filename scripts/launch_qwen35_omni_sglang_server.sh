@@ -8,6 +8,7 @@
 # Useful overrides:
 #   PORT=8161 VOICE_TYPE=m02 bash scripts/launch_qwen35_omni_sglang_server.sh
 #   PREFIX_CACHING=off bash scripts/launch_qwen35_omni_sglang_server.sh
+#   THINKER_CUDA_GRAPH=on bash scripts/launch_qwen35_omni_sglang_server.sh
 #   EXTRA_ARGS="--code2wav-stream-chunk-size 4" bash scripts/launch_...
 
 set -euo pipefail
@@ -24,15 +25,21 @@ MAX_TOKENS="${MAX_TOKENS:-512}"
 SEED="${SEED:-3408}"
 GPU_THINKER="${GPU_THINKER:-0}"
 GPU_TALKER="${GPU_TALKER:-1}"
-GPU_CODE2WAV="${GPU_CODE2WAV:-1}"
+GPU_CODE2WAV="${GPU_CODE2WAV:-2}"
 THINKER_MAX_SEQ_LEN="${THINKER_MAX_SEQ_LEN:-192000}"
 PREFIX_CACHING="${PREFIX_CACHING:-on}"
-NO_CODE2WAV_TORCH_COMPILE="${NO_CODE2WAV_TORCH_COMPILE:-1}"
+NO_CODE2WAV_TORCH_COMPILE="${NO_CODE2WAV_TORCH_COMPILE:-0}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-}"
 THINKER_MEM_FRACTION_STATIC="${THINKER_MEM_FRACTION_STATIC:-}"
 TALKER_MEM_FRACTION_STATIC="${TALKER_MEM_FRACTION_STATIC:-}"
 ENCODER_MEM_RESERVE="${ENCODER_MEM_RESERVE:-}"
 TALKER_PARTIAL_START_MIN_CHUNKS="${TALKER_PARTIAL_START_MIN_CHUNKS:-}"
+THINKER_CUDA_GRAPH="${THINKER_CUDA_GRAPH:-off}"
+TALKER_CUDA_GRAPH="${TALKER_CUDA_GRAPH:-on}"
+TALKER_TORCH_COMPILE="${TALKER_TORCH_COMPILE:-on}"
+THINKER_MAX_RUNNING_REQUESTS="${THINKER_MAX_RUNNING_REQUESTS:-7}"
+TALKER_MAX_RUNNING_REQUESTS="${TALKER_MAX_RUNNING_REQUESTS:-10}"
+CODE2WAV_STREAM_CHUNK_SIZE="${CODE2WAV_STREAM_CHUNK_SIZE:-4}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 # Qwen3.5 RTC emits tiny decode-token stream chunks alongside larger talker
@@ -63,6 +70,12 @@ server_args=(
   --thinker-max-seq-len "$THINKER_MAX_SEQ_LEN"
   --code2wav-model-path "$CODE2WAV_PATH"
   --prefix-caching "$PREFIX_CACHING"
+  --code2wav-stream-chunk-size "$CODE2WAV_STREAM_CHUNK_SIZE"
+  --thinker-cuda-graph "$THINKER_CUDA_GRAPH"
+  --talker-cuda-graph "$TALKER_CUDA_GRAPH"
+  --talker-torch-compile "$TALKER_TORCH_COMPILE"
+  --thinker-max-running-requests "$THINKER_MAX_RUNNING_REQUESTS"
+  --talker-max-running-requests "$TALKER_MAX_RUNNING_REQUESTS"
 )
 
 if [[ "$NO_CODE2WAV_TORCH_COMPILE" == "1" ]]; then
@@ -112,7 +125,9 @@ printf -v quoted_server_cmd "%q " "${server_args[@]}"
 echo "[qwen35] launching SGLang server in container=$CONTAINER"
 echo "[qwen35] model=$MODEL_PATH"
 echo "[qwen35] listen=http://$HOST:$PORT voice=$VOICE_TYPE prefix_caching=$PREFIX_CACHING"
+echo "[qwen35] gpus thinker=$GPU_THINKER talker=$GPU_TALKER code2wav=$GPU_CODE2WAV"
 echo "[qwen35] talker_partial_start_min_chunks=${TALKER_PARTIAL_START_MIN_CHUNKS:-pipeline_default}"
+echo "[qwen35] thinker_cuda_graph=$THINKER_CUDA_GRAPH talker_cuda_graph=$TALKER_CUDA_GRAPH talker_torch_compile=$TALKER_TORCH_COMPILE thinker_max_running=$THINKER_MAX_RUNNING_REQUESTS talker_max_running=$TALKER_MAX_RUNNING_REQUESTS code2wav_stream_chunk_size=$CODE2WAV_STREAM_CHUNK_SIZE"
 echo "[qwen35] stream_inline_cpu_max_bytes=$SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES decode_stream_token_batch_size=$SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE decode_stream_immediate_token_count=$SGLANG_OMNI_DECODE_STREAM_IMMEDIATE_TOKEN_COUNT decode_stream_priority_burst=$SGLANG_OMNI_STREAM_PRIORITY_BURST_DECODE decode_stream_priority_normal_wait_ms=$SGLANG_OMNI_STREAM_PRIORITY_NORMAL_WAIT_MS_DECODE defer_prefill_during_priority_decode=$SGLANG_OMNI_DEFER_PREFILL_DURING_PRIORITY_DECODE"
 
 docker exec "${docker_env_args[@]}" "$CONTAINER" bash -lc \
