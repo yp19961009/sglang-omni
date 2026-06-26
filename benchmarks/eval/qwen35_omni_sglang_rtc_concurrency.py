@@ -77,6 +77,29 @@ def _session_context(
     }
 
 
+def _apply_talker_request_options(
+    payload: dict[str, Any], args: argparse.Namespace
+) -> None:
+    option_names = (
+        "talker_temperature",
+        "talker_top_k",
+        "talker_top_p",
+        "talker_min_p",
+        "talker_repetition_penalty",
+        "talker_seed",
+        "subtalker_temperature",
+        "subtalker_top_k",
+        "subtalker_top_p",
+        "subtalker_min_p",
+        "subtalker_repetition_penalty",
+        "subtalker_seed",
+    )
+    for name in option_names:
+        value = getattr(args, name, None)
+        if value is not None:
+            payload[name] = value
+
+
 async def _run_preruns(
     *,
     session: aiohttp.ClientSession,
@@ -169,6 +192,7 @@ async def _run_actual(
     if not args.text_only:
         payload["audio"] = {"format": "wav", "voice": args.voice}
     _apply_video_request_options(payload, args)
+    _apply_talker_request_options(payload, args)
 
     measured = await post_chat(
         session,
@@ -514,6 +538,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prerun-max-tokens", type=int, default=0)
     parser.add_argument("--post-prerun-sleep-ms", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--talker-temperature", type=float, default=None)
+    parser.add_argument("--talker-top-k", type=int, default=None)
+    parser.add_argument("--talker-top-p", type=float, default=None)
+    parser.add_argument("--talker-min-p", type=float, default=None)
+    parser.add_argument("--talker-repetition-penalty", type=float, default=None)
+    parser.add_argument("--talker-seed", type=int, default=None)
+    parser.add_argument("--subtalker-temperature", type=float, default=None)
+    parser.add_argument("--subtalker-top-k", type=int, default=None)
+    parser.add_argument("--subtalker-top-p", type=float, default=None)
+    parser.add_argument("--subtalker-min-p", type=float, default=None)
+    parser.add_argument("--subtalker-repetition-penalty", type=float, default=None)
+    parser.add_argument("--subtalker-seed", type=int, default=None)
     parser.add_argument("--voice", default="f245")
     parser.add_argument("--audio-only", action="store_true")
     parser.add_argument("--text-only", action="store_true")

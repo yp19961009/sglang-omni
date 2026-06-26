@@ -239,10 +239,13 @@ class QwenTalkerModelRunner(ModelRunner):
             batch_size=len(requests),
         )
         try:
+            batch_size = len(requests)
+            code_chunks = self.model._output_codes[:batch_size].detach().clone()
+            feedback_rows = self.model._output_embeds[:batch_size].detach().clone()
             for idx, sched_req in enumerate(requests):
                 req = schedule_batch.reqs[idx]
-                code_chunk = self.model._output_codes[idx].detach().clone()
-                feedback_row = self.model._output_embeds[idx].detach().clone()
+                code_chunk = code_chunks[idx]
+                feedback_row = feedback_rows[idx]
                 should_emit = bool(
                     getattr(sched_req.data, "last_talker_decode_should_emit", True)
                 )

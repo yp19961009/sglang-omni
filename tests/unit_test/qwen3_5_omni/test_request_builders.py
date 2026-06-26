@@ -209,9 +209,29 @@ def test_qwen35_audio_output_resolvers_honor_params_modalities():
     assert request_builders.resolve_terminal_stages(payload.request) == ["decode"]
 
 
-def test_qwen35_rtc_prerun_resolvers_keep_decode_terminal_by_default(monkeypatch):
+def test_qwen35_rtc_prerun_resolvers_terminate_at_thinker_by_default(monkeypatch):
     monkeypatch.delenv("QWEN35_RTC_PRERUN_PREFILL_ONLY", raising=False)
     monkeypatch.delenv("QWEN35_RTC_PRERUN_THINKER_TERMINAL", raising=False)
+    payload = StagePayload(
+        request_id="req-prerun",
+        request=OmniRequest(
+            inputs={},
+            params={"modalities": ["text"]},
+            metadata={"pre_run": True, "media_cache_namespace": "rtc:req-0"},
+        ),
+        data={},
+    )
+
+    assert request_builders.resolve_thinker_next_stages("req-prerun", payload) is None
+    assert request_builders.resolve_thinker_stream_done_targets(
+        "req-prerun", payload
+    ) == []
+    assert request_builders.resolve_terminal_stages(payload.request) == ["thinker"]
+
+
+def test_qwen35_rtc_prerun_resolvers_can_keep_decode_terminal(monkeypatch):
+    monkeypatch.delenv("QWEN35_RTC_PRERUN_PREFILL_ONLY", raising=False)
+    monkeypatch.setenv("QWEN35_RTC_PRERUN_THINKER_TERMINAL", "0")
     payload = StagePayload(
         request_id="req-prerun",
         request=OmniRequest(
@@ -229,26 +249,6 @@ def test_qwen35_rtc_prerun_resolvers_keep_decode_terminal_by_default(monkeypatch
         "req-prerun", payload
     ) == ["decode"]
     assert request_builders.resolve_terminal_stages(payload.request) == ["decode"]
-
-
-def test_qwen35_rtc_prerun_resolvers_can_terminate_at_thinker(monkeypatch):
-    monkeypatch.delenv("QWEN35_RTC_PRERUN_PREFILL_ONLY", raising=False)
-    monkeypatch.setenv("QWEN35_RTC_PRERUN_THINKER_TERMINAL", "1")
-    payload = StagePayload(
-        request_id="req-prerun",
-        request=OmniRequest(
-            inputs={},
-            params={"modalities": ["text", "audio"]},
-            metadata={"pre_run": True, "media_cache_namespace": "rtc:req-0"},
-        ),
-        data={},
-    )
-
-    assert request_builders.resolve_thinker_next_stages("req-prerun", payload) is None
-    assert request_builders.resolve_thinker_stream_done_targets(
-        "req-prerun", payload
-    ) == []
-    assert request_builders.resolve_terminal_stages(payload.request) == ["thinker"]
 
 
 def test_qwen35_rtc_prerun_resolvers_can_keep_generation(monkeypatch):

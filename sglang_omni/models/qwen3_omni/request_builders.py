@@ -145,6 +145,13 @@ class _DecodeStreamTokenBatcher:
         self._buffers.pop(request_id, None)
         return _make_decode_stream_message(request_id, token_ids)
 
+    def flush(self, request_id: str) -> OutgoingMessage | None:
+        token_ids = self._buffers.pop(request_id, None)
+        self._sent_counts.pop(request_id, None)
+        if not token_ids:
+            return None
+        return _make_decode_stream_message(request_id, list(token_ids))
+
 _MEDIA_MODEL_INPUT_KEYS = (
     "audio_embeds",
     "image_embeds",
@@ -1388,6 +1395,20 @@ def make_thinker_stream_output_builder():
 
         return messages
 
+    def _flush_stream_output(
+        request_id: str, req_data: Any
+    ) -> list[OutgoingMessage]:
+        stage_payload = getattr(req_data, "stage_payload", None)
+        is_streaming = bool(
+            stage_payload is not None
+            and (stage_payload.request.params or {}).get("stream", False)
+        )
+        if not is_streaming:
+            return []
+        decode_msg = decode_stream_batcher.flush(request_id)
+        return [decode_msg] if decode_msg is not None else []
+
+    _build_stream_output.flush = _flush_stream_output  # type: ignore[attr-defined]
     return _build_stream_output
 
 

@@ -356,6 +356,8 @@ class StreamingDetokenizeScheduler:
 
     def _on_stream_chunk(self, request_id: str, item: Any) -> None:
         s = self._ensure_state(request_id)
+        text_parts: list[str] = []
+        last_text_token_id: int | None = None
         for token_id in _coerce_stream_token_ids(item.data):
             s.stream_token_count += 1
             if not is_decodable_token_id(self._tokenizer, token_id):
@@ -417,7 +419,16 @@ class StreamingDetokenizeScheduler:
                     )
                 continue  # special tokens suppressed; nothing to emit
 
-            self._emit_text_delta(request_id, s, candidate, token_id=token_id)
+            text_parts.append(candidate)
+            last_text_token_id = token_id
+
+        if text_parts:
+            self._emit_text_delta(
+                request_id,
+                s,
+                "".join(text_parts),
+                token_id=last_text_token_id,
+            )
 
     def _on_stream_done(self, request_id: str) -> None:
         # No state row means either zero-token generation (no chunk created

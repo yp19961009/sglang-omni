@@ -390,6 +390,27 @@ def test_qwen_thinker_stream_builder_batches_decode_tokens(monkeypatch):
     assert decode_chunks[4] == []
 
 
+def test_qwen_thinker_stream_builder_flushes_tail_decode_tokens(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
+    monkeypatch.setenv("SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE", "3")
+    builder = make_thinker_stream_output_builder()
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(is_chunked=0),
+        stage_payload=_thinker_stage_payload(["text"]),
+    )
+
+    for token_id in [11, 12, 13, 14, 15]:
+        builder("req-1", req_data, SimpleNamespace(data=token_id, extra={}))
+
+    flush = getattr(builder, "flush")
+    flushed = flush("req-1", req_data)
+
+    assert len(flushed) == 1
+    assert flushed[0].target == "decode"
+    assert flushed[0].data == 15
+    assert flush("req-1", req_data) == []
+
+
 def test_qwen_thinker_stream_builder_keeps_immediate_decode_prefix(monkeypatch):
     monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
     monkeypatch.setenv("SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE", "3")
@@ -617,7 +638,7 @@ def test_streaming_detokenizer_accepts_batched_token_ids():
     sched._on_stream_chunk("req-1", _StreamItem(data=[1, 2, 3]))
 
     out = _drain_outbox(sched)
-    assert [msg.data["text"] for msg in out] == ["hi", " there", "!"]
+    assert [msg.data["text"] for msg in out] == ["hi there!"]
     assert sched._state["req-1"].stream_token_count == 3
 
 

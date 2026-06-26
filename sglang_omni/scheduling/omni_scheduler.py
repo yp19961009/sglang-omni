@@ -1010,8 +1010,12 @@ class OmniScheduler:
                 if finished_reason is not None
                 else None
             )
+            flush_messages = []
             try:
                 result = self._result_adapter(data)
+                stream_flush = getattr(self._stream_output_builder, "flush", None)
+                if callable(stream_flush):
+                    flush_messages = list(stream_flush(rid, data) or [])
             except Exception as exc:
                 logger.exception(
                     "OmniScheduler result adapter failed for request %s", rid
@@ -1026,6 +1030,8 @@ class OmniScheduler:
 
             self._first_emit_done.discard(rid)
             self._prefill_start_done.discard(rid)
+            for msg in flush_messages:
+                self.outbox.put(msg)
             self.outbox.put(
                 OutgoingMessage(
                     request_id=rid,
