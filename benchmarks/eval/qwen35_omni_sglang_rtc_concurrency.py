@@ -47,6 +47,35 @@ def _last_audio_ms(row: dict[str, Any]) -> float | None:
     return float(ttfa_ms) + sum(float(v) for v in row.get("inter_chunk_ms") or [])
 
 
+def _audio_tail_ms(row: dict[str, Any]) -> float | None:
+    ttfa_ms = row.get("ttfa_ms")
+    last_audio_ms = row.get("last_audio_ms")
+    if ttfa_ms is None or last_audio_ms is None:
+        return None
+    return float(last_audio_ms) - float(ttfa_ms)
+
+
+def _finish_tail_ms(row: dict[str, Any]) -> float | None:
+    last_audio_ms = row.get("last_audio_ms")
+    e2e_total_ms = row.get("e2e_total_ms")
+    if last_audio_ms is None or e2e_total_ms is None:
+        return None
+    return float(e2e_total_ms) - float(last_audio_ms)
+
+
+def _chunk_interval_avg_ms(row: dict[str, Any]) -> float | None:
+    intervals = [float(v) for v in row.get("inter_chunk_ms") or []]
+    return _mean(intervals)
+
+
+def _audio_tail_rtf(row: dict[str, Any]) -> float | None:
+    tail_ms = row.get("audio_tail_ms")
+    duration_s = row.get("audio_duration_s")
+    if tail_ms is None or duration_s is None or float(duration_s) <= 0:
+        return None
+    return float(tail_ms) / (float(duration_s) * 1000.0)
+
+
 def _compact_error(exc: BaseException) -> str:
     return "".join(traceback.format_exception_only(type(exc), exc)).strip()
 
@@ -221,6 +250,15 @@ async def _run_actual(
         "question_idx": offsets["question_idx"],
     }
     row["last_audio_ms"] = _last_audio_ms(row)
+    row["audio_tail_ms"] = _audio_tail_ms(row)
+    row["finish_tail_ms"] = _finish_tail_ms(row)
+    row["chunk_interval_avg_ms"] = _chunk_interval_avg_ms(row)
+    row["audio_chunk_count"] = (
+        len(row.get("inter_chunk_ms") or []) + 1
+        if row.get("ttfa_ms") is not None
+        else 0
+    )
+    row["audio_tail_rtf"] = _audio_tail_rtf(row)
     (sample_dir / "result.json").write_text(
         json.dumps(row, indent=2, ensure_ascii=False),
         encoding="utf-8",
@@ -457,6 +495,36 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         for row in rows
         if row.get("last_audio_ms") is not None
     ]
+    audio_tail = [
+        float(row["audio_tail_ms"])
+        for row in rows
+        if row.get("audio_tail_ms") is not None
+    ]
+    finish_tail = [
+        float(row["finish_tail_ms"])
+        for row in rows
+        if row.get("finish_tail_ms") is not None
+    ]
+    chunk_interval_avg = [
+        float(row["chunk_interval_avg_ms"])
+        for row in rows
+        if row.get("chunk_interval_avg_ms") is not None
+    ]
+    chunk_intervals = [
+        float(value)
+        for row in rows
+        for value in (row.get("inter_chunk_ms") or [])
+    ]
+    audio_chunk_count = [
+        float(row["audio_chunk_count"])
+        for row in rows
+        if row.get("audio_chunk_count") is not None
+    ]
+    audio_tail_rtf = [
+        float(row["audio_tail_rtf"])
+        for row in rows
+        if row.get("audio_tail_rtf") is not None
+    ]
     e2e = [float(row["e2e_total_ms"]) for row in rows]
     audio_dur = [
         float(row["audio_duration_s"])
@@ -494,6 +562,22 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "last_audio_p50_ms": _percentile(last_audio, 50),
         "last_audio_p95_ms": _percentile(last_audio, 95),
         "last_audio_p99_ms": _percentile(last_audio, 99),
+        "audio_tail_avg_ms": _mean(audio_tail),
+        "audio_tail_p50_ms": _percentile(audio_tail, 50),
+        "audio_tail_p95_ms": _percentile(audio_tail, 95),
+        "audio_tail_p99_ms": _percentile(audio_tail, 99),
+        "audio_tail_rtf_avg": _mean(audio_tail_rtf),
+        "audio_tail_rtf_p95": _percentile(audio_tail_rtf, 95),
+        "finish_tail_avg_ms": _mean(finish_tail),
+        "finish_tail_p50_ms": _percentile(finish_tail, 50),
+        "finish_tail_p95_ms": _percentile(finish_tail, 95),
+        "finish_tail_p99_ms": _percentile(finish_tail, 99),
+        "chunk_interval_avg_per_req_ms": _mean(chunk_interval_avg),
+        "chunk_interval_all_avg_ms": _mean(chunk_intervals),
+        "chunk_interval_all_p50_ms": _percentile(chunk_intervals, 50),
+        "chunk_interval_all_p95_ms": _percentile(chunk_intervals, 95),
+        "chunk_interval_all_p99_ms": _percentile(chunk_intervals, 99),
+        "audio_chunk_count_avg": _mean(audio_chunk_count),
         "e2e_avg_ms": _mean(e2e),
         "e2e_p50_ms": _percentile(e2e, 50),
         "e2e_p95_ms": _percentile(e2e, 95),
