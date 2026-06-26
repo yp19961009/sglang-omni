@@ -1375,6 +1375,107 @@ def test_qwen_thinker_embed_injection_offsets_cached_media_prefix() -> None:
     assert req._omni_consumed is None
 
 
+def test_qwen_thinker_slices_deepstack_input_embeds_by_cached_prefix() -> None:
+    """Qwen3.5 full deepstack inputs must match the current extend chunk."""
+
+    class RecordingEmbed:
+        num_embeddings = 10
+
+        def __call__(self, input_ids: torch.Tensor) -> torch.Tensor:
+            return torch.zeros((input_ids.shape[0], 4), dtype=torch.float32)
+
+    runner = ThinkerModelRunner.__new__(ThinkerModelRunner)
+    runner._embed_tokens = RecordingEmbed()
+    runner._image_token_id = 5
+    runner._video_token_id = 6
+    runner._audio_token_id = 7
+    req = SimpleNamespace(
+        origin_input_ids=[1, 999, 999, 999, 2],
+        prefix_indices=[0, 1, 2],
+        omni_model_inputs={
+            "audio_embeds": torch.tensor(
+                [
+                    [10.0, 0.0, 0.0, 0.0],
+                    [20.0, 0.0, 0.0, 0.0],
+                    [30.0, 0.0, 0.0, 0.0],
+                ]
+            ),
+            "deepstack_input_embeds": {
+                "deepstack_input_embeds_0": torch.tensor(
+                    [[0.0], [1.0], [2.0], [3.0], [4.0]]
+                ),
+                "deepstack_input_embeds_1": torch.tensor(
+                    [[10.0], [11.0], [12.0], [13.0], [14.0]]
+                ),
+            },
+            "pad_values": {"audio": 999},
+        },
+        _omni_consumed=None,
+        is_chunked=0,
+    )
+
+    input_embeds, deepstack, visual_mask = runner._inject_multimodal_embeds(
+        SimpleNamespace(
+            input_ids=torch.tensor([999, 2]),
+            extend_seq_lens_cpu=[2],
+        ),
+        SimpleNamespace(reqs=[req]),
+    )
+
+    assert torch.equal(input_embeds[0], torch.tensor([30.0, 0.0, 0.0, 0.0]))
+    assert visual_mask is None
+    assert deepstack["deepstack_input_embeds_0"].tolist() == [[3.0], [4.0]]
+    assert deepstack["deepstack_input_embeds_1"].tolist() == [[13.0], [14.0]]
+    assert req._omni_consumed is None
+    assert req._omni_deepstack_consumed is None
+
+
+def test_qwen_thinker_deepstack_input_embeds_advance_across_chunks() -> None:
+    """Chunked prefill should not replay deepstack rows from earlier chunks."""
+
+    class RecordingEmbed:
+        num_embeddings = 10
+
+        def __call__(self, input_ids: torch.Tensor) -> torch.Tensor:
+            return torch.zeros((input_ids.shape[0], 4), dtype=torch.float32)
+
+    runner = ThinkerModelRunner.__new__(ThinkerModelRunner)
+    runner._embed_tokens = RecordingEmbed()
+    runner._image_token_id = 5
+    runner._video_token_id = 6
+    runner._audio_token_id = 7
+    req = SimpleNamespace(
+        origin_input_ids=[1, 2, 3, 4, 5],
+        prefix_indices=[0, 1],
+        omni_model_inputs={
+            "deepstack_input_embeds": {
+                "deepstack_input_embeds_0": torch.tensor(
+                    [[0.0], [1.0], [2.0], [3.0], [4.0]]
+                ),
+            },
+        },
+        _omni_consumed=None,
+        is_chunked=1,
+    )
+
+    _, deepstack, _ = runner._inject_multimodal_embeds(
+        SimpleNamespace(input_ids=torch.tensor([3, 4]), extend_seq_lens_cpu=[2]),
+        SimpleNamespace(reqs=[req]),
+    )
+
+    assert deepstack["deepstack_input_embeds_0"].tolist() == [[2.0], [3.0]]
+    assert req._omni_deepstack_consumed == 4
+
+    req.is_chunked = 0
+    _, deepstack, _ = runner._inject_multimodal_embeds(
+        SimpleNamespace(input_ids=torch.tensor([5]), extend_seq_lens_cpu=[1]),
+        SimpleNamespace(reqs=[req]),
+    )
+
+    assert deepstack["deepstack_input_embeds_0"].tolist() == [[4.0]]
+    assert req._omni_deepstack_consumed is None
+
+
 def test_qwen_talker_keeps_existing_read_only_weight_loader() -> None:
     """Preserves FP8 parameter weight_loader properties during default binding."""
 

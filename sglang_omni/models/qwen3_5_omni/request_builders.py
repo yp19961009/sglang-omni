@@ -1191,7 +1191,7 @@ def _normalize_chunk_hidden(hidden: torch.Tensor | None) -> torch.Tensor | None:
     if hidden.ndim == 1:
         return hidden
     if hidden.ndim == 2:
-        return hidden[0]
+        return hidden[-1]
     return None
 
 

@@ -676,6 +676,18 @@ class OmniScheduler:
         """Keep RTC actual prefill ahead of background pre-run cache writes."""
 
         if (
+            self._isolate_prefill_only_batches
+            and self.chunked_req is not None
+            and bool(getattr(self.chunked_req, "_omni_isolate_prefill_batch", False))
+        ):
+            hidden_reqs = list(self.waiting_queue)
+            self.waiting_queue = []
+            try:
+                return _Upstream.get_new_batch_prefill(self)
+            finally:
+                self.waiting_queue = [*self.waiting_queue, *hidden_reqs]
+
+        if (
             self._defer_prefill_during_priority_decode
             and self.waiting_queue
             and self._running_batch_has_priority_prefill_req()

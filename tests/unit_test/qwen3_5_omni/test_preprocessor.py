@@ -484,7 +484,7 @@ def test_qwen35_processor_shim_caches_video_items():
     assert second_grid.tolist() == [[1, 1, 1], [1, 1, 1]]
 
 
-def test_qwen35_processor_shim_marks_omitted_cached_video_pixels(monkeypatch):
+def test_qwen35_processor_shim_keeps_cached_video_pixels_for_outer_trim(monkeypatch):
     monkeypatch.setenv("SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS", "1")
     video_processor = _ShimCachingVideoProcessor()
     shim = _Qwen35ProcessorShim(
@@ -517,8 +517,11 @@ def test_qwen35_processor_shim_marks_omitted_cached_video_pixels(monkeypatch):
         ["chunk-1"],
         ["chunk-2"],
     ]
-    assert second_inputs["video_item_pixel_present"] == [False, True]
-    assert second_inputs["pixel_values_videos"].tolist() == [[2.0, 2.0]]
+    assert "video_item_pixel_present" not in second_inputs
+    assert second_inputs["pixel_values_videos"].tolist() == [
+        [1.0, 1.0],
+        [2.0, 2.0],
+    ]
     assert second_grid.tolist() == [[1, 1, 1], [1, 1, 1]]
 
 

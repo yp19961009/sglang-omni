@@ -84,3 +84,29 @@ def test_get_new_batch_prefill_prioritizes_waiting_stream_prefill(monkeypatch):
     assert seen["waiting_queue"] == [priority_req]
     assert scheduler.waiting_queue == [hidden_req]
     assert scheduler._priority_prefill_rids == {"priority"}
+
+
+def test_get_new_batch_prefill_keeps_chunked_isolated_prefill_alone(monkeypatch):
+    hidden_req = SimpleNamespace()
+    priority_req = SimpleNamespace(rid="priority", _omni_prioritize_prefill=True)
+    chunked_req = SimpleNamespace(_omni_isolate_prefill_batch=True)
+    scheduler = _make_scheduler(
+        waiting_queue=[hidden_req, priority_req],
+        running_batch=None,
+    )
+    scheduler.chunked_req = chunked_req
+    seen = {}
+
+    def fake_upstream_prefill(self):
+        seen["waiting_queue"] = list(self.waiting_queue)
+        self.waiting_queue = []
+        return "prefill"
+
+    monkeypatch.setattr(
+        omni_scheduler._Upstream, "get_new_batch_prefill", fake_upstream_prefill
+    )
+
+    assert scheduler.get_new_batch_prefill() == "prefill"
+    assert seen["waiting_queue"] == []
+    assert scheduler.waiting_queue == [hidden_req, priority_req]
+    assert scheduler._priority_prefill_rids == set()

@@ -123,6 +123,27 @@ class ThinkerModelRunner(ModelRunner):
             if int(token_id) in match_ids
         )
 
+    @staticmethod
+    def _iter_deepstack_input_layers(value: Any):
+        if value is None:
+            return
+        if isinstance(value, dict):
+            for key, tensor in value.items():
+                if isinstance(tensor, torch.Tensor):
+                    yield key, tensor
+            return
+        if isinstance(value, (list, tuple)):
+            for idx, tensor in enumerate(value):
+                if isinstance(tensor, torch.Tensor):
+                    yield f"deepstack_input_embeds_{idx}", tensor
+            return
+        if isinstance(value, torch.Tensor):
+            if value.ndim >= 3:
+                for idx in range(int(value.shape[0])):
+                    yield f"deepstack_input_embeds_{idx}", value[idx]
+            else:
+                yield "deepstack_input_embeds_0", value
+
     def _initial_omni_consumed(
         self,
         req: Any,
@@ -183,6 +204,7 @@ class ThinkerModelRunner(ModelRunner):
 
         deepstack_visual_embeds_list = []
         visual_pos_masks_list = []
+        deepstack_input_entries: dict[Any, list[tuple[int, int, torch.Tensor]]] = {}
         has_deepstack = False
 
         for i, req in enumerate(schedule_batch.reqs):
@@ -195,6 +217,7 @@ class ThinkerModelRunner(ModelRunner):
             req_input_ids = forward_batch.input_ids[start:end]
             chunk_offsets: dict[str, tuple[int, int]] = {}
             pad_values = omni_inputs.get("pad_values", {})
+            prefix_len: int | None = None
             if req._omni_consumed is None:
                 prefix_len = self._request_prefix_len(req, forward_batch, i)
                 consumed = self._initial_omni_consumed(
@@ -225,6 +248,31 @@ class ThinkerModelRunner(ModelRunner):
                 consumed[modality] = offset + n_tokens
 
             req._omni_consumed = consumed
+
+            deepstack_input_embeds = omni_inputs.get("deepstack_input_embeds")
+            if deepstack_input_embeds is not None:
+                token_offset = getattr(req, "_omni_deepstack_consumed", None)
+                if token_offset is None:
+                    if prefix_len is None:
+                        prefix_len = self._request_prefix_len(req, forward_batch, i)
+                    token_offset = int(prefix_len)
+                token_count = int(end - start)
+                token_end = int(token_offset) + token_count
+                for key, layer in self._iter_deepstack_input_layers(
+                    deepstack_input_embeds
+                ):
+                    layer = layer.reshape(-1, layer.shape[-1])
+                    chunk = layer[int(token_offset) : token_end]
+                    if int(chunk.shape[0]) != token_count:
+                        raise ValueError(
+                            "Qwen thinker deepstack_input_embeds slice mismatch: "
+                            f"key={key!r} offset={int(token_offset)} "
+                            f"tokens={token_count} available={int(layer.shape[0])}"
+                        )
+                    deepstack_input_entries.setdefault(key, []).append(
+                        (start, end, chunk)
+                    )
+                req._omni_deepstack_consumed = token_end
 
             ds_embeds = omni_inputs.get("deepstack_visual_embeds")
             image_ds = omni_inputs.get("image_deepstack_visual_embeds")
@@ -297,6 +345,7 @@ class ThinkerModelRunner(ModelRunner):
             if req.is_chunked == 0:
                 req.omni_model_inputs = None
                 req._omni_consumed = None
+                req._omni_deepstack_consumed = None
 
         ds_embeds_out = None
         visual_masks_out = None
@@ -321,7 +370,33 @@ class ThinkerModelRunner(ModelRunner):
                 ds_embeds_out = merged_ds
                 visual_masks_out = combined_mask
 
-        return input_embeds, ds_embeds_out, visual_masks_out
+        deepstack_input_embeds_out = None
+        if deepstack_input_entries:
+            total_tokens = int(forward_batch.input_ids.shape[0])
+            deepstack_input_embeds_out = {}
+            for key, entries in deepstack_input_entries.items():
+                template = entries[0][2]
+                full = torch.zeros(
+                    (total_tokens, int(template.shape[-1])),
+                    device=device,
+                    dtype=input_embeds.dtype,
+                )
+                for entry_start, entry_end, chunk in entries:
+                    full[entry_start:entry_end] = chunk.to(
+                        device=device,
+                        dtype=input_embeds.dtype,
+                    )
+                deepstack_input_embeds_out[key] = full
+
+        return (
+            input_embeds,
+            (
+                deepstack_input_embeds_out
+                if deepstack_input_embeds_out is not None
+                else ds_embeds_out
+            ),
+            visual_masks_out,
+        )
 
     # ------------------------------------------------------------------
     # Custom forward with multimodal embeddings + deepstack
@@ -344,7 +419,9 @@ class ThinkerModelRunner(ModelRunner):
             positions = forward_batch.mrope_positions
 
         ds_input = None
-        if deepstack_visual_embeds is not None and visual_pos_masks is not None:
+        if deepstack_visual_embeds is not None and visual_pos_masks is None:
+            ds_input = deepstack_visual_embeds
+        elif deepstack_visual_embeds is not None and visual_pos_masks is not None:
             device = input_embeds.device
             dtype = input_embeds.dtype
             layer_tensors = [

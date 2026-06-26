@@ -888,7 +888,6 @@ class _Qwen35ProcessorShim:
         miss_indices: list[int] = []
         miss_videos: list[Any] = []
         cache_keys_by_index: list[Any | None] = []
-        omit_cached_pixels = _omit_cached_visual_item_payloads_enabled()
         pixel_present: list[bool] = []
         for index, video in enumerate(videos):
             per_item_kwargs = self._select_item_processor_kwargs(
@@ -906,12 +905,8 @@ class _Qwen35ProcessorShim:
                 self._video_item_processor_cache, cache_key
             )
             if cached is not None:
-                pixel_present.append(not omit_cached_pixels)
-                entries[index] = (
-                    _video_entry_with_empty_pixels(cached)
-                    if omit_cached_pixels
-                    else cached
-                )
+                pixel_present.append(True)
+                entries[index] = cached
                 continue
             pixel_present.append(True)
             miss_indices.append(index)

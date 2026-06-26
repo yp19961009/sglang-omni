@@ -3101,6 +3101,41 @@ def test_qwen35_stream_builder_uses_stream_hidden_as_embed_fallback():
     assert torch.equal(messages[0].data, embed[0])
 
 
+def test_qwen35_stream_builder_uses_last_hidden_row_for_prefill_suffix():
+    embed = torch.tensor([[1.0, 1.0], [2.0, 2.0]])
+    hidden_18 = torch.tensor([[18.0, 18.0], [19.0, 19.0]])
+    stream_hidden = torch.tensor([[101.0, 101.0], [102.0, 102.0]])
+    builder = request_builders.make_thinker_stream_output_builder(
+        required_aux_hidden_key=18
+    )
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(inputs={}),
+        data={},
+    )
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(is_chunked=0),
+        stage_payload=payload,
+    )
+
+    messages = builder(
+        "req-0",
+        req_data,
+        SimpleNamespace(
+            data=42,
+            extra={
+                "hidden_states": {"embed": embed, 18: hidden_18},
+                "stream_hidden_states": stream_hidden,
+            },
+        ),
+    )
+
+    assert len(messages) == 1
+    assert messages[0].target == "talker_ar"
+    assert torch.equal(messages[0].data, embed[-1])
+    assert torch.equal(messages[0].metadata["layer_hidden"], hidden_18[-1])
+
+
 def test_qwen35_stream_builder_inlines_decode_token_when_enabled(monkeypatch):
     monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
     embed = torch.tensor([[1.0, 1.0]])
