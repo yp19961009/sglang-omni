@@ -178,7 +178,7 @@ def test_execute_falls_back_to_standard_forward_after_before_hook(
     assert not hasattr(ModelRunner, "prepare_prefill")
 
 
-def test_prefill_only_placeholder_token_keeps_scheduler_bookkeeping(
+def test_prefill_only_does_not_publish_placeholder_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_fake_forward_batch_module(monkeypatch)
@@ -194,7 +194,7 @@ def test_prefill_only_placeholder_token_keeps_scheduler_bookkeeping(
         _capture_hidden=False,
         process=lambda result, scheduler_output: {
             "req-1": SimpleNamespace(
-                data=int(result.next_token_ids[0].item()),
+                data=None,
                 extra={"hidden_states": "kept"},
             ),
         },
@@ -202,9 +202,9 @@ def test_prefill_only_placeholder_token_keeps_scheduler_bookkeeping(
 
     output = runner.execute(scheduler_output)
 
-    assert scheduler_output.batch_data.output_ids.tolist() == [0]
-    assert output.outputs["req-1"].data == 0
-    assert scheduler_output.requests[0].data.generation_steps == 1
+    assert scheduler_output.batch_data.output_ids is None
+    assert output.outputs["req-1"].data is None
+    assert scheduler_output.requests[0].data.generation_steps == 0
     assert scheduler_output.requests[0].data.extra_model_outputs == {
         "hidden_states": "kept"
     }

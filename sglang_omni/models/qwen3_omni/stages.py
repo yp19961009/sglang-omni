@@ -49,10 +49,14 @@ _ENCODER_CACHE_MAX_ENTRIES_ENV = "SGLANG_OMNI_ENCODER_CACHE_MAX_ENTRIES"
 _STORE_ITEM_PLAN_COMBINED_CACHE_ENV = (
     "SGLANG_OMNI_STORE_ITEM_PLAN_COMBINED_ENCODER_CACHE"
 )
+_IMAGE_ENCODER_BATCH_BUDGET_BYTES_ENV = (
+    "SGLANG_OMNI_IMAGE_ENCODER_BATCH_BUDGET_BYTES"
+)
+_VISUAL_ITEM_BATCH_STATS_ENV = "SGLANG_OMNI_VISUAL_ITEM_BATCH_STATS"
+_COMPACT_VISUAL_ENCODER_RESULTS_ENV = "SGLANG_OMNI_COMPACT_VISUAL_ENCODER_RESULTS"
+_COMPACT_AUDIO_ENCODER_RESULTS_ENV = "SGLANG_OMNI_COMPACT_AUDIO_ENCODER_RESULTS"
+_IMAGE_ENCODER_EMPTY_CACHE_ENV = "SGLANG_OMNI_IMAGE_ENCODER_EMPTY_CACHE"
 
-# Image-encoder batching budget; the multiplier accounts for transient activations.
-QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES = 10 * 1024**3
-QWEN3_IMAGE_ENCODER_ACTIVATION_MULTIPLIER = 5
 
 def _env_int(name: str, default: int) -> int:
     value = os.getenv(name)
@@ -63,6 +67,21 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         logger.warning("Invalid %s=%r; using default %s", name, value, default)
         return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
+# Image-encoder batching budget; the multiplier accounts for transient activations.
+QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES = _env_int(
+    _IMAGE_ENCODER_BATCH_BUDGET_BYTES_ENV,
+    10 * 1024**3,
+)
+QWEN3_IMAGE_ENCODER_ACTIVATION_MULTIPLIER = 5
 
 
 # CPU LRU cap for repeated-media encoder outputs.
@@ -254,6 +273,7 @@ def _run_single_audio_encoder_payload(
 
     with torch.no_grad():
         result = model(**request.model_inputs)
+    result = _compact_audio_encoder_result(result)
     _store_cached_encoder_output(
         request=request,
         request_id=payload.request_id,
@@ -356,6 +376,99 @@ def _split_visual_multiscale(
     if tensors is None:
         return None
     return [tensor[start:end] for tensor in tensors]
+
+
+def _compact_visual_encoder_results_enabled() -> bool:
+    return _env_bool(_COMPACT_VISUAL_ENCODER_RESULTS_ENV, default=True)
+
+
+def _compact_audio_encoder_results_enabled() -> bool:
+    return _env_bool(_COMPACT_AUDIO_ENCODER_RESULTS_ENV, default=True)
+
+
+def _image_encoder_empty_cache_enabled() -> bool:
+    return _env_bool(_IMAGE_ENCODER_EMPTY_CACHE_ENV, default=False)
+
+
+def _tensor_storage_nbytes(tensor: torch.Tensor) -> int:
+    try:
+        return int(tensor.untyped_storage().nbytes())
+    except RuntimeError:
+        return _tensor_bytes(tensor)
+
+
+def _compact_visual_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    tensor = tensor.detach()
+    if not _compact_visual_encoder_results_enabled():
+        return tensor
+    if tensor.numel() == 0:
+        return tensor.contiguous()
+
+    tensor_bytes = _tensor_bytes(tensor)
+    storage_bytes = _tensor_storage_nbytes(tensor)
+    if (
+        not tensor.is_contiguous()
+        or tensor.storage_offset() != 0
+        or storage_bytes > tensor_bytes
+    ):
+        return tensor.clone(memory_format=torch.contiguous_format)
+    return tensor
+
+
+def _compact_visual_encoder_result(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return _compact_visual_tensor(value)
+    if isinstance(value, dict):
+        return {
+            key: _compact_visual_encoder_result(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_compact_visual_encoder_result(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_compact_visual_encoder_result(item) for item in value)
+    return value
+
+
+def _compact_audio_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    tensor = tensor.detach()
+    if not _compact_audio_encoder_results_enabled():
+        return tensor
+    if tensor.numel() == 0:
+        return tensor.contiguous()
+
+    tensor_bytes = _tensor_bytes(tensor)
+    storage_bytes = _tensor_storage_nbytes(tensor)
+    if (
+        not tensor.is_contiguous()
+        or tensor.storage_offset() != 0
+        or storage_bytes > tensor_bytes
+    ):
+        return tensor.clone(memory_format=torch.contiguous_format)
+    return tensor
+
+
+def _compact_audio_encoder_result(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return _compact_audio_tensor(value)
+    if isinstance(value, dict):
+        return {
+            key: _compact_audio_encoder_result(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_compact_audio_encoder_result(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_compact_audio_encoder_result(item) for item in value)
+    return value
+
+
+def _empty_image_encoder_cache_if_requested() -> None:
+    if not _image_encoder_empty_cache_enabled():
+        return
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.empty_cache()
 
 
 @dataclass
@@ -700,7 +813,175 @@ def _item_result_from_combined(
                 end=token_end,
             ),
         }
-    return result, row_end, token_end
+    return _compact_visual_encoder_result(result), row_end, token_end
+
+
+def _visual_item_batch_stats_enabled() -> bool:
+    return _env_bool(_VISUAL_ITEM_BATCH_STATS_ENV, default=False)
+
+
+def _visual_item_cost(item: dict[str, Any], *, model: Any) -> int:
+    hidden = int(model.out_hidden_size)
+    output_layers = 1 + int(model.deepstack_layers)
+    dtype_bytes = int(model.visual_dtype_bytes)
+    token_count = int(item.get("token_count") or 0)
+    output_bytes = token_count * hidden * dtype_bytes * output_layers
+    return (
+        _nested_tensor_bytes({"pixels": item.get("pixels"), "grid": item.get("grid")})
+        + output_bytes
+    ) * QWEN3_IMAGE_ENCODER_ACTIVATION_MULTIPLIER
+
+
+def _chunk_visual_items_by_cost(
+    items: list[dict[str, Any]],
+    *,
+    model: Any,
+) -> list[list[dict[str, Any]]]:
+    if not items:
+        return []
+    budget = int(QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES)
+    if budget <= 0:
+        return [items]
+
+    chunks: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_cost = 0
+    for item in items:
+        item_cost = max(_visual_item_cost(item, model=model), 0)
+        if current and current_cost + item_cost > budget:
+            chunks.append(current)
+            current = []
+            current_cost = 0
+        current.append(item)
+        current_cost += item_cost
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _dedup_visual_items_by_cache_key(
+    items: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    unique_items: list[dict[str, Any]] = []
+    leader_by_key: dict[str, dict[str, Any]] = {}
+    leader_index_by_key: dict[str, int] = {}
+    duplicate_items: dict[str, list[dict[str, Any]]] = {}
+
+    for item in items:
+        cache_key = item.get("cache_key")
+        if cache_key is None:
+            unique_items.append(item)
+            continue
+
+        leader = leader_by_key.get(cache_key)
+        if leader is None:
+            leader_by_key[cache_key] = item
+            leader_index_by_key[cache_key] = len(unique_items)
+            unique_items.append(item)
+            continue
+
+        if leader.get("pixels") is None and item.get("pixels") is not None:
+            duplicate_items.setdefault(cache_key, []).append(leader)
+            leader_by_key[cache_key] = item
+            unique_items[leader_index_by_key[cache_key]] = item
+        else:
+            duplicate_items.setdefault(cache_key, []).append(item)
+
+    return unique_items, duplicate_items
+
+
+def _copy_visual_item_results_to_duplicates(
+    leaders: list[dict[str, Any]],
+    duplicate_items: dict[str, list[dict[str, Any]]],
+) -> None:
+    if not duplicate_items:
+        return
+    leader_by_key = {
+        item.get("cache_key"): item
+        for item in leaders
+        if item.get("cache_key") is not None
+    }
+    for cache_key, duplicates in duplicate_items.items():
+        leader = leader_by_key.get(cache_key)
+        if leader is None or leader.get("result") is None:
+            continue
+        for item in duplicates:
+            item["result"] = leader["result"]
+
+
+def _encode_visual_item_batch(
+    items: list[dict[str, Any]],
+    *,
+    model: Any,
+    cache: StageOutputCache | None,
+) -> None:
+    image_pixels: list[torch.Tensor] = []
+    image_grids: list[torch.Tensor] = []
+    video_pixels: list[torch.Tensor] = []
+    video_grids: list[torch.Tensor] = []
+    for item in items:
+        if item.get("pixels") is None:
+            raise RuntimeError(
+                "Visual item cache miss cannot be encoded because its "
+                f"payload pixels were omitted: {item.get('cache_key')!r}"
+            )
+        if item["modality"] == "image":
+            image_pixels.append(item["pixels"])
+            image_grids.append(item["grid"])
+        else:
+            video_pixels.append(item["pixels"])
+            video_grids.append(item["grid"])
+
+    batched_inputs: dict[str, Any] = {}
+    if image_pixels:
+        batched_inputs["pixel_values"] = torch.cat(image_pixels, dim=0)
+        batched_inputs["image_grid_thw"] = torch.cat(image_grids, dim=0)
+    if video_pixels:
+        batched_inputs["pixel_values_videos"] = torch.cat(video_pixels, dim=0)
+        batched_inputs["video_grid_thw"] = torch.cat(video_grids, dim=0)
+
+    with torch.no_grad():
+        combined = model(**batched_inputs)
+
+    image_row_cursor = image_token_cursor = 0
+    video_row_cursor = video_token_cursor = 0
+    for item in items:
+        if item["modality"] == "image":
+            item_result, image_row_cursor, image_token_cursor = (
+                _item_result_from_combined(
+                    modality="image",
+                    item=item,
+                    combined=combined,
+                    row_cursor=image_row_cursor,
+                    token_cursor=image_token_cursor,
+                )
+            )
+        else:
+            item_result, video_row_cursor, video_token_cursor = (
+                _item_result_from_combined(
+                    modality="video",
+                    item=item,
+                    combined=combined,
+                    row_cursor=video_row_cursor,
+                    token_cursor=video_token_cursor,
+                )
+            )
+        item["result"] = item_result
+        cache_key = item.get("cache_key")
+        if cache is not None and cache_key is not None:
+            cache.put(cache_key, item_result)
+            _trace_encoder_cache(
+                IMAGE_STAGE,
+                "item_store",
+                request_id=str(item.get("request_id", "item")),
+                cache_key=cache_key,
+                input_bytes=_nested_tensor_bytes(
+                    {"pixels": item.get("pixels"), "grid": item.get("grid")}
+                ),
+                output_bytes=_nested_tensor_bytes(item_result),
+            )
+    del combined, batched_inputs
+    _empty_image_encoder_cache_if_requested()
 
 
 def _execute_visual_item_cache_plans(
@@ -717,71 +998,30 @@ def _execute_visual_item_cache_plans(
         if item.get("result") is None
     ]
     if missing_items:
-        image_pixels: list[torch.Tensor] = []
-        image_grids: list[torch.Tensor] = []
-        video_pixels: list[torch.Tensor] = []
-        video_grids: list[torch.Tensor] = []
-        for item in missing_items:
-            if item.get("pixels") is None:
-                raise RuntimeError(
-                    "Visual item cache miss cannot be encoded because its "
-                    f"payload pixels were omitted: {item.get('cache_key')!r}"
-                )
-            if item["modality"] == "image":
-                image_pixels.append(item["pixels"])
-                image_grids.append(item["grid"])
-            else:
-                video_pixels.append(item["pixels"])
-                video_grids.append(item["grid"])
-
-        batched_inputs: dict[str, Any] = {}
-        if image_pixels:
-            batched_inputs["pixel_values"] = torch.cat(image_pixels, dim=0)
-            batched_inputs["image_grid_thw"] = torch.cat(image_grids, dim=0)
-        if video_pixels:
-            batched_inputs["pixel_values_videos"] = torch.cat(video_pixels, dim=0)
-            batched_inputs["video_grid_thw"] = torch.cat(video_grids, dim=0)
-
-        with torch.no_grad():
-            combined = model(**batched_inputs)
-
-        image_row_cursor = image_token_cursor = 0
-        video_row_cursor = video_token_cursor = 0
-        for item in missing_items:
-            if item["modality"] == "image":
-                item_result, image_row_cursor, image_token_cursor = (
-                    _item_result_from_combined(
-                        modality="image",
-                        item=item,
-                        combined=combined,
-                        row_cursor=image_row_cursor,
-                        token_cursor=image_token_cursor,
-                    )
-                )
-            else:
-                item_result, video_row_cursor, video_token_cursor = (
-                    _item_result_from_combined(
-                        modality="video",
-                        item=item,
-                        combined=combined,
-                        row_cursor=video_row_cursor,
-                        token_cursor=video_token_cursor,
-                    )
-                )
-            item["result"] = item_result
-            cache_key = item.get("cache_key")
-            if cache is not None and cache_key is not None:
-                cache.put(cache_key, item_result)
-                _trace_encoder_cache(
-                    IMAGE_STAGE,
-                    "item_store",
-                    request_id=str(item.get("request_id", "item")),
-                    cache_key=cache_key,
-                    input_bytes=_nested_tensor_bytes(
-                        {"pixels": item.get("pixels"), "grid": item.get("grid")}
-                    ),
-                    output_bytes=_nested_tensor_bytes(item_result),
-                )
+        raw_missing_count = len(missing_items)
+        missing_items, duplicate_items = _dedup_visual_items_by_cache_key(
+            missing_items
+        )
+        duplicate_count = sum(len(items) for items in duplicate_items.values())
+        chunks = _chunk_visual_items_by_cost(missing_items, model=model)
+        if _visual_item_batch_stats_enabled():
+            costs = [
+                sum(_visual_item_cost(item, model=model) for item in chunk)
+                for chunk in chunks
+            ]
+            logger.info(
+                "visual_item_batch_stats raw_missing_items=%d unique_items=%d duplicate_items=%d chunks=%d chunk_sizes=%s chunk_costs=%s budget=%d",
+                raw_missing_count,
+                len(missing_items),
+                duplicate_count,
+                len(chunks),
+                [len(chunk) for chunk in chunks],
+                costs,
+                QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES,
+            )
+        for chunk in chunks:
+            _encode_visual_item_batch(chunk, model=model, cache=cache)
+        _copy_visual_item_results_to_duplicates(missing_items, duplicate_items)
 
     for plan in plans:
         stage_result = _combine_visual_item_results(plan)
@@ -797,17 +1037,16 @@ def _execute_visual_item_cache_plans(
         results[plan.idx] = store_state(plan.payload, plan.state)
 
 
-def _create_image_encoder_request_cost_fn(model: Qwen3OmniImageEncoder):
+def _create_image_encoder_request_cost_fn(
+    model: Qwen3OmniImageEncoder,
+    cache: StageOutputCache | None = None,
+):
     merge = int(model.spatial_merge_size) ** 2
     hidden = int(model.out_hidden_size)
     output_layers = 1 + int(model.deepstack_layers)
     dtype_bytes = int(model.visual_dtype_bytes)
 
-    def _cost(payload: StagePayload) -> int:
-        state = load_state(payload)
-        request = build_encoder_request(state, stage_name=IMAGE_STAGE)
-        if request.skip_result is not None:
-            return 0
+    def _full_request_cost(request: Any) -> int:
         model_inputs = request.model_inputs
         raw_bytes = _tensor_bytes(model_inputs.get("pixel_values"))
         raw_bytes += _tensor_bytes(model_inputs.get("pixel_values_videos"))
@@ -818,6 +1057,77 @@ def _create_image_encoder_request_cost_fn(model: Qwen3OmniImageEncoder):
         )
         output_bytes = visual_tokens * hidden * dtype_bytes * output_layers
         return (raw_bytes + output_bytes) * QWEN3_IMAGE_ENCODER_ACTIVATION_MULTIPLIER
+
+    def _cache_has(cache_key: str | None) -> bool:
+        return cache is not None and cache.contains(cache_key)
+
+    def _item_cache_miss_cost(request: Any) -> int | None:
+        if cache is None:
+            return None
+        model_inputs = request.model_inputs
+        image_grid = model_inputs.get("image_grid_thw")
+        video_grid = model_inputs.get("video_grid_thw")
+        image_rows = (
+            int(image_grid.shape[0]) if isinstance(image_grid, torch.Tensor) else 0
+        )
+        video_rows = (
+            int(video_grid.shape[0]) if isinstance(video_grid, torch.Tensor) else 0
+        )
+        if image_rows == 0 and video_rows == 0:
+            return None
+
+        image_keys = _visual_item_keys(request, modality="image", rows=image_rows)
+        video_keys = _visual_item_keys(request, modality="video", rows=video_rows)
+        if image_keys is None or video_keys is None:
+            return None
+        if not any(key is not None for key in (*image_keys, *video_keys)):
+            return None
+
+        image_pixel_present = _visual_item_pixel_present(
+            request, modality="image", rows=image_rows
+        )
+        video_pixel_present = _visual_item_pixel_present(
+            request, modality="video", rows=video_rows
+        )
+        if image_pixel_present is None or video_pixel_present is None:
+            return None
+
+        image_items = _split_visual_items(
+            model_inputs=model_inputs,
+            modality="image",
+            item_keys=image_keys,
+            pixel_present=image_pixel_present,
+            merge=merge,
+        )
+        video_items = _split_visual_items(
+            model_inputs=model_inputs,
+            modality="video",
+            item_keys=video_keys,
+            pixel_present=video_pixel_present,
+            merge=merge,
+        )
+        if image_items is None or video_items is None:
+            return None
+
+        cost = 0
+        for item in (*image_items, *video_items):
+            cache_key = item.get("cache_key")
+            if cache_key is not None and _cache_has(cache_key):
+                continue
+            if item.get("pixels") is None:
+                continue
+            cost += _visual_item_cost(item, model=model)
+        return cost
+
+    def _cost(payload: StagePayload) -> int:
+        state = load_state(payload)
+        request = build_encoder_request(state, stage_name=IMAGE_STAGE)
+        if request.skip_result is not None:
+            return 0
+        miss_cost = _item_cache_miss_cost(request)
+        if miss_cost is not None:
+            return miss_cost
+        return _full_request_cost(request)
 
     return _cost
 
@@ -839,8 +1149,7 @@ def _nested_tensor_bytes(value: Any) -> int:
 
 
 def _encoder_cache_trace_enabled() -> bool:
-    value = os.getenv("SGLANG_OMNI_TRACE_ENCODER_CACHE", "")
-    return value.lower() not in ("", "0", "false", "no")
+    return _env_bool("SGLANG_OMNI_TRACE_ENCODER_CACHE", default=False)
 
 
 def _store_item_plan_combined_encoder_cache_enabled() -> bool:
@@ -848,8 +1157,7 @@ def _store_item_plan_combined_encoder_cache_enabled() -> bool:
     # Caching every combined prefix as well is actively harmful for realtime
     # chunk workloads: trunk=1..N creates many large combined entries that evict
     # the item outputs needed by the final request.
-    value = os.getenv(_STORE_ITEM_PLAN_COMBINED_CACHE_ENV, "0")
-    return value.lower() not in ("", "0", "false", "no", "off")
+    return _env_bool(_STORE_ITEM_PLAN_COMBINED_CACHE_ENV, default=False)
 
 
 def _short_cache_key(cache_key: str | None) -> str:
@@ -1149,6 +1457,7 @@ def _batch_image_encoder_payloads(
                 video_row_cursor = row_end
                 video_token_cursor = token_end
             request = meta["request"]
+            stage_result = _compact_visual_encoder_result(stage_result)
             _store_cached_encoder_output(
                 request=request,
                 request_id=meta["payload"].request_id,
@@ -1172,6 +1481,19 @@ def _batch_image_encoder_payloads(
             for idx, payload, state in waiters:
                 apply_encoder_result(state, stage_name=IMAGE_STAGE, result=stage_result)
                 results[idx] = store_state(payload, state)
+        del (
+            combined,
+            batched_inputs,
+            image_grid_all,
+            image_counts_all,
+            image_embeds_all,
+            image_multiscale_all,
+            video_grid_all,
+            video_counts_all,
+            video_embeds_all,
+            video_multiscale_all,
+        )
+        _empty_image_encoder_cache_if_requested()
 
     if item_plans:
         _execute_visual_item_cache_plans(
@@ -1389,13 +1711,15 @@ def _execute_audio_item_cache_plans(
         for row, item in enumerate(missing_items):
             output_length = output_lengths[row : row + 1]
             token_end = token_cursor + int(output_length.sum().item())
-            item_result = {
-                "audio_embeds": embeds[token_cursor:token_end],
-                "audio_feature_lengths": combined["audio_feature_lengths"][
-                    row : row + 1
-                ],
-                "audio_output_lengths": output_length,
-            }
+            item_result = _compact_audio_encoder_result(
+                {
+                    "audio_embeds": embeds[token_cursor:token_end],
+                    "audio_feature_lengths": combined["audio_feature_lengths"][
+                        row : row + 1
+                    ],
+                    "audio_output_lengths": output_length,
+                }
+            )
             item["result"] = item_result
             token_cursor = token_end
             cache_key = item.get("cache_key")
@@ -1531,13 +1855,15 @@ def _batch_audio_encoder_payloads(
             row_end = row_cursor + item["count"]
             req_output_lengths = output_lengths[row_cursor:row_end]
             token_end = token_cursor + int(req_output_lengths.sum().item())
-            stage_result = {
-                "audio_embeds": embeds[token_cursor:token_end],
-                "audio_feature_lengths": combined["audio_feature_lengths"][
-                    row_cursor:row_end
-                ],
-                "audio_output_lengths": req_output_lengths,
-            }
+            stage_result = _compact_audio_encoder_result(
+                {
+                    "audio_embeds": embeds[token_cursor:token_end],
+                    "audio_feature_lengths": combined["audio_feature_lengths"][
+                        row_cursor:row_end
+                    ],
+                    "audio_output_lengths": req_output_lengths,
+                }
+            )
             _store_cached_encoder_output(
                 request=item["request"],
                 request_id=item["payload"].request_id,
@@ -1674,7 +2000,7 @@ def create_image_encoder_executor(
         batch_compute_fn=_encode_batch,
         max_batch_size=32,
         max_batch_wait_ms=50,
-        request_cost_fn=_create_image_encoder_request_cost_fn(model),
+        request_cost_fn=_create_image_encoder_request_cost_fn(model, cache),
         max_batch_cost=QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES,
     )
 

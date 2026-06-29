@@ -43,9 +43,15 @@ _AR_BUSY_YIELD_SECONDS_DEFAULT = 0.0
 _PRIORITY_FIRST_STREAM_ENV = "SGLANG_OMNI_PRIORITY_FIRST_STREAM"
 _PRIORITY_MARKER_ATTR = "_sg_omni_priority_stream"
 _ISOLATE_PREFILL_ONLY_BATCHES_ENV = "SGLANG_OMNI_ISOLATE_PREFILL_ONLY_BATCHES"
+_ISOLATED_PREFILL_MAX_BATCH_SIZE_ENV = (
+    "SGLANG_OMNI_ISOLATED_PREFILL_MAX_BATCH_SIZE"
+)
 _PRIORITIZE_PREFILL_ATTR = "_omni_prioritize_prefill"
 _PRIORITIZE_PREFILL_ENV = "SGLANG_OMNI_PRIORITIZE_STREAM_PREFILL"
 _PRIORITY_PREFILL_MAX_BATCH_SIZE_ENV = "SGLANG_OMNI_PRIORITY_PREFILL_MAX_BATCH_SIZE"
+_PRIORITY_PREFILL_BATCH_WAIT_MS_ENV = (
+    "SGLANG_OMNI_PRIORITY_PREFILL_BATCH_WAIT_MS"
+)
 _DEFER_PREFILL_DURING_PRIORITY_DECODE_ENV = (
     "SGLANG_OMNI_DEFER_PREFILL_DURING_PRIORITY_DECODE"
 )
@@ -130,6 +136,21 @@ def _isolate_prefill_only_batches_enabled() -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _isolated_prefill_max_batch_size() -> int:
+    raw = os.getenv(_ISOLATED_PREFILL_MAX_BATCH_SIZE_ENV)
+    if raw is None or raw == "":
+        return 0
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using unlimited isolated prefill batch size",
+            _ISOLATED_PREFILL_MAX_BATCH_SIZE_ENV,
+            raw,
+        )
+        return 0
+
+
 def _prioritize_stream_prefill_enabled() -> bool:
     raw = os.getenv(_PRIORITIZE_PREFILL_ENV)
     if raw is None or raw == "":
@@ -150,6 +171,21 @@ def _priority_prefill_max_batch_size() -> int:
             raw,
         )
         return 0
+
+
+def _priority_prefill_batch_wait_seconds() -> float:
+    raw = os.getenv(_PRIORITY_PREFILL_BATCH_WAIT_MS_ENV)
+    if raw is None or raw == "":
+        return 0.0
+    try:
+        return max(float(raw), 0.0) / 1000.0
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; disabling priority prefill batch wait",
+            _PRIORITY_PREFILL_BATCH_WAIT_MS_ENV,
+            raw,
+        )
+        return 0.0
 
 
 def _defer_prefill_during_priority_decode_enabled() -> bool:
@@ -457,8 +493,10 @@ class OmniScheduler:
         self._busy_yield_seconds = _ar_busy_yield_seconds()
         self._busy_yield_counter = 0
         self._isolate_prefill_only_batches = _isolate_prefill_only_batches_enabled()
+        self._isolated_prefill_max_batch_size = _isolated_prefill_max_batch_size()
         self._prioritize_stream_prefill = _prioritize_stream_prefill_enabled()
         self._priority_prefill_max_batch_size = _priority_prefill_max_batch_size()
+        self._priority_prefill_batch_wait_s = _priority_prefill_batch_wait_seconds()
         self._defer_prefill_during_priority_decode = (
             _defer_prefill_during_priority_decode_enabled()
         )
@@ -672,6 +710,14 @@ class OmniScheduler:
             )
             self.waiting_queue.append(req)
 
+    def get_num_allocatable_reqs(self, running_bs):
+        num_allocatable = _Upstream.get_num_allocatable_reqs(self, running_bs)
+        model_runner = getattr(getattr(self, "tp_worker", None), "model_runner", None)
+        if getattr(model_runner, "mambaish_config", None) is not None:
+            available_req_slots = int(self.req_to_token_pool.available_size())
+            num_allocatable = min(num_allocatable, available_req_slots)
+        return max(num_allocatable, 0)
+
     def get_new_batch_prefill(self):
         """Keep RTC actual prefill ahead of background pre-run cache writes."""
 
@@ -680,17 +726,81 @@ class OmniScheduler:
             and self.chunked_req is not None
             and bool(getattr(self.chunked_req, "_omni_isolate_prefill_batch", False))
         ):
-            hidden_reqs = list(self.waiting_queue)
-            self.waiting_queue = []
+            self._coalesce_priority_prefill_reqs()
+            priority_reqs = [
+                req
+                for req in self.waiting_queue
+                if bool(getattr(req, _PRIORITIZE_PREFILL_ATTR, False))
+            ]
+            if self._prioritize_stream_prefill and priority_reqs:
+                if self._priority_prefill_max_batch_size > 0:
+                    selected_priority_reqs = priority_reqs[
+                        : self._priority_prefill_max_batch_size
+                    ]
+                    deferred_priority_reqs = priority_reqs[
+                        self._priority_prefill_max_batch_size :
+                    ]
+                else:
+                    selected_priority_reqs = priority_reqs
+                    deferred_priority_reqs = []
+                for req in selected_priority_reqs:
+                    req.init_next_round_input(self.tree_cache)
+                can_preempt_chunked = all(
+                    int(getattr(req, "extend_input_len", 0))
+                    <= int(self.chunked_prefill_size)
+                    for req in selected_priority_reqs
+                )
+                if can_preempt_chunked:
+                    paused_chunked_req = self.chunked_req
+                    hidden_reqs = [
+                        req
+                        for req in self.waiting_queue
+                        if not bool(getattr(req, _PRIORITIZE_PREFILL_ATTR, False))
+                    ]
+                    self.chunked_req = None
+                    self.waiting_queue = selected_priority_reqs
+                    self._remember_priority_prefill_reqs(selected_priority_reqs)
+                    try:
+                        return _Upstream.get_new_batch_prefill(self)
+                    finally:
+                        if self.chunked_req is None:
+                            self.chunked_req = paused_chunked_req
+                            paused_reqs = []
+                        else:
+                            paused_reqs = [paused_chunked_req]
+                        self.waiting_queue = [
+                            *self.waiting_queue,
+                            *deferred_priority_reqs,
+                            *paused_reqs,
+                            *hidden_reqs,
+                        ]
+
+            isolated_reqs, deferred_isolated_reqs = (
+                self._split_isolated_prefill_reqs(self.waiting_queue)
+            )
+            hidden_reqs = [
+                req
+                for req in self.waiting_queue
+                if not bool(getattr(req, "_omni_isolate_prefill_batch", False))
+            ]
+            self.waiting_queue = isolated_reqs
             try:
                 return _Upstream.get_new_batch_prefill(self)
             finally:
-                self.waiting_queue = [*self.waiting_queue, *hidden_reqs]
+                self.waiting_queue = [
+                    *self.waiting_queue,
+                    *deferred_isolated_reqs,
+                    *hidden_reqs,
+                ]
 
         if (
             self._defer_prefill_during_priority_decode
             and self.waiting_queue
             and self._running_batch_has_priority_prefill_req()
+            and not any(
+                bool(getattr(req, _PRIORITIZE_PREFILL_ATTR, False))
+                for req in self.waiting_queue
+            )
         ):
             return None
 
@@ -703,6 +813,7 @@ class OmniScheduler:
                 for req in self.waiting_queue
             )
         ):
+            self._coalesce_priority_prefill_reqs()
             priority_reqs = [
                 req
                 for req in self.waiting_queue
@@ -745,20 +856,39 @@ class OmniScheduler:
         ):
             return _Upstream.get_new_batch_prefill(self)
 
-        isolated_idx = next(
-            i
-            for i, req in enumerate(self.waiting_queue)
-            if bool(getattr(req, "_omni_isolate_prefill_batch", False))
-        )
-        isolated_req = self.waiting_queue[isolated_idx]
         hidden_reqs = [
-            req for i, req in enumerate(self.waiting_queue) if i != isolated_idx
+            req
+            for req in self.waiting_queue
+            if not bool(getattr(req, "_omni_isolate_prefill_batch", False))
         ]
-        self.waiting_queue = [isolated_req]
+        isolated_reqs, deferred_isolated_reqs = self._split_isolated_prefill_reqs(
+            self.waiting_queue
+        )
+        self.waiting_queue = isolated_reqs
         try:
             return _Upstream.get_new_batch_prefill(self)
         finally:
-            self.waiting_queue = [*self.waiting_queue, *hidden_reqs]
+            self.waiting_queue = [
+                *self.waiting_queue,
+                *deferred_isolated_reqs,
+                *hidden_reqs,
+            ]
+
+    def _split_isolated_prefill_reqs(
+        self,
+        reqs: list[Any],
+    ) -> tuple[list[Any], list[Any]]:
+        isolated_reqs = [
+            req
+            for req in reqs
+            if bool(getattr(req, "_omni_isolate_prefill_batch", False))
+        ]
+        max_batch_size = int(
+            getattr(self, "_isolated_prefill_max_batch_size", 0) or 0
+        )
+        if max_batch_size <= 0 or len(isolated_reqs) <= max_batch_size:
+            return isolated_reqs, []
+        return isolated_reqs[:max_batch_size], isolated_reqs[max_batch_size:]
 
     def _remember_priority_prefill_reqs(self, reqs: list[Any]) -> None:
         priority_rids = self.__dict__.setdefault("_priority_prefill_rids", set())
@@ -766,6 +896,22 @@ class OmniScheduler:
             rid = getattr(req, "rid", None)
             if rid is not None:
                 priority_rids.add(rid)
+
+    def _coalesce_priority_prefill_reqs(self) -> None:
+        wait_s = float(getattr(self, "_priority_prefill_batch_wait_s", 0.0) or 0.0)
+        if wait_s <= 0 or not self._prioritize_stream_prefill:
+            return
+        if not any(
+            bool(getattr(req, _PRIORITIZE_PREFILL_ATTR, False))
+            for req in self.waiting_queue
+        ):
+            return
+
+        time.sleep(wait_s)
+        recv_reqs = self.recv_requests()
+        recv_reqs.extend(self._take_deferred_request_payloads())
+        if recv_reqs:
+            self.process_input_requests(recv_reqs)
 
     def _forget_priority_prefill_rid(self, rid: str) -> None:
         self.__dict__.setdefault("_priority_prefill_rids", set()).discard(rid)
@@ -859,6 +1005,58 @@ class OmniScheduler:
                 type="error",
                 data=error,
             )
+        )
+
+    def process_batch_result(self, batch, result) -> None:
+        if self._is_prefill_only_no_token_result(batch, result):
+            self._process_prefill_only_no_token_result(batch, result)
+            return
+        _Upstream.process_batch_result(self, batch, result)
+
+    @staticmethod
+    def _is_prefill_only_no_token_result(batch, result) -> bool:
+        return (
+            getattr(result, "next_token_ids", object()) is None
+            and bool(getattr(batch, "is_prefill_only", False))
+        )
+
+    def _process_prefill_only_no_token_result(self, batch, result) -> None:
+        copy_done = getattr(result, "copy_done", None)
+        if copy_done is not None:
+            copy_done.synchronize()
+
+        skip_stream_req = None
+        for req in getattr(batch, "reqs", []) or []:
+            if req.finished() or getattr(req, "is_retracted", False):
+                continue
+
+            if getattr(req, "is_chunked", 0) <= 0:
+                time_stats = getattr(req, "time_stats", None)
+                if (
+                    time_stats is not None
+                    and getattr(time_stats, "prefill_finished_ts", 0.0) == 0.0
+                ):
+                    time_stats.prefill_finished_ts = time.time()
+
+                req.check_finished(new_accepted_len=0)
+                if req.finished():
+                    self.maybe_collect_routed_experts(req)
+                    release_kv_cache(req, self.tree_cache)
+                    if time_stats is not None:
+                        time_stats.completion_time = time.perf_counter()
+                elif (
+                    not getattr(batch, "decoding_reqs", None)
+                    or req not in batch.decoding_reqs
+                ):
+                    self.tree_cache.cache_unfinished_req(req)
+            else:
+                req.is_chunked -= 1
+                skip_stream_req = req
+
+        self.stream_output(
+            batch.reqs,
+            getattr(batch, "return_logprob", False),
+            skip_req=skip_stream_req,
         )
 
     def run_batch(self, batch, pp_proxy_tensors=None):

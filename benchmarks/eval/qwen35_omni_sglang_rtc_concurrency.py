@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import subprocess
 import statistics
+import sys
 import time
 import traceback
 import uuid
@@ -80,9 +82,39 @@ def _compact_error(exc: BaseException) -> str:
     return "".join(traceback.format_exception_only(type(exc), exc)).strip()
 
 
+async def _start_request_profile(
+    session: aiohttp.ClientSession,
+    *,
+    base_url: str,
+    run_id: str,
+    event_dir: Path,
+) -> None:
+    url = base_url.rstrip("/") + "/start_request_profile"
+    async with session.post(
+        url,
+        json={"run_id": run_id, "event_dir": str(event_dir.resolve())},
+    ) as response:
+        response.raise_for_status()
+        print("profile_start", await response.text(), flush=True)
+
+
+async def _stop_request_profile(
+    session: aiohttp.ClientSession,
+    *,
+    base_url: str,
+    run_id: str,
+) -> None:
+    url = base_url.rstrip("/") + "/stop_request_profile"
+    async with session.post(url, json={"run_id": run_id}) as response:
+        response.raise_for_status()
+        print("profile_stop", await response.text(), flush=True)
+
+
 def _is_pure_bang_text(text: str | None) -> bool:
     stripped = (text or "").strip()
-    return bool(stripped) and set(stripped) <= {"!"}
+    stripped = stripped.strip('"\'“”')
+    stripped = stripped.lstrip("#＃")
+    return bool(stripped) and set(stripped) <= {"!", "！"}
 
 
 def _session_offsets(args: argparse.Namespace, sample_idx: int) -> dict[str, int]:
@@ -292,7 +324,23 @@ async def _run_session(
 async def run(args: argparse.Namespace) -> dict[str, Any]:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    api_url = args.base_url.rstrip("/") + "/v1/chat/completions"
+    base_url = args.base_url.rstrip("/")
+    api_url = base_url + "/v1/chat/completions"
+    profile_actual_run_id = args.profile_actual_run_id
+    profile_actual_event_dir = (
+        Path(args.profile_actual_event_dir)
+        if args.profile_actual_event_dir
+        else out_dir / "events"
+    )
+    profile_actual_json = (
+        Path(args.profile_actual_json)
+        if args.profile_actual_json
+        else (
+            out_dir / f"request_profile_{profile_actual_run_id}.json"
+            if profile_actual_run_id
+            else None
+        )
+    )
 
     rows: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -419,21 +467,39 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             for _ in range(args.concurrency):
                 queue.put_nowait(None)
 
-            t0 = time.perf_counter()
-            if args.post_prerun_sleep_ms > 0:
-                await asyncio.sleep(args.post_prerun_sleep_ms / 1000.0)
-            await asyncio.gather(
-                *(
-                    actual_worker(
-                        session=session,
-                        queue=queue,
-                        pre_run_by_sample=pre_run_by_sample,
-                        worker_idx=i,
+            profile_started = False
+            try:
+                if profile_actual_run_id:
+                    await _start_request_profile(
+                        session,
+                        base_url=base_url,
+                        run_id=profile_actual_run_id,
+                        event_dir=profile_actual_event_dir,
                     )
-                    for i in range(args.concurrency)
+                    profile_started = True
+
+                t0 = time.perf_counter()
+                if args.post_prerun_sleep_ms > 0:
+                    await asyncio.sleep(args.post_prerun_sleep_ms / 1000.0)
+                await asyncio.gather(
+                    *(
+                        actual_worker(
+                            session=session,
+                            queue=queue,
+                            pre_run_by_sample=pre_run_by_sample,
+                            worker_idx=i,
+                        )
+                        for i in range(args.concurrency)
+                    )
                 )
-            )
-            actual_elapsed_s = time.perf_counter() - t0
+                actual_elapsed_s = time.perf_counter() - t0
+            finally:
+                if profile_started:
+                    await _stop_request_profile(
+                        session,
+                        base_url=base_url,
+                        run_id=profile_actual_run_id,
+                    )
             elapsed_s = pre_elapsed_s + actual_elapsed_s
         else:
             queue: asyncio.Queue[int | None] = asyncio.Queue()
@@ -534,6 +600,21 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     bang_sample_indices = [
         int(row["sample_idx"]) for row in rows if _is_pure_bang_text(row.get("text"))
     ]
+    if profile_actual_run_id and profile_actual_json is not None:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sglang_omni.profiler",
+                str(profile_actual_event_dir.resolve()),
+                "--format",
+                "json",
+                "--out",
+                str(profile_actual_json.resolve()),
+            ],
+            check=True,
+        )
+
     metrics = {
         "trunk_size": args.trunk_size,
         "concurrency": args.concurrency,
@@ -586,6 +667,15 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "prompt_tokens_avg": _mean([float(row["prompt_tokens"]) for row in rows]),
         "completion_tokens_avg": _mean(
             [float(row["completion_tokens"]) for row in rows]
+        ),
+        "profile_actual_run_id": profile_actual_run_id,
+        "profile_actual_event_dir": (
+            str(profile_actual_event_dir.resolve()) if profile_actual_run_id else None
+        ),
+        "profile_actual_json": (
+            str(profile_actual_json.resolve())
+            if profile_actual_run_id and profile_actual_json is not None
+            else None
         ),
         "errors": errors,
     }
@@ -670,10 +760,37 @@ def parse_args() -> argparse.Namespace:
             "concurrency, wait for all of them, then launch measured actual requests."
         ),
     )
+    parser.add_argument(
+        "--profile-actual-run-id",
+        default=None,
+        help=(
+            "Start request profiling after barrier/serialized pre-run completes, "
+            "then stop it after the measured actual requests."
+        ),
+    )
+    parser.add_argument(
+        "--profile-actual-event-dir",
+        default=None,
+        help="Event directory for --profile-actual-run-id; defaults to OUTPUT_DIR/events.",
+    )
+    parser.add_argument(
+        "--profile-actual-json",
+        default=None,
+        help=(
+            "Profiler JSON output path for --profile-actual-run-id; defaults to "
+            "OUTPUT_DIR/request_profile_RUN_ID.json."
+        ),
+    )
     parser.add_argument("--timeout-s", type=float, default=1800)
     args = parser.parse_args()
     if args.serialize_prerun and args.barrier_prerun:
         parser.error("--serialize-prerun and --barrier-prerun are mutually exclusive")
+    if args.profile_actual_run_id and not (
+        args.serialize_prerun or args.barrier_prerun
+    ):
+        parser.error(
+            "--profile-actual-run-id requires --serialize-prerun or --barrier-prerun"
+        )
     return args
 
 

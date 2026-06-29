@@ -74,6 +74,16 @@ class StageOutputCache:
         self._cache.move_to_end(key)
         return _clone_cached_value(entry.data)
 
+    def contains(self, key: str | None) -> bool:
+        if key is None:
+            return False
+        key = str(key)
+        entry = self._cache.get(key)
+        if entry is None:
+            return False
+        self._cache.move_to_end(key)
+        return True
+
     def put(self, key: str | None, data: Any) -> None:
         if key is None:
             return

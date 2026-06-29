@@ -1468,6 +1468,68 @@ def test_async_stream_ingest_preserves_per_request_order(
     asyncio.run(_run())
 
 
+def test_async_stream_ingest_yield_interval_can_be_stage_specific(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_ASYNC_STREAM_INGEST", "1")
+    monkeypatch.setenv("SGLANG_OMNI_STAGE_IO_YIELD_EVERY_MESSAGES", "1")
+    monkeypatch.setenv("SGLANG_OMNI_STAGE_IO_YIELD_EVERY_MESSAGES_DECODE", "3")
+    monkeypatch.setenv("SGLANG_OMNI_STREAM_INGEST_YIELD_EVERY_MESSAGES", "1")
+    monkeypatch.setenv("SGLANG_OMNI_STREAM_INGEST_YIELD_EVERY_MESSAGES_DECODE", "2")
+
+    async def _run() -> None:
+        scheduler = SimpleNamespace(
+            outbox=queue.Queue(),
+            inbox=queue.Queue(),
+            abort=lambda request_id: None,
+        )
+        stage = Stage(
+            name="decode",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={},
+            control_plane=_FakeControlPlane(),
+            relay=_FakeRelay(),
+            scheduler=scheduler,
+            can_accept_stream_before_payload=True,
+        )
+        stage._stream_queue = StreamQueue(max_pending=4096)
+        assert stage._stage_io_yield_every_messages == 3
+        assert stage._stream_ingest_yield_every_messages == 2
+
+        order: list[tuple[str, int]] = []
+        loop = asyncio.get_running_loop()
+
+        async def _record_stream_chunk(msg: DataReadyMessage) -> None:
+            assert msg.chunk_id is not None
+            order.append(("chunk", msg.chunk_id))
+            loop.call_soon(order.append, ("tick", msg.chunk_id))
+
+        stage._on_stream_chunk = _record_stream_chunk
+
+        ingest_queue: asyncio.Queue[DataReadyMessage | None] = asyncio.Queue()
+        for chunk_id in range(2):
+            ingest_queue.put_nowait(
+                DataReadyMessage(
+                    request_id="req-a",
+                    from_stage="thinker",
+                    to_stage="decode",
+                    shm_metadata={},
+                    chunk_id=chunk_id,
+                )
+            )
+        ingest_queue.put_nowait(None)
+
+        await stage._drain_stream_ingest_queue("req-a", ingest_queue)
+        await asyncio.sleep(0)
+
+        assert order[:2] == [("chunk", 0), ("chunk", 1)]
+        assert order.index(("tick", 0)) > order.index(("chunk", 1))
+
+    asyncio.run(_run())
+
+
 def test_stage_drops_stream_chunk_after_abort_during_relay_read() -> None:
     async def _run() -> None:
         control_plane = _FakeControlPlane()

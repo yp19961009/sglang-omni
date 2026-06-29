@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
 from types import SimpleNamespace
@@ -23,6 +24,7 @@ from sglang_omni.models.qwen3_omni.pending_text_queue import (
 )
 from sglang_omni.models.qwen3_omni.request_builders import build_sglang_talker_request
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
+from sglang_omni.models.qwen3_omni import talker_scheduler as talker_scheduler_mod
 from sglang_omni.models.qwen3_omni.talker_scheduler import (
     MIN_PARTIAL_START_CHUNKS,
     QwenTalkerScheduler,
@@ -235,6 +237,76 @@ def test_qwen_talker_qwen35_decode_waits_when_countdown_exhausted() -> None:
     assert not QwenTalkerModelRunner._data_has_next_decode_input(sched_req.data)
     assert _take_decode_input(sched_req) is None
     assert len(sched_req.data.pending_feedback_queue) == 1
+
+
+def test_qwen_talker_decode_readiness_reports_qwen35_wait_reason() -> None:
+    sched_req = _sched_req(
+        pending_feedback_queue=deque([torch.tensor([1.0, 2.0])]),
+        pending_text_queue=deque([torch.tensor([20.0, 20.0])]),
+        thinker_chunks_done=False,
+        tts_pad_embed=torch.tensor([7.0, 8.0]),
+        talker_decode_input_mode="qwen35_external",
+        talker_text_feedback_countdown=0,
+        talker_text_chunk_size=4,
+    )
+
+    ready, reason = QwenTalkerModelRunner._decode_input_readiness(sched_req.data)
+    assert not ready
+    assert reason == "wait_external_text_chunk"
+    assert not QwenTalkerModelRunner._data_has_next_decode_input(sched_req.data)
+
+    sched_req.data.talker_text_feedback_countdown = 1
+    ready, reason = QwenTalkerModelRunner._decode_input_readiness(sched_req.data)
+    assert ready
+    assert reason == "ready_external_feedback_countdown"
+    assert QwenTalkerModelRunner._data_has_next_decode_input(sched_req.data)
+
+
+def test_qwen_talker_readiness_stats_can_run_without_stream_timing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_TALKER_READINESS_STATS", "1")
+    monkeypatch.setenv("SGLANG_OMNI_STREAM_TIMING_STATS", "0")
+
+    runner = object.__new__(QwenTalkerModelRunner)
+    runner._feedback_enabled = True
+    runner._decode_readiness_stats = runner._new_readiness_stats()
+    runner._decode_readiness_last_log_ns = 0
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_decode=lambda: True),
+        reqs=[
+            SimpleNamespace(
+                _omni_data=SimpleNamespace(
+                    pending_feedback_queue=deque([torch.tensor([1.0, 2.0])]),
+                    pending_text_queue=deque([torch.tensor([20.0, 20.0])]),
+                    thinker_chunks_done=False,
+                    talker_decode_input_mode="qwen35_external",
+                    talker_text_feedback_countdown=1,
+                    talker_text_chunk_size=4,
+                )
+            ),
+            SimpleNamespace(
+                _omni_data=SimpleNamespace(
+                    pending_feedback_queue=deque([torch.tensor([3.0, 4.0])]),
+                    pending_text_queue=deque([torch.tensor([30.0, 30.0])]),
+                    thinker_chunks_done=False,
+                    talker_decode_input_mode="qwen35_external",
+                    talker_text_feedback_countdown=0,
+                    talker_text_chunk_size=4,
+                )
+            ),
+        ],
+    )
+
+    with caplog.at_level(logging.INFO, logger=QwenTalkerModelRunner.__module__):
+        assert not runner.is_decode_batch_ready(batch)
+
+    message = caplog.records[-1].getMessage()
+    assert "batch_size_hist={2: 1}" in message
+    assert "ready_count_hist={1: 1}" in message
+    assert "unready_count_hist={1: 1}" in message
+    assert "wait_external_text_chunk" in message
 
 
 def test_qwen_talker_decode_readiness_requires_feedback_and_text_or_pad() -> None:
@@ -1084,6 +1156,229 @@ def test_wiring_propagation_factory_args_to_scheduler(monkeypatch) -> None:
     assert scheduler._enable_partial_start is True
     assert scheduler._partial_start_min_chunks == 7
 
+
+def test_ready_subset_update_stashes_unready_decode_reqs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_TALKER_READY_SUBSET_MIN_SIZE", "2")
+
+    class FakeBatch:
+        def __init__(self, reqs: list[Any], label: tuple[int, ...] = ()) -> None:
+            self.reqs = reqs
+            self.label = label
+            self.batch_is_full = True
+            self.filtered = False
+
+        def filter_batch(self, **_: Any) -> None:
+            self.filtered = True
+
+        def is_empty(self) -> bool:
+            return not self.reqs
+
+        def merge_batch(self, other: "FakeBatch") -> None:
+            self.reqs.extend(other.reqs)
+
+    reqs = [
+        SimpleNamespace(_omni_data=SimpleNamespace(ready=True)),
+        SimpleNamespace(_omni_data=SimpleNamespace(ready=True)),
+        SimpleNamespace(_omni_data=SimpleNamespace(ready=False)),
+    ]
+    batch = FakeBatch(reqs)
+    scheduler = object.__new__(QwenTalkerScheduler)
+    scheduler._ready_subset_deferred_batch = None
+    scheduler._model_runner = SimpleNamespace(
+        _decode_input_readiness=lambda data: (bool(data.ready), "test")
+    )
+    scheduler._ready_subset_supported = lambda _batch: True
+    scheduler._make_decode_batch_subset = lambda source, indices: FakeBatch(
+        [source.reqs[i] for i in indices],
+        tuple(indices),
+    )
+
+    upstream_calls: list[FakeBatch] = []
+
+    def fake_update_running_batch(_self: Any, ready_batch: FakeBatch) -> FakeBatch:
+        upstream_calls.append(ready_batch)
+        return ready_batch
+
+    monkeypatch.setattr(
+        talker_scheduler_mod._Upstream,
+        "update_running_batch",
+        fake_update_running_batch,
+    )
+
+    out = scheduler.update_running_batch(batch)
+
+    assert batch.filtered is True
+    assert out.label == (0, 1)
+    assert upstream_calls == [out]
+    assert scheduler._ready_subset_deferred_batch.label == (2,)
+
+
+def test_ready_subset_restore_merges_deferred_decode_batch() -> None:
+    class FakeBatch:
+        def __init__(self, reqs: list[Any]) -> None:
+            self.reqs = reqs
+            self.batch_is_full = True
+
+        def is_empty(self) -> bool:
+            return not self.reqs
+
+        def merge_batch(self, other: "FakeBatch") -> None:
+            self.reqs.extend(other.reqs)
+
+    running_req = SimpleNamespace(rid="ready")
+    deferred_req = SimpleNamespace(rid="deferred")
+    scheduler = object.__new__(QwenTalkerScheduler)
+    scheduler.running_batch = FakeBatch([running_req])
+    scheduler._ready_subset_deferred_batch = FakeBatch([deferred_req])
+
+    scheduler._restore_ready_subset_deferred_batch()
+
+    assert [req.rid for req in scheduler.running_batch.reqs] == ["ready", "deferred"]
+    assert scheduler.running_batch.batch_is_full is False
+    assert scheduler._ready_subset_deferred_batch is None
+
+
+def test_ready_subset_stats_log_split_and_restore(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_TALKER_READY_SUBSET_STATS", "1")
+    scheduler = object.__new__(QwenTalkerScheduler)
+    scheduler._ready_subset_stats = scheduler._new_ready_subset_stats()
+    scheduler._ready_subset_stats_last_log_ns = 0
+
+    with caplog.at_level(logging.INFO, logger=talker_scheduler_mod.__name__):
+        scheduler._record_ready_subset_split(
+            input_size=5,
+            ready_size=3,
+            deferred_size=2,
+        )
+        scheduler._record_ready_subset_restore(restored_reqs=2)
+
+    assert scheduler._ready_subset_stats["split_batches"] == 1
+    assert scheduler._ready_subset_stats["ready_reqs"] == 3
+    assert scheduler._ready_subset_stats["deferred_reqs"] == 2
+    assert scheduler._ready_subset_stats["restored_batches"] == 1
+    assert scheduler._ready_subset_stats["restored_reqs"] == 2
+    assert "talker_ready_subset_stats split_batches=1" in caplog.text
+    assert "ready_size_hist={3: 1}" in caplog.text
+
+
+def test_ready_subset_subset_uses_output_ids_instead_of_stale_input_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSamplingInfo:
+        def __init__(self) -> None:
+            self.filtered: tuple[list[int], torch.Tensor] | None = None
+
+        def filter_batch(
+            self, keep_indices: list[int], keep_indices_device: torch.Tensor
+        ) -> None:
+            self.filtered = (list(keep_indices), keep_indices_device.clone())
+
+    monkeypatch.setattr(
+        talker_scheduler_mod.SamplingBatchInfo,
+        "from_schedule_batch",
+        lambda _batch, _vocab_size: FakeSamplingInfo(),
+    )
+
+    class FakeBatch:
+        def __init__(self) -> None:
+            self.reqs = [
+                SimpleNamespace(
+                    return_logprob=False,
+                    stream=True,
+                    grammar=None,
+                    return_hidden_states=False,
+                    output_ids=[101],
+                    origin_input_ids=[11],
+                ),
+                SimpleNamespace(
+                    return_logprob=False,
+                    stream=True,
+                    grammar=None,
+                    return_hidden_states=False,
+                    output_ids=[202],
+                    origin_input_ids=[22],
+                ),
+            ]
+            self.req_to_token_pool = object()
+            self.token_to_kv_pool_allocator = object()
+            self.tree_cache = object()
+            self.is_hybrid_swa = False
+            self.model_config = SimpleNamespace(
+                vocab_size=32000,
+                is_encoder_decoder=False,
+            )
+            self.forward_mode = object()
+            self.enable_overlap = False
+            self.batch_is_full = True
+            self.chunked_req = None
+            # Intentionally stale: this is shorter than reqs/output_ids.
+            self.input_ids = torch.tensor([999], dtype=torch.long)
+            self.req_pool_indices = torch.tensor([3, 4], dtype=torch.long)
+            self.seq_lens = torch.tensor([10, 11], dtype=torch.long)
+            self.seq_lens_cpu = torch.tensor([10, 11], dtype=torch.long)
+            self.out_cache_loc = object()
+            self.output_ids = torch.tensor([101, 202], dtype=torch.long)
+            self.multimodal_inputs = None
+            self.seq_lens_sum = 21
+            self.orig_seq_lens = torch.tensor([10, 11], dtype=torch.int32)
+            self.return_logprob = False
+            self.top_logprobs_nums = None
+            self.token_ids_logprobs = None
+            self.has_stream = True
+            self.has_grammar = False
+            self.return_hidden_states = False
+            self.return_routed_experts = False
+            self.is_prefill_only = False
+            self.global_num_tokens = None
+            self.global_num_tokens_for_logprob = None
+            self.is_extend_in_batch = False
+            self.can_run_dp_cuda_graph = False
+            self.global_forward_mode = None
+            self.dllm_config = None
+            self.device = torch.device("cpu")
+            self.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+            self.spec_info = None
+            self.sampling_info = FakeSamplingInfo()
+
+        def filter_batch(
+            self,
+            *,
+            keep_indices: list[int],
+            v1_spec_info_filtered: bool = False,
+        ) -> None:
+            del v1_spec_info_filtered
+            keep_indices_device = torch.tensor(keep_indices, dtype=torch.long)
+            self.reqs = [self.reqs[i] for i in keep_indices]
+            self.req_pool_indices = self.req_pool_indices[keep_indices_device]
+            self.seq_lens = self.seq_lens[keep_indices_device]
+            self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
+            self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
+            self.output_ids = self.output_ids[keep_indices_device]
+            self.seq_lens_sum = int(self.seq_lens.sum().item())
+            self.sampling_info.filter_batch(keep_indices, keep_indices_device)
+
+    batch = FakeBatch()
+    scheduler = object.__new__(QwenTalkerScheduler)
+
+    subset = scheduler._make_decode_batch_subset(batch, [1])
+
+    assert torch.equal(subset.input_ids, torch.tensor([202]))
+    assert torch.equal(subset.output_ids, torch.tensor([202]))
+    assert subset.reqs == [batch.reqs[1]]
+    assert subset.seq_lens_sum == 11
+    assert subset.batch_is_full is False
+    assert subset.out_cache_loc is None
+    assert isinstance(subset.sampling_info, FakeSamplingInfo)
+    assert subset.sampling_info.filtered is not None
+    assert subset.sampling_info.filtered[0] == [1]
+    # The original batch stays untouched; the subset owns the filtered fields.
+    assert torch.equal(batch.output_ids, torch.tensor([101, 202]))
+    assert torch.equal(batch.input_ids, torch.tensor([999]))
 
 def test_rollback_decode_prep_after_skip_is_idempotent_across_repeated_stalls() -> None:
     """Repeated stalls must leave talker scheduler state identical to pre-prepare_for_decode.

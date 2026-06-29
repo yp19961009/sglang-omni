@@ -84,6 +84,9 @@ _PLAIN_TEXT_TOKEN_CACHE_MAX_ENTRIES = 4096
 _OMIT_CACHED_VISUAL_ITEM_PAYLOADS_ENV = (
     "SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS"
 )
+_VIDEO_PROCESSOR_CACHE_CLONE_ON_HIT_ENV = (
+    "SGLANG_OMNI_VIDEO_PROCESSOR_CACHE_CLONE_ON_HIT"
+)
 _IMAGE_REQUEST_INPUT_ALIASES = (
     "images",
     "input_images",
@@ -279,6 +282,13 @@ def _metadata_at(video_metadata: Any, index: int) -> Any:
 def _omit_cached_visual_item_payloads_enabled() -> bool:
     value = os.getenv(_OMIT_CACHED_VISUAL_ITEM_PAYLOADS_ENV, "")
     return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _video_processor_cache_clone_on_hit_enabled() -> bool:
+    value = os.getenv(_VIDEO_PROCESSOR_CACHE_CLONE_ON_HIT_ENV)
+    if value is None or value == "":
+        return True
+    return value.lower() not in ("0", "false", "no", "off")
 
 
 def _video_entry_with_empty_pixels(
@@ -902,7 +912,9 @@ class _Qwen35ProcessorShim:
             )
             cache_keys_by_index.append(cache_key)
             cached = self._processor_cache_get(
-                self._video_item_processor_cache, cache_key
+                self._video_item_processor_cache,
+                cache_key,
+                clone=_video_processor_cache_clone_on_hit_enabled(),
             )
             if cached is not None:
                 pixel_present.append(True)
@@ -949,7 +961,13 @@ class _Qwen35ProcessorShim:
             and any(item_cache_keys)
         )
 
-    def _processor_cache_get(self, cache: OrderedDict, cache_key: Any):
+    def _processor_cache_get(
+        self,
+        cache: OrderedDict,
+        cache_key: Any,
+        *,
+        clone: bool = True,
+    ):
         if cache_key is None:
             return None
         try:
@@ -957,7 +975,9 @@ class _Qwen35ProcessorShim:
         except KeyError:
             return None
         cache[cache_key] = value
-        return _clone_processor_cache_value(value)
+        if clone:
+            return _clone_processor_cache_value(value)
+        return value
 
     def _processor_cache_set(
         self,

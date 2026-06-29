@@ -1109,6 +1109,162 @@ def test_qwen_image_encoder_item_cache_reuses_video_prefix() -> None:
     assert len(model.calls) == 2
 
 
+def test_qwen_visual_item_cache_miss_chunks_by_cost(monkeypatch) -> None:
+    model = FakeImageEncoderModel()
+    cache = StageOutputCache(max_size=16, max_bytes=1 << 20, cache_device="cpu")
+    items = [
+        {
+            "modality": "video",
+            "cache_key": f"v{idx}",
+            "pixels": torch.ones((1, 3)),
+            "grid": torch.tensor([[1, 1, 1]], dtype=torch.long),
+            "token_count": 1,
+            "result": None,
+        }
+        for idx in range(5)
+    ]
+    item_cost = qwen_stages._visual_item_cost(items[0], model=model)
+    monkeypatch.setattr(
+        qwen_stages,
+        "QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES",
+        item_cost * 2,
+    )
+    state = make_qwen_state()
+    payload = make_qwen_payload(state, request_id="req-chunked-items")
+    plan = qwen_stages._VisualItemCachePlan(
+        idx=0,
+        payload=payload,
+        state=state,
+        request=SimpleNamespace(cache_key=None),
+        image_items=[],
+        video_items=items,
+    )
+    results: list[StagePayload | None] = [None]
+
+    qwen_stages._execute_visual_item_cache_plans(
+        [plan],
+        model=model,
+        cache=cache,
+        results=results,
+    )
+
+    assert [call["video_grid_thw"].shape[0] for call in model.calls] == [2, 2, 1]
+    assert all(item["result"] is not None for item in items)
+    result_state = Qwen3OmniPipelineState.from_dict(results[0].data)
+    assert result_state.encoder_outs["image_encoder"]["video_grid_thw"].shape[0] == 5
+
+
+def test_qwen_visual_item_cache_miss_dedups_same_batch_key() -> None:
+    model = FakeImageEncoderModel()
+    cache = StageOutputCache(max_size=16, max_bytes=1 << 20, cache_device="cpu")
+    items = [
+        {
+            "modality": "video",
+            "cache_key": "shared-video",
+            "pixels": torch.ones((1, 3)),
+            "grid": torch.tensor([[1, 1, 1]], dtype=torch.long),
+            "token_count": 1,
+            "result": None,
+        },
+        {
+            "modality": "video",
+            "cache_key": "shared-video",
+            "pixels": torch.ones((1, 3)) * 2,
+            "grid": torch.tensor([[1, 1, 1]], dtype=torch.long),
+            "token_count": 1,
+            "result": None,
+        },
+    ]
+    state = make_qwen_state()
+    payload = make_qwen_payload(state, request_id="req-dedup-items")
+    plan = qwen_stages._VisualItemCachePlan(
+        idx=0,
+        payload=payload,
+        state=state,
+        request=SimpleNamespace(cache_key=None),
+        image_items=[],
+        video_items=items,
+    )
+    results: list[StagePayload | None] = [None]
+
+    qwen_stages._execute_visual_item_cache_plans(
+        [plan],
+        model=model,
+        cache=cache,
+        results=results,
+    )
+
+    assert len(model.calls) == 1
+    assert model.calls[0]["video_grid_thw"].shape[0] == 1
+    assert items[0]["result"] is items[1]["result"]
+    result_state = Qwen3OmniPipelineState.from_dict(results[0].data)
+    assert result_state.encoder_outs["image_encoder"]["video_grid_thw"].shape[0] == 2
+
+
+def test_qwen_visual_item_result_compacts_combined_views(monkeypatch) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_COMPACT_VISUAL_ENCODER_RESULTS", "1")
+    image_embeds = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    deepstack = [
+        torch.arange(24, dtype=torch.float32).reshape(6, 4),
+        torch.arange(24, 48, dtype=torch.float32).reshape(6, 4),
+    ]
+    combined = {
+        "image_embeds": image_embeds,
+        "image_grid_thw": torch.tensor([[1, 1, 2], [1, 1, 4]], dtype=torch.long),
+        "image_token_counts": torch.tensor([2, 4], dtype=torch.long),
+        "deepstack_visual_embeds_image": deepstack,
+    }
+
+    result, row_end, token_end = qwen_stages._item_result_from_combined(
+        modality="image",
+        item={"token_count": 2},
+        combined=combined,
+        row_cursor=0,
+        token_cursor=0,
+    )
+
+    assert row_end == 1
+    assert token_end == 2
+    assert torch.equal(result["image_embeds"], image_embeds[:2])
+    assert result["image_embeds"].untyped_storage().data_ptr() != (
+        image_embeds.untyped_storage().data_ptr()
+    )
+    assert result["image_embeds"].untyped_storage().nbytes() == (
+        result["image_embeds"].numel() * result["image_embeds"].element_size()
+    )
+    assert result["deepstack_visual_embeds_image"][0].untyped_storage().data_ptr() != (
+        deepstack[0].untyped_storage().data_ptr()
+    )
+
+
+def test_qwen_audio_encoder_result_compacts_combined_views(monkeypatch) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_COMPACT_AUDIO_ENCODER_RESULTS", "1")
+    audio_embeds = torch.arange(40, dtype=torch.float32).reshape(10, 4)
+    feature_lengths = torch.tensor([4, 6], dtype=torch.long)
+    output_lengths = torch.tensor([4, 6], dtype=torch.long)
+    combined_slice = {
+        "audio_embeds": audio_embeds[:4],
+        "audio_feature_lengths": feature_lengths[:1],
+        "audio_output_lengths": output_lengths[:1],
+    }
+
+    result = qwen_stages._compact_audio_encoder_result(combined_slice)
+
+    assert torch.equal(result["audio_embeds"], audio_embeds[:4])
+    assert result["audio_embeds"].untyped_storage().data_ptr() != (
+        audio_embeds.untyped_storage().data_ptr()
+    )
+    assert result["audio_embeds"].untyped_storage().nbytes() == (
+        result["audio_embeds"].numel() * result["audio_embeds"].element_size()
+    )
+    assert result["audio_feature_lengths"].untyped_storage().data_ptr() != (
+        feature_lengths.untyped_storage().data_ptr()
+    )
+    assert result["audio_output_lengths"].untyped_storage().data_ptr() != (
+        output_lengths.untyped_storage().data_ptr()
+    )
+
+
 def test_qwen_image_encoder_item_cache_does_not_store_combined_prefix_by_default(
     monkeypatch,
 ) -> None:
@@ -1187,6 +1343,52 @@ def test_qwen_image_encoder_item_cache_accepts_omitted_video_pixels() -> None:
     assert model.calls[-1]["video_grid_thw"].tolist() == [[1, 1, 3]]
     assert second_out["video_grid_thw"].tolist() == [[1, 1, 2], [1, 1, 3]]
     assert second_out["video_embeds"].shape == (5, 2)
+
+
+def test_qwen_image_encoder_request_cost_uses_item_cache_misses() -> None:
+    model = FakeImageEncoderModel()
+    cache = StageOutputCache(max_size=16, max_bytes=1 << 20, cache_device="cpu")
+    cache.put(
+        "visual_item:video:v1",
+        {
+            "video_embeds": torch.ones((2, 2)),
+            "video_grid_thw": torch.tensor([[1, 1, 2]], dtype=torch.long),
+            "video_token_counts": torch.tensor([2], dtype=torch.long),
+            "deepstack_visual_embeds_video": [torch.ones((2, 2))],
+        },
+    )
+    state = make_qwen_state(
+        encoder_inputs={
+            "image_encoder": {
+                "cache_key": "whole:v1v2",
+                "pixel_values_videos": torch.ones((3, 3)),
+                "video_grid_thw": torch.tensor(
+                    [[1, 1, 2], [1, 1, 3]],
+                    dtype=torch.long,
+                ),
+                "video_item_cache_keys": ["v1", "v2"],
+                "video_item_pixel_present": [False, True],
+            },
+        },
+    )
+    payload = make_qwen_payload(state, request_id="req-cost-v1v2")
+    miss_cost_fn = qwen_stages._create_image_encoder_request_cost_fn(model, cache)
+    full_cost_fn = qwen_stages._create_image_encoder_request_cost_fn(model)
+    expected_miss_cost = qwen_stages._visual_item_cost(
+        {
+            "modality": "video",
+            "cache_key": "visual_item:video:v2",
+            "pixels": torch.ones((3, 3)),
+            "grid": torch.tensor([[1, 1, 3]], dtype=torch.long),
+            "token_count": 3,
+            "result": None,
+        },
+        model=model,
+    )
+
+    assert cache.contains("visual_item:video:v1")
+    assert miss_cost_fn(payload) == expected_miss_cost
+    assert full_cost_fn(payload) > miss_cost_fn(payload)
 
 
 def test_qwen_audio_encoder_item_cache_reuses_audio_prefix() -> None:

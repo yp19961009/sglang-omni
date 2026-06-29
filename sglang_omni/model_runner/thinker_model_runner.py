@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -44,8 +45,8 @@ class ThinkerModelRunner(ModelRunner):
 
     def execute(self, scheduler_output: Any):
         capture_layers = getattr(self._text_model, "layers_to_capture", None)
-        if capture_layers and not self._batch_should_capture_hidden(
-            scheduler_output.requests
+        if capture_layers and not self._scheduler_output_should_capture_hidden(
+            scheduler_output
         ):
             saved_capture_layers = list(capture_layers)
             self._text_model.layers_to_capture = []
@@ -54,6 +55,26 @@ class ThinkerModelRunner(ModelRunner):
             finally:
                 self._text_model.layers_to_capture = saved_capture_layers
         return super().execute(scheduler_output)
+
+    def _scheduler_output_should_capture_hidden(self, scheduler_output: Any) -> bool:
+        if self._skip_prefill_hidden_capture_enabled():
+            batch = getattr(scheduler_output, "batch_data", None)
+            forward_mode = getattr(batch, "forward_mode", None)
+            is_prefill = bool(
+                forward_mode is not None
+                and callable(getattr(forward_mode, "is_extend", None))
+                and forward_mode.is_extend()
+            )
+            if is_prefill:
+                return False
+        return self._batch_should_capture_hidden(scheduler_output.requests)
+
+    @staticmethod
+    def _skip_prefill_hidden_capture_enabled() -> bool:
+        value = os.getenv("SGLANG_OMNI_SKIP_PREFILL_HIDDEN_CAPTURE")
+        if value is None:
+            return False
+        return value.strip().lower() in {"1", "true", "yes", "on"}
 
     def _batch_should_capture_hidden(self, requests: list[Any]) -> bool:
         if self._should_capture_hidden is None:

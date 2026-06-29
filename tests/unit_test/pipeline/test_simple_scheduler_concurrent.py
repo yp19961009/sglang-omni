@@ -47,6 +47,107 @@ def run_scheduler(
         thread.join(timeout=2.0)
 
 
+def run_prefilled_scheduler(
+    scheduler: SimpleScheduler,
+    messages: list[IncomingMessage],
+    *,
+    output_count: int,
+) -> list[Any]:
+    for message in messages:
+        scheduler.inbox.put(message)
+    thread = threading.Thread(target=scheduler.start, daemon=True)
+    thread.start()
+    try:
+        return [scheduler.outbox.get(timeout=2.0) for _ in range(output_count)]
+    finally:
+        scheduler.stop()
+        thread.join(timeout=2.0)
+
+
+def test_priority_fn_promotes_queued_serial_request() -> None:
+    def is_priority(msg: IncomingMessage) -> bool:
+        return msg.type == "new_request" and str(msg.data).startswith("actual")
+
+    outputs = run_prefilled_scheduler(
+        SimpleScheduler(lambda payload: payload, priority_fn=is_priority),
+        [
+            IncomingMessage("pre-1", "new_request", "pre-1"),
+            IncomingMessage("pre-2", "new_request", "pre-2"),
+            IncomingMessage("actual-1", "new_request", "actual-1"),
+        ],
+        output_count=3,
+    )
+
+    assert [out.request_id for out in outputs] == ["actual-1", "pre-1", "pre-2"]
+
+
+def test_priority_fn_collects_priority_batch_without_non_priority() -> None:
+    def is_priority(msg: IncomingMessage) -> bool:
+        return msg.type == "new_request" and str(msg.data).startswith("actual")
+
+    outputs = run_prefilled_scheduler(
+        SimpleScheduler(
+            lambda payload: payload,
+            batch_compute_fn=lambda payloads: [payload.upper() for payload in payloads],
+            max_batch_size=4,
+            max_batch_wait_ms=10,
+            priority_fn=is_priority,
+        ),
+        [
+            IncomingMessage("pre-1", "new_request", "pre-1"),
+            IncomingMessage("actual-1", "new_request", "actual-1"),
+            IncomingMessage("pre-2", "new_request", "pre-2"),
+            IncomingMessage("actual-2", "new_request", "actual-2"),
+        ],
+        output_count=4,
+    )
+
+    assert [out.request_id for out in outputs[:2]] == ["actual-1", "actual-2"]
+    assert {out.request_id for out in outputs[2:]} == {"pre-1", "pre-2"}
+
+
+def test_priority_fn_promotes_prefilled_concurrent_request() -> None:
+    def is_priority(msg: IncomingMessage) -> bool:
+        return msg.type == "new_request" and str(msg.data).startswith("actual")
+
+    started: list[str] = []
+    lock = threading.Lock()
+    two_started = threading.Event()
+    release = threading.Event()
+
+    def compute(payload: str) -> str:
+        with lock:
+            started.append(payload)
+            if len(started) == 2:
+                two_started.set()
+        assert release.wait(timeout=2.0)
+        return payload
+
+    scheduler = SimpleScheduler(compute, max_concurrency=2, priority_fn=is_priority)
+    for message in [
+        IncomingMessage("pre-1", "new_request", "pre-1"),
+        IncomingMessage("pre-2", "new_request", "pre-2"),
+        IncomingMessage("actual-1", "new_request", "actual-1"),
+    ]:
+        scheduler.inbox.put(message)
+
+    thread = threading.Thread(target=scheduler.start, daemon=True)
+    thread.start()
+    try:
+        assert two_started.wait(timeout=2.0)
+        with lock:
+            first_two = list(started)
+        assert "actual-1" in first_two
+        release.set()
+        outputs = [scheduler.outbox.get(timeout=2.0) for _ in range(3)]
+    finally:
+        release.set()
+        scheduler.stop()
+        thread.join(timeout=2.0)
+
+    assert {out.request_id for out in outputs} == {"actual-1", "pre-1", "pre-2"}
+
+
 def test_max_concurrency_runs_sync_fn_in_parallel() -> None:
     """Two sync ``compute_fn`` invocations must be in flight simultaneously
     when ``max_concurrency=2``, not serialized."""

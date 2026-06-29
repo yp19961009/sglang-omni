@@ -319,22 +319,31 @@ class ModelRunner:
         prepare_for_decode turns into an input_ids that mismatches seq_lens once
         a request finishes mid-batch (the bs>1 replay size mismatch)."""
         is_prefill_only = bool(getattr(schedule_batch, "is_prefill_only", False))
-        if is_prefill_only:
-            if batch_result.next_token_ids is None:
-                batch_result.next_token_ids = torch.zeros(
-                    len(model_worker_batch.seq_lens),
-                    dtype=torch.long,
-                    device=model_worker_batch.input_ids.device,
-                )
-        elif batch_result.next_token_ids is None:
+        if not is_prefill_only and batch_result.next_token_ids is None:
             batch_result.next_token_ids = self._sample_next_token_ids(
                 batch_result.logits_output,
                 forward_batch,
                 schedule_batch,
                 scheduler_output.requests,
             )
-        if set_output_ids:
+        self._suppress_initial_zero_token_outputs(
+            batch_result=batch_result,
+            forward_batch=forward_batch,
+            scheduler_output=scheduler_output,
+            is_prefill_only=is_prefill_only,
+        )
+        if set_output_ids and batch_result.next_token_ids is not None:
             schedule_batch.output_ids = batch_result.next_token_ids
+
+        self._debug_zero_token_outputs(
+            batch_result=batch_result,
+            forward_batch=forward_batch,
+            schedule_batch=schedule_batch,
+            model_worker_batch=model_worker_batch,
+            scheduler_output=scheduler_output,
+            is_prefill_only=is_prefill_only,
+            set_output_ids=set_output_ids,
+        )
 
         outputs = self.output_processor.process(batch_result, scheduler_output)
         self.post_process_outputs(batch_result, scheduler_output, outputs)
@@ -343,8 +352,9 @@ class ModelRunner:
             if sched_req.request_id in skip_rids:
                 continue
             data = sched_req.data
-            data.generation_steps = int(data.generation_steps) + 1
             req_output = outputs[sched_req.request_id]
+            if not is_prefill_only:
+                data.generation_steps = int(data.generation_steps) + 1
             extra = req_output.extra
             if isinstance(extra, dict) and extra:
                 data.extra_model_outputs.update(extra)
@@ -357,6 +367,273 @@ class ModelRunner:
             req_id_to_index=req_id_to_index,
             can_run_cuda_graph=bool(batch_result.can_run_cuda_graph),
         )
+
+    @staticmethod
+    def _env_flag_enabled(name: str) -> bool:
+        value = os.getenv(name)
+        if value is None:
+            return False
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    def _runner_allowed_by_env(self, env_name: str) -> bool:
+        runner_filter = os.getenv(env_name)
+        if not runner_filter:
+            return True
+        allowed = {item.strip() for item in runner_filter.split(",") if item.strip()}
+        return type(self).__name__ in allowed
+
+    @staticmethod
+    def _initial_suppress_token_ids(vocab_size: int) -> set[int]:
+        raw = os.getenv("SGLANG_OMNI_SUPPRESS_INITIAL_TOKEN_IDS", "0,1,2,2834,6115,30225")
+        token_ids: set[int] = set()
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                token_id = int(item)
+            except ValueError:
+                logger.warning(
+                    "Invalid SGLANG_OMNI_SUPPRESS_INITIAL_TOKEN_IDS item=%r",
+                    item,
+                )
+                continue
+            if 0 <= token_id < vocab_size:
+                token_ids.add(token_id)
+        return token_ids
+
+    @staticmethod
+    def _output_prefix_only_has_tokens(req: Any, token_ids: set[int]) -> bool:
+        output_ids = getattr(req, "output_ids", None) or []
+        return all(int(token_id) in token_ids for token_id in output_ids)
+
+    def _suppress_initial_zero_token_outputs(
+        self,
+        *,
+        batch_result: Any,
+        forward_batch: Any,
+        scheduler_output: Any,
+        is_prefill_only: bool,
+    ) -> None:
+        if is_prefill_only:
+            return
+        if not self._env_flag_enabled("SGLANG_OMNI_SUPPRESS_INITIAL_ZERO_TOKEN"):
+            return
+        if not self._runner_allowed_by_env(
+            "SGLANG_OMNI_SUPPRESS_INITIAL_ZERO_TOKEN_RUNNERS"
+        ):
+            return
+
+        next_token_ids = getattr(batch_result, "next_token_ids", None)
+        logits_output = getattr(batch_result, "logits_output", None)
+        logits = getattr(logits_output, "next_token_logits", None)
+        if (
+            not isinstance(next_token_ids, torch.Tensor)
+            or not isinstance(logits, torch.Tensor)
+            or logits.ndim != 2
+            or logits.shape[0] != next_token_ids.numel()
+            or logits.shape[1] <= 0
+        ):
+            return
+
+        suppress_token_ids = self._initial_suppress_token_ids(logits.shape[1])
+        if not suppress_token_ids:
+            return
+
+        flat_token_ids = next_token_ids.view(-1)
+        rows_to_resample: list[int] = []
+        for row_idx, token_id in enumerate(flat_token_ids.detach().cpu().tolist()):
+            if int(token_id) not in suppress_token_ids:
+                continue
+            try:
+                sched_req = scheduler_output.requests[row_idx]
+            except IndexError:
+                continue
+            data = getattr(sched_req, "data", None)
+            req = getattr(data, "req", None)
+            sampling_params = getattr(req, "sampling_params", None)
+            max_new_tokens = getattr(sampling_params, "max_new_tokens", None)
+            if bool(getattr(req, "is_prefill_only", False)):
+                continue
+            if max_new_tokens is not None and int(max_new_tokens) <= 0:
+                continue
+            if not self._output_prefix_only_has_tokens(req, suppress_token_ids):
+                continue
+            rows_to_resample.append(row_idx)
+
+        if not rows_to_resample:
+            return
+
+        rows_t = torch.tensor(rows_to_resample, dtype=torch.long, device=logits.device)
+        toks = sorted(suppress_token_ids)
+        toks_t = torch.tensor(toks, dtype=torch.long, device=logits.device)
+        saved_scores = logits[rows_t[:, None], toks_t[None, :]].clone()
+        logits[rows_t[:, None], toks_t[None, :]] = float("-inf")
+        try:
+            resampled = self.tp_worker.model_runner.sample(logits_output, forward_batch)
+        finally:
+            logits[rows_t[:, None], toks_t[None, :]] = saved_scores
+
+        if not isinstance(resampled, torch.Tensor):
+            return
+        resampled_flat = resampled.view(-1)
+        updated = flat_token_ids.clone()
+        for row_idx in rows_to_resample:
+            old_token = int(updated[row_idx].item())
+            new_token = int(resampled_flat[row_idx].item())
+            updated[row_idx] = resampled_flat[row_idx]
+            sched_req = scheduler_output.requests[row_idx]
+            logger.warning(
+                "suppressed_initial_zero_token runner=%s request_id=%s row=%s "
+                "old_token=%s new_token=%s suppressed_tokens=%s",
+                type(self).__name__,
+                getattr(sched_req, "request_id", None),
+                row_idx,
+                old_token,
+                new_token,
+                toks,
+            )
+        batch_result.next_token_ids = updated.view_as(next_token_ids)
+
+    def _debug_zero_token_outputs(
+        self,
+        *,
+        batch_result: Any,
+        forward_batch: Any,
+        schedule_batch: Any,
+        model_worker_batch: Any,
+        scheduler_output: Any,
+        is_prefill_only: bool,
+        set_output_ids: bool,
+    ) -> None:
+        if not os.getenv("SGLANG_OMNI_DEBUG_ZERO_TOKEN"):
+            return
+        if not self._runner_allowed_by_env("SGLANG_OMNI_DEBUG_ZERO_TOKEN_RUNNERS"):
+            return
+
+        next_token_ids = getattr(batch_result, "next_token_ids", None)
+        if next_token_ids is None:
+            return
+        if isinstance(next_token_ids, torch.Tensor):
+            token_ids = [int(x) for x in next_token_ids.detach().cpu().view(-1).tolist()]
+        else:
+            try:
+                token_ids = [int(x) for x in next_token_ids]
+            except TypeError:
+                token_ids = [int(next_token_ids)]
+        if not any(token_id == 0 for token_id in token_ids):
+            return
+
+        input_ids = getattr(forward_batch, "input_ids", None)
+        seq_lens = getattr(model_worker_batch, "seq_lens", None)
+        logits_output = getattr(batch_result, "logits_output", None)
+        logits = getattr(logits_output, "next_token_logits", None)
+        for row_idx, token_id in enumerate(token_ids):
+            if token_id != 0:
+                continue
+            try:
+                sched_req = scheduler_output.requests[row_idx]
+            except IndexError:
+                sched_req = None
+            data = getattr(sched_req, "data", None)
+            req = getattr(data, "req", None)
+            sampling_params = getattr(req, "sampling_params", None)
+            top_tokens = None
+            zero_logit = None
+            logits_stats = None
+            if (
+                isinstance(logits, torch.Tensor)
+                and logits.ndim == 2
+                and row_idx < logits.shape[0]
+            ):
+                row_logits = logits[row_idx].detach().float()
+                finite = torch.isfinite(row_logits)
+                finite_logits = row_logits[finite]
+                top_k = min(10, int(row_logits.numel()))
+                top_vals, top_idx = torch.topk(row_logits, k=top_k)
+                top_tokens = [
+                    (int(idx), float(val))
+                    for idx, val in zip(
+                        top_idx.detach().cpu().tolist(),
+                        top_vals.detach().cpu().tolist(),
+                    )
+                ]
+                zero_logit = (
+                    float(row_logits[0].detach().cpu().item())
+                    if row_logits.numel() > 0
+                    else None
+                )
+                logits_stats = {
+                    "shape": list(logits.shape),
+                    "finite": int(finite.sum().detach().cpu().item()),
+                    "nan": int(torch.isnan(row_logits).sum().detach().cpu().item()),
+                    "posinf": int(torch.isposinf(row_logits).sum().detach().cpu().item()),
+                    "neginf": int(torch.isneginf(row_logits).sum().detach().cpu().item()),
+                    "min": (
+                        float(finite_logits.min().detach().cpu().item())
+                        if finite_logits.numel()
+                        else None
+                    ),
+                    "max": (
+                        float(finite_logits.max().detach().cpu().item())
+                        if finite_logits.numel()
+                        else None
+                    ),
+                }
+            req_debug = None
+            if req is not None:
+                prefix_indices = getattr(req, "prefix_indices", None)
+                req_debug = {
+                    "rid": getattr(req, "rid", None),
+                    "extra_key": getattr(req, "extra_key", None),
+                    "extend_input_len": getattr(req, "extend_input_len", None),
+                    "prefix_len": (
+                        len(prefix_indices) if prefix_indices is not None else None
+                    ),
+                    "fill_ids_len": len(getattr(req, "fill_ids", []) or []),
+                    "origin_input_len": len(
+                        getattr(req, "origin_input_ids", []) or []
+                    ),
+                    "mamba_branching_seqlen": getattr(
+                        req, "mamba_branching_seqlen", None
+                    ),
+                    "omni_mamba_branching_seqlen": getattr(
+                        req, "_omni_mamba_branching_seqlen", None
+                    ),
+                    "omni_max_prefix_cache_len": getattr(
+                        req, "_omni_max_prefix_cache_len", None
+                    ),
+                }
+            logger.warning(
+                "zero_token_output runner=%s request_id=%s row=%s "
+                "generation_steps=%s batch_is_prefill_only=%s "
+                "req_is_prefill_only=%s max_new_tokens=%s forward_mode=%s "
+                "is_prefill_only_batch_attr=%s input_ids_shape=%s seq_lens=%s "
+                "existing_output_len=%s set_output_ids=%s can_run_cuda_graph=%s "
+                "zero_logit=%s top_tokens=%s logits_stats=%s req_debug=%s",
+                type(self).__name__,
+                getattr(sched_req, "request_id", None),
+                row_idx,
+                int(getattr(data, "generation_steps", 0) or 0),
+                is_prefill_only,
+                bool(getattr(req, "is_prefill_only", False)) if req is not None else None,
+                getattr(sampling_params, "max_new_tokens", None),
+                getattr(forward_batch, "forward_mode", None),
+                bool(getattr(schedule_batch, "is_prefill_only", False)),
+                list(input_ids.shape) if isinstance(input_ids, torch.Tensor) else None,
+                (
+                    [int(x) for x in seq_lens.detach().cpu().tolist()]
+                    if isinstance(seq_lens, torch.Tensor)
+                    else seq_lens
+                ),
+                len(getattr(req, "output_ids", []) or []) if req is not None else None,
+                set_output_ids,
+                bool(getattr(batch_result, "can_run_cuda_graph", False)),
+                zero_logit,
+                top_tokens,
+                logits_stats,
+                req_debug,
+            )
 
     # ------------------------------------------------------------------
     # Hooks — override in subclasses

@@ -44,6 +44,8 @@ _DECODE_STREAM_IMMEDIATE_TOKEN_COUNT_ENV = (
     "SGLANG_OMNI_DECODE_STREAM_IMMEDIATE_TOKEN_COUNT"
 )
 _DECODE_STREAM_BATCH_STATE_MAX = 10000
+_DEBUG_THINKER_INPUTS_ENV = "SGLANG_OMNI_DEBUG_THINKER_INPUTS"
+_DEBUG_THINKER_INPUTS_ALL_ENV = "SGLANG_OMNI_DEBUG_THINKER_INPUTS_ALL"
 
 # Note(Chenchen Hong): PyTorch sampling_seed must fit a positive int32.
 MAX_INT32_POSITIVE = 0x7FFFFFFF
@@ -77,6 +79,86 @@ def _decode_stream_immediate_token_count() -> int:
         return max(1, int(raw))
     except ValueError:
         return 1
+
+
+def _debug_thinker_inputs_enabled() -> bool:
+    value = os.getenv(_DEBUG_THINKER_INPUTS_ENV)
+    return value is not None and value.strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _debug_thinker_inputs_all_enabled() -> bool:
+    value = os.getenv(_DEBUG_THINKER_INPUTS_ALL_ENV)
+    return value is not None and value.strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _tensor_debug_stats(path: str, value: Any, out: list[dict[str, Any]]) -> None:
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach()
+        if tensor.dtype.is_floating_point or tensor.dtype.is_complex:
+            nan = int(torch.isnan(tensor).sum().detach().cpu().item())
+            posinf = int(torch.isposinf(tensor).sum().detach().cpu().item())
+            neginf = int(torch.isneginf(tensor).sum().detach().cpu().item())
+        else:
+            nan = posinf = neginf = 0
+        if nan or posinf or neginf or _debug_thinker_inputs_all_enabled():
+            out.append(
+                {
+                    "path": path,
+                    "shape": list(tensor.shape),
+                    "dtype": str(tensor.dtype),
+                    "device": str(tensor.device),
+                    "nan": nan,
+                    "posinf": posinf,
+                    "neginf": neginf,
+                }
+            )
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _tensor_debug_stats(f"{path}.{key}" if path else str(key), item, out)
+        return
+    if isinstance(value, (list, tuple)):
+        for idx, item in enumerate(value):
+            _tensor_debug_stats(f"{path}[{idx}]", item, out)
+
+
+def _maybe_log_thinker_input_stats(
+    *,
+    rid: str,
+    input_len: int,
+    max_new_tokens: int,
+    model_inputs: dict[str, Any],
+    media_cache_keys: dict[str, Any],
+    pad_values: dict[str, int],
+) -> None:
+    if not _debug_thinker_inputs_enabled():
+        return
+    stats: list[dict[str, Any]] = []
+    _tensor_debug_stats("", model_inputs, stats)
+    if not stats and not _debug_thinker_inputs_all_enabled():
+        return
+    logger.warning(
+        "thinker_input_stats rid=%s input_len=%s max_new_tokens=%s "
+        "media_cache_keys=%s pad_values=%s tensor_stats=%s",
+        rid,
+        input_len,
+        max_new_tokens,
+        media_cache_keys,
+        pad_values,
+        stats,
+    )
 
 
 def _make_decode_stream_message(
@@ -1029,6 +1111,14 @@ def build_sglang_thinker_request(
     stop = params.get("stop") or []
     stop_token_ids = params.get("stop_token_ids") or []
     seed = _resolve_seed(params)
+    _maybe_log_thinker_input_stats(
+        rid=rid,
+        input_len=len(input_ids_list),
+        max_new_tokens=max_new_tokens,
+        model_inputs=model_inputs,
+        media_cache_keys=media_cache_keys,
+        pad_values=pad_values,
+    )
 
     # Build SGLang SamplingParams and normalize
     sampling_params = SamplingParams(

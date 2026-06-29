@@ -10,6 +10,7 @@ import torch
 from sglang_omni.models.qwen3_5_omni.payload_types import Qwen3OmniPipelineState
 from sglang_omni.models.qwen3_5_omni import stages
 from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.scheduling.messages import IncomingMessage
 
 
 def _split_root(tmp_path):
@@ -93,6 +94,7 @@ def test_resolve_qwen35_stage_model_path_requires_config_json(tmp_path):
 
 
 def test_qwen35_preprocessing_executor_uses_thinker_subdir(monkeypatch, tmp_path):
+    monkeypatch.delenv("PREPROCESSING_MAX_CONCURRENCY", raising=False)
     root, thinker = _split_root(tmp_path)
     seen = {}
 
@@ -127,6 +129,103 @@ def test_qwen35_preprocessing_executor_uses_thinker_subdir(monkeypatch, tmp_path
     assert seen["kwargs"]["audio_timestamp_interval"] == 30
     assert seen["kwargs"]["audio_downsample_times"] == 4
     assert seen["kwargs"]["audio_downsample_chunk_size"] == 100
+
+
+def test_qwen35_preprocessing_executor_uses_env_max_concurrency(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("PREPROCESSING_MAX_CONCURRENCY", "3")
+    root, _ = _split_root(tmp_path)
+
+    class FakePreprocessor:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __call__(self, payload):
+            return payload
+
+    monkeypatch.setattr(stages, "Qwen35OmniPreprocessor", FakePreprocessor)
+
+    scheduler = stages.create_preprocessing_executor(str(root))
+
+    assert scheduler._max_concurrency == 3
+
+
+def test_qwen35_preprocessing_executor_ignores_invalid_env_max_concurrency(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("PREPROCESSING_MAX_CONCURRENCY", "bad")
+    root, _ = _split_root(tmp_path)
+
+    class FakePreprocessor:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __call__(self, payload):
+            return payload
+
+    monkeypatch.setattr(stages, "Qwen35OmniPreprocessor", FakePreprocessor)
+
+    scheduler = stages.create_preprocessing_executor(str(root), max_concurrency=2)
+
+    assert scheduler._max_concurrency == 2
+
+
+def test_qwen35_front_stage_priority_predicate_is_env_gated(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("SGLANG_OMNI_PRIORITIZE_FRONT_STAGE_STREAM_PREFILL", raising=False)
+    root, _ = _split_root(tmp_path)
+
+    class FakePreprocessor:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __call__(self, payload):
+            return payload
+
+    monkeypatch.setattr(stages, "Qwen35OmniPreprocessor", FakePreprocessor)
+
+    scheduler = stages.create_preprocessing_executor(str(root))
+    assert scheduler._priority_fn is None
+
+    monkeypatch.setenv("SGLANG_OMNI_PRIORITIZE_FRONT_STAGE_STREAM_PREFILL", "1")
+    scheduler = stages.create_preprocessing_executor(str(root))
+
+    actual = StagePayload(
+        request_id="actual",
+        request=OmniRequest(
+            inputs={},
+            params={"stream": True},
+            metadata={"pre_run": False},
+        ),
+        data={},
+    )
+    prerun = StagePayload(
+        request_id="prerun",
+        request=OmniRequest(
+            inputs={},
+            params={"stream": False},
+            metadata={"pre_run": True},
+        ),
+        data={},
+    )
+
+    assert scheduler._priority_fn is not None
+    assert scheduler._priority_fn(IncomingMessage("actual", "new_request", actual))
+    assert not scheduler._priority_fn(IncomingMessage("prerun", "new_request", prerun))
+    assert not scheduler._priority_fn(IncomingMessage("actual", "abort", actual))
+
+
+def test_qwen35_aggregate_executor_can_prioritize_front_stage_actuals(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_PRIORITIZE_FRONT_STAGE_STREAM_PREFILL", "1")
+
+    scheduler = stages.create_aggregate_executor()
+
+    assert scheduler._priority_fn is not None
 
 
 def test_load_qwen35_encoder_uses_local_image_impl(monkeypatch):

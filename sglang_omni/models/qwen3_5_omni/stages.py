@@ -48,6 +48,9 @@ PREPROCESSING_STAGE = "preprocessing"
 logger = logging.getLogger(__name__)
 
 _ENCODER_MAX_BATCH_WAIT_MS_ENV = "SGLANG_OMNI_ENCODER_MAX_BATCH_WAIT_MS"
+_AUDIO_ENCODER_MAX_BATCH_SIZE_ENV = "SGLANG_OMNI_AUDIO_ENCODER_MAX_BATCH_SIZE"
+_PREPROCESSING_MAX_CONCURRENCY_ENV = "PREPROCESSING_MAX_CONCURRENCY"
+_FRONT_STAGE_PRIORITY_ENV = "SGLANG_OMNI_PRIORITIZE_FRONT_STAGE_STREAM_PREFILL"
 
 
 _ENCODER_IMPL_CANDIDATES: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
@@ -90,6 +93,64 @@ def _encoder_max_batch_wait_ms() -> int:
             value,
         )
         return 50
+
+
+def _audio_encoder_max_batch_size(default: int) -> int:
+    value = os.getenv(_AUDIO_ENCODER_MAX_BATCH_SIZE_ENV)
+    if value is None or value == "":
+        return max(int(default), 1)
+    try:
+        return max(int(value), 1)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using default %d",
+            _AUDIO_ENCODER_MAX_BATCH_SIZE_ENV,
+            value,
+            default,
+        )
+        return max(int(default), 1)
+
+
+def _preprocessing_max_concurrency(default: int) -> int:
+    value = os.getenv(_PREPROCESSING_MAX_CONCURRENCY_ENV)
+    if value is None or value == "":
+        return max(int(default), 1)
+    try:
+        return max(int(value), 1)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using configured max_concurrency=%d",
+            _PREPROCESSING_MAX_CONCURRENCY_ENV,
+            value,
+            default,
+        )
+        return max(int(default), 1)
+
+
+def _front_stage_priority_enabled() -> bool:
+    raw = os.getenv(_FRONT_STAGE_PRIORITY_ENV)
+    if raw is None or raw == "":
+        return False
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _is_stream_actual_payload(payload: Any) -> bool:
+    request = getattr(payload, "request", None)
+    params = getattr(request, "params", None)
+    metadata = getattr(request, "metadata", None)
+    if not isinstance(params, dict) or not bool(params.get("stream")):
+        return False
+    return not (isinstance(metadata, dict) and bool(metadata.get("pre_run")))
+
+
+def _front_stage_priority_fn():
+    if not _front_stage_priority_enabled():
+        return None
+
+    def _priority(msg: Any) -> bool:
+        return msg.type == "new_request" and _is_stream_actual_payload(msg.data)
+
+    return _priority
 
 
 def _resolve_qwen35_stage_model_path(model_path: str, stage_name: str) -> str:
@@ -194,11 +255,23 @@ def create_preprocessing_executor(
     async def _preprocess(payload: StagePayload) -> StagePayload:
         return await preprocessor(payload)
 
-    return SimpleScheduler(_preprocess, max_concurrency=max_concurrency)
+    return SimpleScheduler(
+        _preprocess,
+        max_concurrency=_preprocessing_max_concurrency(max_concurrency),
+        priority_fn=_front_stage_priority_fn(),
+    )
 
 
 def create_aggregate_executor():
-    return _create_aggregate_executor()
+    if not _front_stage_priority_enabled():
+        return _create_aggregate_executor()
+
+    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+
+    def _identity(payload: StagePayload) -> StagePayload:
+        return payload
+
+    return SimpleScheduler(_identity, priority_fn=_front_stage_priority_fn())
 
 
 def _create_encoder_executor(stage_name: str, model: Any):
@@ -291,16 +364,22 @@ def _create_batched_encoder_executor(stage_name: str, model: Any):
                     metadata={"modality": modality, "batch_size": len(payloads)},
                 )
 
+    max_batch_size = 32
+    if stage_name == AUDIO_STAGE:
+        max_batch_size = _audio_encoder_max_batch_size(max_batch_size)
+
     kwargs: dict[str, Any] = {
-        "batch_compute_fn": _encode_batch,
-        "max_batch_size": 32,
+        "max_batch_size": max_batch_size,
         "max_batch_wait_ms": _encoder_max_batch_wait_ms(),
+        "priority_fn": _front_stage_priority_fn(),
     }
+    if max_batch_size > 1:
+        kwargs["batch_compute_fn"] = _encode_batch
     if stage_name == IMAGE_STAGE:
         # Reuse Qwen3-Omni's calibrated visual encoder batch budget so
         # concurrent video benchmarks do not degrade into per-request serial
         # vision encoding.
-        kwargs["request_cost_fn"] = _create_image_encoder_request_cost_fn(model)
+        kwargs["request_cost_fn"] = _create_image_encoder_request_cost_fn(model, cache)
         kwargs["max_batch_cost"] = QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES
     return SimpleScheduler(_encode, **kwargs)
 

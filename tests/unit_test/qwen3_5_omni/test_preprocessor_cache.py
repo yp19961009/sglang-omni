@@ -38,6 +38,22 @@ def test_processor_item_cache_returns_independent_values():
     assert second["nested"][0].tolist() == [5]
 
 
+def test_processor_item_cache_can_return_shared_value_when_clone_disabled():
+    shim = object.__new__(_Qwen35ProcessorShim)
+    cache = OrderedDict()
+    key = ("video", "k")
+    value = {"tensor": torch.tensor([1, 2])}
+
+    shim._processor_cache_set(cache, key, value)
+    first = shim._processor_cache_get(cache, key, clone=False)
+    assert first is not None
+    first["tensor"][0] = 77
+
+    second = shim._processor_cache_get(cache, key, clone=False)
+    assert second is not None
+    assert second["tensor"].tolist() == [77, 2]
+
+
 def test_get_video_tokens_does_not_mutate_frame_indices():
     shim = object.__new__(_Qwen35ProcessorShim)
     shim.vision_bos_token = "<vision_bos>"

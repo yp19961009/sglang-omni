@@ -46,6 +46,9 @@ _STREAM_RELAY_COMPLETION_TIMEOUT_ENV = "SGLANG_OMNI_STREAM_RELAY_COMPLETION_TIME
 _STREAM_RELAY_COMPLETION_DEFAULT_TIMEOUT_S = 300.0
 _DEFER_NONSTREAM_COMPLETES_ENV = "SGLANG_OMNI_DEFER_NONSTREAM_COMPLETES"
 _STAGE_IO_YIELD_EVERY_MESSAGES_ENV = "SGLANG_OMNI_STAGE_IO_YIELD_EVERY_MESSAGES"
+_STREAM_INGEST_YIELD_EVERY_MESSAGES_ENV = (
+    "SGLANG_OMNI_STREAM_INGEST_YIELD_EVERY_MESSAGES"
+)
 _ASYNC_STREAM_INGEST_ENV = "SGLANG_OMNI_ASYNC_STREAM_INGEST"
 _STREAM_PAYLOAD_ON_STREAM_ENDPOINT_ENV = "SGLANG_OMNI_STREAM_PAYLOAD_ON_STREAM_ENDPOINT"
 
@@ -76,20 +79,54 @@ def _defer_nonstream_completes_enabled() -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _stage_io_yield_every_messages() -> int:
-    raw = os.getenv(_STAGE_IO_YIELD_EVERY_MESSAGES_ENV)
-    if raw is None or raw == "":
-        return 1
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.warning(
-            "Invalid %s=%r; using 1",
+def _stage_io_yield_every_messages(stage_name: str) -> int:
+    return max(
+        0,
+        _stage_env_int(
             _STAGE_IO_YIELD_EVERY_MESSAGES_ENV,
-            raw,
-        )
-        return 1
-    return max(0, value)
+            stage_name,
+            1,
+        ),
+    )
+
+
+def _stage_env_suffix(stage_name: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in stage_name.upper())
+
+
+def _stage_env_int(name: str, stage_name: str, default: int) -> int:
+    stage_value = os.getenv(f"{name}_{_stage_env_suffix(stage_name)}")
+    if stage_value is not None and stage_value != "":
+        try:
+            return int(stage_value)
+        except ValueError:
+            logger.warning(
+                "Invalid %s_%s=%r; using %s",
+                name,
+                _stage_env_suffix(stage_name),
+                stage_value,
+                default,
+            )
+            return default
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", name, raw, default)
+        return default
+
+
+def _stream_ingest_yield_every_messages(stage_name: str) -> int:
+    return max(
+        0,
+        _stage_env_int(
+            _STREAM_INGEST_YIELD_EVERY_MESSAGES_ENV,
+            stage_name,
+            1,
+        ),
+    )
 
 
 def _stream_payload_on_stream_endpoint_enabled() -> bool:
@@ -214,8 +251,11 @@ class Stage:
         self._stream_relay_completion_tasks: set[asyncio.Task] = set()
         self._defer_nonstream_completes = _defer_nonstream_completes_enabled()
         self._deferred_complete_queue: asyncio.Queue[CompleteMessage] | None = None
-        self._stage_io_yield_every_messages = _stage_io_yield_every_messages()
+        self._stage_io_yield_every_messages = _stage_io_yield_every_messages(self.name)
         self._async_stream_ingest = _async_stream_ingest_enabled()
+        self._stream_ingest_yield_every_messages = (
+            _stream_ingest_yield_every_messages(self.name)
+        )
         self._stream_ingest_queues: dict[
             str, asyncio.Queue[DataReadyMessage | None]
         ] = {}
@@ -637,6 +677,7 @@ class Stage:
         request_id: str,
         queue: asyncio.Queue[DataReadyMessage | None],
     ) -> None:
+        handled_messages = 0
         while self._running or not queue.empty():
             msg = await queue.get()
             if msg is None:
@@ -645,7 +686,12 @@ class Stage:
                 await self._on_stream_signal(msg)
                 break
             await self._on_stream_chunk(msg)
-            await asyncio.sleep(0)
+            handled_messages += 1
+            if (
+                self._stream_ingest_yield_every_messages > 0
+                and handled_messages % self._stream_ingest_yield_every_messages == 0
+            ):
+                await asyncio.sleep(0)
 
     def _on_stream_ingest_done(self, request_id: str, task: asyncio.Task) -> None:
         current = self._stream_ingest_tasks.get(request_id)
