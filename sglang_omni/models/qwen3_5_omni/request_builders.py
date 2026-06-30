@@ -1707,6 +1707,22 @@ def _trim_qwen35_visual_features_to_prompt_tokens(
             actual_rows=actual_rows,
         )
         if keep_items is None:
+            if not _trim_partial_trailing_visual_features_enabled():
+                continue
+
+            model_inputs[feature_key] = _trim_feature_rows(feature_value, expected_rows)
+            for key in spec["deepstack_keys"]:
+                if key in model_inputs:
+                    model_inputs[key] = _trim_token_aligned_value(
+                        model_inputs[key], expected_rows
+                    )
+            logger.warning(
+                "Trimmed partial trailing Qwen3.5 %s encoder rows to match "
+                "prompt tokens: features=%d prompt_tokens=%d",
+                spec["modality"],
+                actual_rows,
+                expected_rows,
+            )
             continue
 
         model_inputs[feature_key] = _trim_feature_rows(feature_value, expected_rows)
@@ -1739,6 +1755,13 @@ def _env_flag_enabled(raw: str | None, *, default: bool = False) -> bool:
     if raw is None or raw == "":
         return default
     return raw not in {"0", "false", "False", "no", "NO", "off", "OFF"}
+
+
+def _trim_partial_trailing_visual_features_enabled() -> bool:
+    return _env_flag_enabled(
+        os.getenv("QWEN35_TRIM_PARTIAL_TRAILING_VISUAL_FEATURES"),
+        default=False,
+    )
 
 
 def _omit_cached_visual_item_payloads_enabled() -> bool:

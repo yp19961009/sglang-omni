@@ -3194,6 +3194,37 @@ def test_qwen35_prepare_thinker_inputs_rejects_partial_video_item_mismatch():
         request_builders._prepare_qwen35_thinker_inputs(state, _mrope_config())
 
 
+def test_qwen35_prepare_thinker_inputs_can_trim_partial_video_rows_for_rtc(
+    monkeypatch,
+):
+    monkeypatch.setenv("QWEN35_TRIM_PARTIAL_TRAILING_VISUAL_FEATURES", "1")
+    state = Qwen3OmniPipelineState(
+        prompt={"input_ids": torch.tensor([12, 12, 12, 12, 99])},
+        thinker_inputs={
+            "model_inputs": {
+                "video_embeds": torch.arange(5, dtype=torch.float32).reshape(5, 1),
+                "video_grid_thw": torch.tensor(
+                    [[1, 1, 3], [1, 1, 2]], dtype=torch.long
+                ),
+                "video_token_counts": torch.tensor([3, 2], dtype=torch.long),
+                "video_deepstack_visual_embeds": [
+                    torch.arange(10, 15, dtype=torch.float32).reshape(5, 1)
+                ],
+            }
+        },
+    )
+
+    request_builders._prepare_qwen35_thinker_inputs(state, _mrope_config())
+
+    model_inputs = state.thinker_inputs["model_inputs"]
+    assert model_inputs["video_embeds"].tolist() == [[0.0], [1.0], [2.0], [3.0]]
+    assert model_inputs["video_grid_thw"].tolist() == [[1, 1, 3], [1, 1, 2]]
+    assert model_inputs["video_token_counts"].tolist() == [3, 2]
+    assert model_inputs["deepstack_input_embeds"][
+        "deepstack_input_embeds_0"
+    ].tolist() == [[10.0], [11.0], [12.0], [13.0], [0.0]]
+
+
 def test_qwen35_multimodal_feature_length_validation_passes():
     request_builders._validate_qwen35_multimodal_feature_lengths(
         torch.tensor([11, 11, 12, 14, 14]),
