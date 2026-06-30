@@ -19,10 +19,34 @@ from sglang_omni.scheduling.messages import OutgoingMessage
 logger = logging.getLogger(__name__)
 
 _QWEN35_EXTERNAL_DECODE_INPUT_MODE = "qwen35_external"
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid integer env %s=%r", name, raw)
+        return default
+
 _QWEN35_ALLOW_EMPTY_TEXT_FEEDBACK = os.environ.get(
     "QWEN35_TALKER_ALLOW_EMPTY_TEXT_FEEDBACK",
     "1",
 ).lower() in {"1", "true", "yes", "on"}
+_QWEN35_ALLOW_UNBOUNDED_EMPTY_TEXT_FEEDBACK = os.environ.get(
+    "QWEN35_TALKER_ALLOW_UNBOUNDED_EMPTY_TEXT_FEEDBACK",
+    "0",
+).lower() in {"1", "true", "yes", "on"}
+_QWEN35_ALLOW_PARTIAL_TEXT_CHUNK_BEFORE_DONE = os.environ.get(
+    "QWEN35_TALKER_ALLOW_PARTIAL_TEXT_CHUNK_BEFORE_DONE",
+    "0",
+).lower() in {"1", "true", "yes", "on"}
+_QWEN35_PARTIAL_TEXT_CHUNK_WAIT_SKIPS = max(
+    0,
+    _env_int("QWEN35_TALKER_PARTIAL_TEXT_CHUNK_WAIT_SKIPS", 0),
+)
 _STREAM_TIMING_STATS_ENV = "SGLANG_OMNI_STREAM_TIMING_STATS"
 _READINESS_STATS_ENV = "SGLANG_OMNI_TALKER_READINESS_STATS"
 
@@ -644,18 +668,30 @@ class QwenTalkerModelRunner(ModelRunner):
                 )
                 pending_len = _queue_len(getattr(data, "pending_text_queue", None))
                 if pending_len >= chunk_size:
+                    QwenTalkerModelRunner._reset_partial_text_chunk_wait(data)
                     return True, "ready_external_text_chunk"
                 if bool(getattr(data, "thinker_chunks_done", False)):
+                    QwenTalkerModelRunner._reset_partial_text_chunk_wait(data)
                     return True, "ready_external_final_text_chunk"
+                partial_reason = (
+                    QwenTalkerModelRunner._partial_text_chunk_ready_reason(data)
+                )
+                if partial_reason is not None:
+                    return True, partial_reason
+                QwenTalkerModelRunner._increment_partial_text_chunk_wait(data)
                 return False, "wait_external_text_chunk"
             if getattr(data, "thinker_chunks_done", False):
+                QwenTalkerModelRunner._reset_partial_text_chunk_wait(data)
                 return True, "ready_external_done_feedback"
+            QwenTalkerModelRunner._reset_partial_text_chunk_wait(data)
             ready = (
                 _QWEN35_ALLOW_EMPTY_TEXT_FEEDBACK
                 and int(getattr(data, "talker_text_feedback_countdown", 0) or 0) > 0
             )
             if ready:
                 return True, "ready_external_empty_text_feedback"
+            if _QWEN35_ALLOW_UNBOUNDED_EMPTY_TEXT_FEEDBACK:
+                return True, "ready_external_unbounded_empty_text_feedback"
             return False, "wait_external_text"
         pending_text_queue = getattr(data, "pending_text_queue", None)
         if pending_text_queue:
@@ -667,6 +703,33 @@ class QwenTalkerModelRunner(ModelRunner):
         if ready:
             return True, "ready_sum_pad"
         return False, "wait_sum_text_or_pad"
+
+    @staticmethod
+    def _partial_text_chunk_ready_reason(data: Any) -> str | None:
+        if _QWEN35_ALLOW_PARTIAL_TEXT_CHUNK_BEFORE_DONE:
+            return "ready_external_partial_text_chunk"
+        if _QWEN35_PARTIAL_TEXT_CHUNK_WAIT_SKIPS <= 0:
+            return None
+        wait_skips = int(
+            getattr(data, "talker_partial_text_chunk_wait_skips", 0) or 0
+        )
+        if wait_skips >= _QWEN35_PARTIAL_TEXT_CHUNK_WAIT_SKIPS:
+            return "ready_external_partial_text_chunk_after_wait"
+        return None
+
+    @staticmethod
+    def _increment_partial_text_chunk_wait(data: Any) -> None:
+        if _QWEN35_PARTIAL_TEXT_CHUNK_WAIT_SKIPS <= 0:
+            return
+        wait_skips = int(
+            getattr(data, "talker_partial_text_chunk_wait_skips", 0) or 0
+        )
+        data.talker_partial_text_chunk_wait_skips = wait_skips + 1
+
+    @staticmethod
+    def _reset_partial_text_chunk_wait(data: Any) -> None:
+        if hasattr(data, "talker_partial_text_chunk_wait_skips"):
+            data.talker_partial_text_chunk_wait_skips = 0
 
     def _requests_ready_for_decode(self, requests: list) -> bool:
         return all(
@@ -815,11 +878,14 @@ class QwenTalkerModelRunner(ModelRunner):
                 if (
                     available < chunk_size
                     and not getattr(data, "thinker_chunks_done", False)
+                    and QwenTalkerModelRunner._partial_text_chunk_ready_reason(data)
+                    is None
                 ):
                     data.last_talker_decode_input_kind = None
                     data.last_talker_decode_should_emit = True
                     return None
                 else:
+                    QwenTalkerModelRunner._reset_partial_text_chunk_wait(data)
                     rows_in_chunk = min(chunk_size, available)
                     data.talker_text_chunk_remaining = rows_in_chunk
                     data.talker_text_outputs_to_drop = max(0, rows_in_chunk - 1)
@@ -838,10 +904,12 @@ class QwenTalkerModelRunner(ModelRunner):
                 return None
             countdown = int(getattr(data, "talker_text_feedback_countdown", 0) or 0)
             if countdown <= 0:
-                data.last_talker_decode_input_kind = None
-                data.last_talker_decode_should_emit = True
-                return None
-            data.talker_text_feedback_countdown = countdown - 1
+                if not _QWEN35_ALLOW_UNBOUNDED_EMPTY_TEXT_FEEDBACK:
+                    data.last_talker_decode_input_kind = None
+                    data.last_talker_decode_should_emit = True
+                    return None
+            else:
+                data.talker_text_feedback_countdown = countdown - 1
             row = feedback
         else:
             row = feedback

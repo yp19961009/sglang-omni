@@ -113,7 +113,7 @@ async def _stop_request_profile(
 def _is_pure_bang_text(text: str | None) -> bool:
     stripped = (text or "").strip()
     stripped = stripped.strip('"\'“”')
-    stripped = stripped.lstrip("#＃")
+    stripped = stripped.lstrip("#＃$＄")
     return bool(stripped) and set(stripped) <= {"!", "！"}
 
 
@@ -307,11 +307,14 @@ async def _run_session(
     sample_idx: int,
 ) -> dict[str, Any]:
     context = _session_context(args, out_dir, sample_idx)
-    pre_run_times = await _run_preruns(
-        session=session, args=args, api_url=api_url, context=context
-    )
-    if args.post_prerun_sleep_ms > 0:
-        await asyncio.sleep(args.post_prerun_sleep_ms / 1000.0)
+    if args.skip_prerun:
+        pre_run_times = []
+    else:
+        pre_run_times = await _run_preruns(
+            session=session, args=args, api_url=api_url, context=context
+        )
+        if args.post_prerun_sleep_ms > 0:
+            await asyncio.sleep(args.post_prerun_sleep_ms / 1000.0)
     return await _run_actual(
         session=session,
         args=args,
@@ -625,6 +628,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "actual_elapsed_s": actual_elapsed_s,
         "serialize_prerun": bool(args.serialize_prerun),
         "barrier_prerun": bool(args.barrier_prerun),
+        "skip_prerun": bool(args.skip_prerun),
         "qps": completed / elapsed_s if elapsed_s > 0 else None,
         "mode": "text" if args.text_only else "text_audio",
         "max_tokens": args.max_tokens,
@@ -745,6 +749,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio-only", action="store_true")
     parser.add_argument("--text-only", action="store_true")
     parser.add_argument(
+        "--skip-prerun",
+        action="store_true",
+        help=(
+            "Skip RTC cache-population pre-run requests and measure one actual "
+            "trunk-size request per session. This matches chunkwise realtime "
+            "latency runs where only the final streamed request is measured."
+        ),
+    )
+    parser.add_argument(
         "--serialize-prerun",
         action="store_true",
         help=(
@@ -785,6 +798,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.serialize_prerun and args.barrier_prerun:
         parser.error("--serialize-prerun and --barrier-prerun are mutually exclusive")
+    if args.skip_prerun and (args.serialize_prerun or args.barrier_prerun):
+        parser.error("--skip-prerun cannot be combined with pre-run modes")
     if args.profile_actual_run_id and not (
         args.serialize_prerun or args.barrier_prerun
     ):

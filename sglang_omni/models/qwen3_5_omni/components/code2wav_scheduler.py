@@ -984,7 +984,7 @@ def _warmup_code2wav_decode(
 ) -> bool:
     if not _env_flag(
         "SGLANG_OMNI_QWEN35_CODE2WAV_COMPILE_WARMUP",
-        default=False,
+        default=True,
     ):
         return False
 

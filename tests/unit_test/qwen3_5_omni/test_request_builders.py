@@ -2728,6 +2728,7 @@ def test_qwen35_thinker_adapter_marks_rtc_prerun_isolated_before_req_init(
     monkeypatch,
 ):
     monkeypatch.delenv("QWEN35_RTC_ISOLATE_PRERUN_PREFILL", raising=False)
+    monkeypatch.setenv("QWEN35_RTC_PROTECT_PRERUN_PREFIX_CACHE", "1")
     fake_req = SimpleNamespace(is_prefill_only=False)
 
     def _fake_build_sglang_thinker_request(*args, **kwargs):
@@ -2751,7 +2752,7 @@ def test_qwen35_thinker_adapter_marks_rtc_prerun_isolated_before_req_init(
         request=OmniRequest(
             inputs={},
             params={"max_tokens": 0},
-            metadata={"pre_run": True},
+            metadata={"pre_run": True, "media_cache_namespace": "rtc:req-0"},
         ),
         data=state.to_dict(),
     )
@@ -2759,6 +2760,43 @@ def test_qwen35_thinker_adapter_marks_rtc_prerun_isolated_before_req_init(
     request_builder(payload)
 
     assert fake_req._omni_isolate_prefill_batch is True
+    assert fake_req._omni_rtc_cache_namespace == "rtc:req-0"
+    assert fake_req._omni_protect_latest_prefix_cache is True
+
+
+def test_qwen35_thinker_adapter_marks_rtc_actual_cache_release(monkeypatch):
+    fake_req = SimpleNamespace(
+        extra_key="media-cache:audio=rtc:req-0:audio",
+        sampling_params=SimpleNamespace(max_new_tokens=64),
+    )
+
+    def _fake_build_sglang_thinker_request(*args, **kwargs):
+        del args, kwargs
+        return SimpleNamespace(req=fake_req, stage_payload=None)
+
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "build_sglang_thinker_request",
+        _fake_build_sglang_thinker_request,
+    )
+
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    state = Qwen3OmniPipelineState(prompt={"input_ids": torch.tensor([1])})
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(inputs={}, params={"max_tokens": 64}, metadata={}),
+        data=state.to_dict(),
+    )
+
+    request_builder(payload)
+
+    assert fake_req._omni_prioritize_prefill is True
+    assert fake_req._omni_rtc_cache_namespace == "rtc:req-0"
+    assert fake_req._omni_release_protected_prefix_cache_on_finish is True
 
 
 def test_qwen35_thinker_adapter_can_keep_rtc_prerun_generation(monkeypatch):
@@ -2857,7 +2895,101 @@ def test_qwen35_mamba_branching_hint_patch_preserves_real_cache_hit():
     assert req.mamba_branching_seqlen is None
 
 
-def test_qwen35_mamba_branching_hint_patch_fills_missing_branch():
+def test_qwen35_rtc_actual_detection_falls_back_to_req_media_cache_key():
+    request = SimpleNamespace(metadata={})
+    req = SimpleNamespace(
+        extra_key="media-cache:audio=rtc:sample:audio|video=rtc:sample:video",
+        sampling_params=SimpleNamespace(max_new_tokens=64),
+    )
+
+    assert request_builders._is_qwen35_rtc_actual_req(request, req)
+
+
+def test_qwen35_rtc_actual_detection_rejects_prefill_only_cache_key():
+    request = SimpleNamespace(metadata={})
+    req = SimpleNamespace(
+        extra_key="media-cache:audio=rtc:sample:audio",
+        sampling_params=SimpleNamespace(max_new_tokens=0),
+    )
+
+    assert not request_builders._is_qwen35_rtc_actual_req(request, req)
+
+
+def test_qwen35_rtc_namespace_from_media_cache_key_strips_modality_suffix():
+    req = SimpleNamespace(
+        extra_key="media-cache:audio=rtc:sample:audio|video=rtc:sample:video"
+    )
+
+    assert request_builders._qwen35_rtc_cache_namespace(
+        SimpleNamespace(metadata={}), req
+    ) == "rtc:sample"
+
+
+def test_qwen35_mamba_branching_hint_patch_caps_actual_prefix_match():
+    class FakeReq:
+        return_logprob = False
+        logprob_start_len = -1
+
+        def init_next_round_input(self, tree_cache=None):
+            del tree_cache
+            self.seen_return_logprob = self.return_logprob
+            self.seen_logprob_start_len = self.logprob_start_len
+            self.prefix_indices = [0] * int(self.logprob_start_len)
+            self.mamba_branching_seqlen = None
+
+    request_builders.qwen3_request_builders._install_mamba_branching_hint_patch(
+        FakeReq
+    )
+    req = FakeReq()
+    req._omni_mamba_branching_seqlen = 896
+    req._omni_mamba_prefix_cache_limit = 896
+
+    req.init_next_round_input(object())
+
+    assert req.seen_return_logprob is True
+    assert req.seen_logprob_start_len == 896
+    assert req.return_logprob is False
+    assert req.logprob_start_len == -1
+    assert len(req.prefix_indices) == 896
+
+
+def test_qwen35_mamba_branching_hint_patch_preserves_covered_radix_branch():
+    class FakeReq:
+        def init_next_round_input(self, tree_cache=None):
+            del tree_cache
+            self.prefix_indices = [0] * 34688
+            self.mamba_branching_seqlen = 35584
+
+    request_builders.qwen3_request_builders._install_mamba_branching_hint_patch(
+        FakeReq
+    )
+    req = FakeReq()
+    req._omni_mamba_branching_seqlen = 896
+
+    req.init_next_round_input(None)
+
+    assert req.mamba_branching_seqlen == 35584
+
+
+def test_qwen35_mamba_branching_hint_patch_overrides_uncovered_deeper_branch():
+    class FakeReq:
+        def init_next_round_input(self, tree_cache=None):
+            del tree_cache
+            self.prefix_indices = [0] * 64
+            self.mamba_branching_seqlen = 256
+
+    request_builders.qwen3_request_builders._install_mamba_branching_hint_patch(
+        FakeReq
+    )
+    req = FakeReq()
+    req._omni_mamba_branching_seqlen = 128
+
+    req.init_next_round_input(None)
+
+    assert req.mamba_branching_seqlen == 128
+
+
+def test_qwen35_mamba_branching_hint_patch_fills_missing_uncovered_branch():
     class FakeReq:
         def init_next_round_input(self, tree_cache=None):
             del tree_cache
@@ -2873,6 +3005,24 @@ def test_qwen35_mamba_branching_hint_patch_fills_missing_branch():
     req.init_next_round_input(None)
 
     assert req.mamba_branching_seqlen == 128
+
+
+def test_qwen35_mamba_branching_hint_patch_preserves_missing_covered_branch():
+    class FakeReq:
+        def init_next_round_input(self, tree_cache=None):
+            del tree_cache
+            self.prefix_indices = [0] * 128
+            self.mamba_branching_seqlen = None
+
+    request_builders.qwen3_request_builders._install_mamba_branching_hint_patch(
+        FakeReq
+    )
+    req = FakeReq()
+    req._omni_mamba_branching_seqlen = 128
+
+    req.init_next_round_input(None)
+
+    assert req.mamba_branching_seqlen is None
 
 
 def test_qwen35_thinker_sampling_accepts_openai_max_tokens_alias():
@@ -2974,6 +3124,74 @@ def test_qwen35_prepare_deepstack_inputs_accepts_encoder_legacy_keys():
     ].tolist() == [[1.0], [2.0], [0.0]]
     assert "deepstack_visual_embeds_image" not in model_inputs
     assert "deepstack_visual_embeds_video" not in model_inputs
+
+
+def test_qwen35_prepare_thinker_inputs_trims_trailing_video_item_features():
+    state = Qwen3OmniPipelineState(
+        prompt={"input_ids": torch.tensor([12, 12, 12, 99])},
+        thinker_inputs={
+            "model_inputs": {
+                "video_embeds": torch.arange(5, dtype=torch.float32).reshape(5, 1),
+                "video_grid_thw": torch.tensor(
+                    [[1, 1, 3], [1, 1, 2]], dtype=torch.long
+                ),
+                "video_token_counts": torch.tensor([3, 2], dtype=torch.long),
+                "video_deepstack_visual_embeds": [
+                    torch.arange(10, 15, dtype=torch.float32).reshape(5, 1)
+                ],
+                "use_audio_in_video": [False, True],
+            }
+        },
+    )
+
+    request_builders._prepare_qwen35_thinker_inputs(state, _mrope_config())
+
+    model_inputs = state.thinker_inputs["model_inputs"]
+    assert model_inputs["video_embeds"].tolist() == [[0.0], [1.0], [2.0]]
+    assert model_inputs["video_grid_thw"].tolist() == [[1, 1, 3]]
+    assert model_inputs["video_token_counts"].tolist() == [3]
+    assert model_inputs["use_audio_in_video"] == [False]
+    assert model_inputs["deepstack_input_embeds"][
+        "deepstack_input_embeds_0"
+    ].tolist() == [[10.0], [11.0], [12.0], [0.0]]
+
+
+def test_qwen35_prepare_thinker_inputs_trims_using_video_grid_counts():
+    state = Qwen3OmniPipelineState(
+        prompt={"input_ids": torch.tensor([12, 12, 12, 99])},
+        thinker_inputs={
+            "model_inputs": {
+                "video_embeds": torch.arange(5, dtype=torch.float32).reshape(5, 1),
+                "video_grid_thw": torch.tensor(
+                    [[1, 1, 3], [1, 1, 2]], dtype=torch.long
+                ),
+            }
+        },
+    )
+
+    request_builders._prepare_qwen35_thinker_inputs(state, _mrope_config())
+
+    model_inputs = state.thinker_inputs["model_inputs"]
+    assert model_inputs["video_embeds"].tolist() == [[0.0], [1.0], [2.0]]
+    assert model_inputs["video_grid_thw"].tolist() == [[1, 1, 3]]
+
+
+def test_qwen35_prepare_thinker_inputs_rejects_partial_video_item_mismatch():
+    state = Qwen3OmniPipelineState(
+        prompt={"input_ids": torch.tensor([12, 12, 12, 12, 99])},
+        thinker_inputs={
+            "model_inputs": {
+                "video_embeds": torch.ones(5, 1),
+                "video_grid_thw": torch.tensor(
+                    [[1, 1, 3], [1, 1, 2]], dtype=torch.long
+                ),
+                "video_token_counts": torch.tensor([3, 2], dtype=torch.long),
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="video feature/token mismatch"):
+        request_builders._prepare_qwen35_thinker_inputs(state, _mrope_config())
 
 
 def test_qwen35_multimodal_feature_length_validation_passes():
@@ -3163,6 +3381,35 @@ def test_qwen35_stream_builder_inlines_decode_token_when_enabled(monkeypatch):
     assert torch.equal(messages[1].data, embed[0])
 
 
+def test_qwen35_stream_builder_skips_non_text_token_for_talker(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
+    embed = torch.tensor([[1.0, 1.0]])
+    builder = request_builders.make_thinker_stream_output_builder(
+        required_aux_hidden_key=18,
+        vocab_size=128,
+    )
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(
+            inputs={},
+            params={"stream": True, "modalities": ["text", "audio"]},
+        ),
+        data={},
+    )
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(is_chunked=0),
+        stage_payload=payload,
+    )
+    req_output = SimpleNamespace(
+        data=1 << 40,
+        extra={"stream_hidden_states": embed},
+    )
+
+    messages = builder("req-0", req_data, req_output)
+
+    assert [msg.target for msg in messages] == ["decode"]
+
+
 def test_qwen35_stream_builder_batches_decode_tokens(monkeypatch):
     monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
     monkeypatch.setenv("SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE", "3")
@@ -3198,6 +3445,236 @@ def test_qwen35_stream_builder_batches_decode_tokens(monkeypatch):
     assert decode_chunks[3][0].data == [43, 44, 45]
     assert decode_chunks[3][0].metadata["token_count"] == 3
     assert decode_chunks[4] == []
+
+
+def test_qwen35_stream_builder_batches_rtc_audio_decode_tokens_by_default(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
+    monkeypatch.delenv("SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE", raising=False)
+    monkeypatch.delenv("QWEN35_RTC_DECODE_STREAM_TOKEN_BATCH_SIZE", raising=False)
+    builder = request_builders.make_thinker_stream_output_builder(
+        required_aux_hidden_key=18
+    )
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(
+            inputs={},
+            params={"stream": True, "modalities": ["text", "audio"]},
+            metadata={"media_cache_namespace": "rtc:req-0"},
+        ),
+        data={},
+    )
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(is_chunked=0),
+        stage_payload=payload,
+    )
+
+    per_token_messages = [
+        builder(
+            "req-0",
+            req_data,
+            SimpleNamespace(data=token_id, extra={}),
+        )
+        for token_id in range(1, 10)
+    ]
+    decode_chunks = [
+        [msg for msg in messages if msg.target == "decode"]
+        for messages in per_token_messages
+    ]
+
+    assert decode_chunks[0][0].data == 1
+    assert all(chunk == [] for chunk in decode_chunks[1:8])
+    assert decode_chunks[8][0].data == list(range(2, 10))
+    assert decode_chunks[8][0].metadata["token_count"] == 8
+
+
+def test_qwen35_stream_builder_batches_rtc_decode_tokens_from_req_extra_key(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
+    monkeypatch.delenv("SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE", raising=False)
+    monkeypatch.delenv("QWEN35_RTC_DECODE_STREAM_TOKEN_BATCH_SIZE", raising=False)
+    builder = request_builders.make_thinker_stream_output_builder(
+        required_aux_hidden_key=18
+    )
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(
+            inputs={},
+            params={"stream": True, "modalities": ["text", "audio"]},
+        ),
+        data={},
+    )
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(is_chunked=0, extra_key="cache=rtc:req-0:video"),
+        stage_payload=payload,
+    )
+
+    per_token_messages = [
+        builder(
+            "req-0",
+            req_data,
+            SimpleNamespace(data=token_id, extra={}),
+        )
+        for token_id in range(1, 10)
+    ]
+    decode_chunks = [
+        [msg for msg in messages if msg.target == "decode"]
+        for messages in per_token_messages
+    ]
+
+    assert decode_chunks[0][0].data == 1
+    assert all(chunk == [] for chunk in decode_chunks[1:8])
+    assert decode_chunks[8][0].data == list(range(2, 10))
+    assert decode_chunks[8][0].metadata["token_count"] == 8
+
+
+def test_qwen35_stream_builder_batches_rtc_text_only_decode_tokens(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
+    monkeypatch.delenv("SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE", raising=False)
+    monkeypatch.delenv("QWEN35_RTC_DECODE_STREAM_TOKEN_BATCH_SIZE", raising=False)
+    builder = request_builders.make_thinker_stream_output_builder(
+        required_aux_hidden_key=18
+    )
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(
+            inputs={},
+            params={"stream": True, "modalities": ["text"]},
+            metadata={"media_cache_namespace": "rtc:req-0"},
+        ),
+        data={},
+    )
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(is_chunked=0),
+        stage_payload=payload,
+    )
+
+    per_token_messages = [
+        builder(
+            "req-0",
+            req_data,
+            SimpleNamespace(data=token_id, extra={}),
+        )
+        for token_id in range(1, 10)
+    ]
+    decode_chunks = [
+        [msg for msg in messages if msg.target == "decode"]
+        for messages in per_token_messages
+    ]
+
+    assert decode_chunks[0][0].data == 1
+    assert all(chunk == [] for chunk in decode_chunks[1:8])
+    assert decode_chunks[8][0].data == list(range(2, 10))
+
+
+def test_qwen35_stream_builder_keeps_non_rtc_decode_tokens_unbatched(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
+    monkeypatch.delenv("SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE", raising=False)
+    monkeypatch.delenv("QWEN35_RTC_DECODE_STREAM_TOKEN_BATCH_SIZE", raising=False)
+    builder = request_builders.make_thinker_stream_output_builder(
+        required_aux_hidden_key=18
+    )
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(
+            inputs={},
+            params={"stream": True, "modalities": ["text", "audio"]},
+        ),
+        data={},
+    )
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(is_chunked=0),
+        stage_payload=payload,
+    )
+
+    first = builder("req-0", req_data, SimpleNamespace(data=1, extra={}))
+    second = builder("req-0", req_data, SimpleNamespace(data=2, extra={}))
+
+    assert [msg.data for msg in first if msg.target == "decode"] == [1]
+    assert [msg.data for msg in second if msg.target == "decode"] == [2]
+
+
+def test_qwen35_talker_adapter_prioritizes_rtc_actual_prefill(monkeypatch):
+    fake_req = SimpleNamespace()
+
+    def _fake_build_talker_request_data(payload, **kwargs):
+        del kwargs
+        return SimpleNamespace(req=fake_req, stage_payload=payload)
+
+    monkeypatch.setattr(
+        request_builders,
+        "_build_talker_request_data",
+        _fake_build_talker_request_data,
+    )
+    model = _FakeTalkerModel()
+    model.config = SimpleNamespace()
+
+    request_builder, *_ = request_builders.make_talker_scheduler_adapters(
+        tokenizer=object(),
+        codec_vocab_size=16,
+        model=model,
+        model_path=str(Path("/tmp")),
+        thinker_config=SimpleNamespace(),
+        required_aux_hidden_key=0,
+        codec_eos_id=7,
+    )
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(
+            inputs={},
+            params={"stream": True, "modalities": ["text", "audio"]},
+            metadata={"media_cache_namespace": "rtc:req-0"},
+        ),
+        data={},
+    )
+
+    request_builder(payload)
+
+    assert fake_req._omni_prioritize_prefill is True
+
+
+def test_qwen35_talker_adapter_uses_text_chunk_size_env(monkeypatch):
+    captured = {}
+
+    def _fake_build_talker_request_data(payload, **kwargs):
+        del payload, kwargs
+        req_data = SimpleNamespace(req=SimpleNamespace(), stage_payload=None)
+        captured["req_data"] = req_data
+        return req_data
+
+    monkeypatch.setattr(
+        request_builders,
+        "_build_talker_request_data",
+        _fake_build_talker_request_data,
+    )
+    monkeypatch.setenv("QWEN35_TALKER_TEXT_CHUNK_SIZE", "1")
+    monkeypatch.setenv("QWEN35_TALKER_TEXT_FEEDBACK_STRIDE", "1")
+    model = _FakeTalkerModel()
+    model.config = SimpleNamespace()
+
+    request_builder, *_ = request_builders.make_talker_scheduler_adapters(
+        tokenizer=object(),
+        codec_vocab_size=16,
+        model=model,
+        model_path=str(Path("/tmp")),
+        thinker_config=SimpleNamespace(),
+        required_aux_hidden_key=0,
+        codec_eos_id=7,
+    )
+
+    request_builder(
+        StagePayload(
+            request_id="req-0",
+            request=OmniRequest(
+                inputs={},
+                params={"stream": True, "modalities": ["text", "audio"]},
+            ),
+            data={},
+        )
+    )
+
+    req_data = captured["req_data"]
+    assert req_data.talker_text_chunk_size == 1
+    assert req_data.talker_text_feedback_stride == 1
+    assert req_data.talker_text_feedback_countdown == 1
 
 
 def test_qwen35_talker_sampling_uses_passed_codec_eos_id(monkeypatch):

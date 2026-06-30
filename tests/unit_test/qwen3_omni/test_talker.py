@@ -239,6 +239,89 @@ def test_qwen_talker_qwen35_decode_waits_when_countdown_exhausted() -> None:
     assert len(sched_req.data.pending_feedback_queue) == 1
 
 
+def test_qwen_talker_qwen35_decode_can_continue_empty_text_when_unbounded(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sglang_omni.models.qwen3_omni.talker_model_runner._QWEN35_ALLOW_UNBOUNDED_EMPTY_TEXT_FEEDBACK",
+        True,
+    )
+    sched_req = _sched_req(
+        pending_feedback_queue=deque([torch.tensor([1.0, 2.0])]),
+        pending_text_queue=deque(),
+        thinker_chunks_done=False,
+        tts_pad_embed=torch.tensor([7.0, 8.0]),
+        talker_decode_input_mode="qwen35_external",
+        talker_text_feedback_stride=4,
+        talker_text_feedback_countdown=0,
+    )
+
+    ready, reason = QwenTalkerModelRunner._decode_input_readiness(sched_req.data)
+    assert ready
+    assert reason == "ready_external_unbounded_empty_text_feedback"
+    assert torch.equal(_take_decode_input(sched_req), torch.tensor([1.0, 2.0]))
+    assert len(sched_req.data.pending_feedback_queue) == 0
+
+
+def test_qwen_talker_qwen35_decode_can_consume_partial_text_chunk_before_done(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sglang_omni.models.qwen3_omni.talker_model_runner._QWEN35_ALLOW_PARTIAL_TEXT_CHUNK_BEFORE_DONE",
+        True,
+    )
+    sched_req = _sched_req(
+        pending_feedback_queue=deque([torch.tensor([1.0, 2.0])]),
+        pending_text_queue=deque([torch.tensor([3.0, 4.0])]),
+        thinker_chunks_done=False,
+        tts_pad_embed=torch.tensor([7.0, 8.0]),
+        talker_decode_input_mode="qwen35_external",
+        talker_text_feedback_countdown=0,
+        talker_text_chunk_size=4,
+    )
+
+    ready, reason = QwenTalkerModelRunner._decode_input_readiness(sched_req.data)
+    assert ready
+    assert reason == "ready_external_partial_text_chunk"
+    boundary = _take_decode_input(sched_req)
+
+    assert torch.equal(boundary, torch.tensor([1.0, 2.0]))
+    assert sched_req.data.last_talker_decode_should_emit is False
+    assert sched_req.data.talker_text_chunk_remaining == 1
+
+
+def test_qwen_talker_qwen35_decode_can_consume_partial_text_chunk_after_wait(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "sglang_omni.models.qwen3_omni.talker_model_runner._QWEN35_ALLOW_PARTIAL_TEXT_CHUNK_BEFORE_DONE",
+        False,
+    )
+    monkeypatch.setattr(
+        "sglang_omni.models.qwen3_omni.talker_model_runner._QWEN35_PARTIAL_TEXT_CHUNK_WAIT_SKIPS",
+        2,
+    )
+    sched_req = _sched_req(
+        pending_feedback_queue=deque([torch.tensor([1.0, 2.0])]),
+        pending_text_queue=deque([torch.tensor([3.0, 4.0])]),
+        thinker_chunks_done=False,
+        tts_pad_embed=torch.tensor([7.0, 8.0]),
+        talker_decode_input_mode="qwen35_external",
+        talker_text_feedback_countdown=0,
+        talker_text_chunk_size=4,
+    )
+
+    assert QwenTalkerModelRunner._decode_input_readiness(sched_req.data) == (
+        False,
+        "wait_external_text_chunk",
+    )
+    assert QwenTalkerModelRunner._decode_input_readiness(sched_req.data) == (
+        False,
+        "wait_external_text_chunk",
+    )
+    ready, reason = QwenTalkerModelRunner._decode_input_readiness(sched_req.data)
+    assert ready
+    assert reason == "ready_external_partial_text_chunk_after_wait"
+    assert torch.equal(_take_decode_input(sched_req), torch.tensor([1.0, 2.0]))
+    assert sched_req.data.talker_partial_text_chunk_wait_skips == 0
+
+
 def test_qwen_talker_decode_readiness_reports_qwen35_wait_reason() -> None:
     sched_req = _sched_req(
         pending_feedback_queue=deque([torch.tensor([1.0, 2.0])]),

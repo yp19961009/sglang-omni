@@ -24,11 +24,11 @@ from typing import Any, Callable
 import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, RadixKey, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler as _Upstream
 from sglang.srt.managers.scheduler import validate_input_length
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.utils import broadcast_pyobj
+from sglang.srt.utils import DynamicGradMode, broadcast_pyobj
 
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
@@ -41,6 +41,7 @@ _AR_BUSY_YIELD_EVERY_DEFAULT = 1
 _AR_BUSY_YIELD_SECONDS_ENV = "SGLANG_OMNI_AR_BUSY_YIELD_SECONDS"
 _AR_BUSY_YIELD_SECONDS_DEFAULT = 0.0
 _PRIORITY_FIRST_STREAM_ENV = "SGLANG_OMNI_PRIORITY_FIRST_STREAM"
+_PRIORITY_TALKER_STREAM_ENV = "SGLANG_OMNI_PRIORITY_TALKER_STREAM"
 _PRIORITY_MARKER_ATTR = "_sg_omni_priority_stream"
 _ISOLATE_PREFILL_ONLY_BATCHES_ENV = "SGLANG_OMNI_ISOLATE_PREFILL_ONLY_BATCHES"
 _ISOLATED_PREFILL_MAX_BATCH_SIZE_ENV = (
@@ -55,10 +56,13 @@ _PRIORITY_PREFILL_BATCH_WAIT_MS_ENV = (
 _DEFER_PREFILL_DURING_PRIORITY_DECODE_ENV = (
     "SGLANG_OMNI_DEFER_PREFILL_DURING_PRIORITY_DECODE"
 )
+_DEBUG_MAMBA_RTC_ENV = "SGLANG_OMNI_DEBUG_MAMBA_RTC"
+_RTC_DISABLE_ACTUAL_MAMBA_TRACK_ENV = "QWEN35_RTC_DISABLE_ACTUAL_MAMBA_TRACK"
+_RTC_PROTECTED_PREFIX_DEPTH_ENV = "QWEN35_RTC_PROTECT_PRERUN_PREFIX_CACHE_DEPTH"
 
 
 class _PriorityFirstStreamQueue:
-    """Queue wrapper that lets each request's first stream bypass old chunks."""
+    """Queue wrapper that lets latency-sensitive streams bypass older messages."""
 
     def __init__(self):
         self._queue: _queue_mod.PriorityQueue[tuple[int, int, Any]] = (
@@ -66,8 +70,16 @@ class _PriorityFirstStreamQueue:
         )
         self._seq = 0
 
+    @staticmethod
+    def _priority(item: Any) -> int:
+        if _priority_talker_stream_enabled() and _is_talker_stream_message(item):
+            return 0
+        if bool(getattr(item, _PRIORITY_MARKER_ATTR, False)):
+            return 1
+        return 2
+
     def put(self, item: Any, block: bool = True, timeout: float | None = None) -> None:
-        priority = 0 if bool(getattr(item, _PRIORITY_MARKER_ATTR, False)) else 1
+        priority = self._priority(item)
         self._seq += 1
         self._queue.put((priority, self._seq, item), block=block, timeout=timeout)
 
@@ -127,6 +139,20 @@ def _priority_first_stream_enabled() -> bool:
     if raw is None or raw == "":
         return True
     return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _priority_talker_stream_enabled() -> bool:
+    raw = os.getenv(_PRIORITY_TALKER_STREAM_ENV)
+    if raw is None or raw == "":
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _is_talker_stream_message(item: Any) -> bool:
+    return (
+        getattr(item, "type", None) == "stream"
+        and getattr(item, "target", None) == "talker_ar"
+    )
 
 
 def _isolate_prefill_only_batches_enabled() -> bool:
@@ -501,6 +527,7 @@ class OmniScheduler:
             _defer_prefill_during_priority_decode_enabled()
         )
         self._priority_prefill_rids: set[str] = set()
+        self._omni_protected_prefix_nodes: dict[str, list[Any]] = {}
 
     def _init_upstream_compat_flags(self, server_args: Any) -> None:
         self.enable_hisparse = bool(getattr(server_args, "enable_hisparse", False))
@@ -717,6 +744,144 @@ class OmniScheduler:
             available_req_slots = int(self.req_to_token_pool.available_size())
             num_allocatable = min(num_allocatable, available_req_slots)
         return max(num_allocatable, 0)
+
+    @staticmethod
+    def _omni_rtc_cache_namespace(req: Any) -> str | None:
+        namespace = getattr(req, "_omni_rtc_cache_namespace", None)
+        return namespace if isinstance(namespace, str) and namespace else None
+
+    @staticmethod
+    def _omni_sequence_to_list(value: Any) -> list[int]:
+        if value is None:
+            return []
+        tolist = getattr(value, "tolist", None)
+        if callable(tolist):
+            value = tolist()
+        if isinstance(value, list):
+            return list(value)
+        if isinstance(value, tuple):
+            return list(value)
+        return list(value)
+
+    @staticmethod
+    def _omni_protected_prefix_depth() -> int:
+        raw = os.getenv(_RTC_PROTECTED_PREFIX_DEPTH_ENV)
+        if raw is None:
+            return 1
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            return 1
+
+    def _release_omni_protected_prefix_cache(self, namespace: str | None) -> None:
+        if not namespace:
+            return
+        protected_nodes = self.__dict__.setdefault(
+            "_omni_protected_prefix_nodes", {}
+        )
+        nodes = protected_nodes.pop(namespace, None)
+        if nodes is None:
+            return
+        if not isinstance(nodes, list):
+            nodes = [nodes]
+        tree_cache = getattr(self, "tree_cache", None)
+        if tree_cache is None or not hasattr(tree_cache, "dec_lock_ref"):
+            return
+        for node in nodes:
+            try:
+                tree_cache.dec_lock_ref(node)
+            except Exception:
+                logger.exception(
+                    "OmniScheduler: failed to release protected RTC prefix cache %s",
+                    namespace,
+                )
+
+    def _release_omni_protected_prefix_cache_for_req(self, req: Any) -> None:
+        if not bool(
+            getattr(req, "_omni_release_protected_prefix_cache_on_finish", False)
+        ):
+            return
+        namespace = self._omni_rtc_cache_namespace(req)
+        self._release_omni_protected_prefix_cache(namespace)
+        req._omni_release_protected_prefix_cache_on_finish = False
+
+    def _protect_omni_latest_prefix_cache(self, req: Any) -> None:
+        if not bool(getattr(req, "_omni_protect_latest_prefix_cache", False)):
+            return
+        namespace = self._omni_rtc_cache_namespace(req)
+        if namespace is None:
+            return
+
+        tree_cache = getattr(self, "tree_cache", None)
+        if (
+            tree_cache is None
+            or not hasattr(tree_cache, "match_prefix")
+            or not hasattr(tree_cache, "inc_lock_ref")
+        ):
+            return
+
+        token_ids = self._omni_sequence_to_list(getattr(req, "origin_input_ids", []))
+        token_ids.extend(self._omni_sequence_to_list(getattr(req, "output_ids", [])))
+        if not token_ids:
+            return
+
+        try:
+            match_result = tree_cache.match_prefix(
+                RadixKey(token_ids=token_ids, extra_key=getattr(req, "extra_key", None))
+            )
+        except Exception:
+            logger.exception(
+                "OmniScheduler: failed to match RTC prefix cache for %s",
+                namespace,
+            )
+            return
+
+        node = getattr(match_result, "last_device_node", None)
+        root_node = getattr(tree_cache, "root_node", None)
+        prefix_indices = getattr(match_result, "device_indices", None)
+        try:
+            prefix_len = len(prefix_indices) if prefix_indices is not None else 0
+        except TypeError:
+            prefix_len = 0
+        if node is None or node is root_node or prefix_len <= 0:
+            return
+
+        protected_nodes = self.__dict__.setdefault(
+            "_omni_protected_prefix_nodes", {}
+        )
+        nodes = protected_nodes.get(namespace, [])
+        if not isinstance(nodes, list):
+            nodes = [nodes]
+        already_protected = any(existing is node for existing in nodes)
+        if already_protected:
+            nodes = [existing for existing in nodes if existing is not node]
+        else:
+            try:
+                tree_cache.inc_lock_ref(node)
+            except Exception:
+                logger.exception(
+                    "OmniScheduler: failed to protect RTC prefix cache for %s",
+                    namespace,
+                )
+                return
+        nodes.append(node)
+        depth = self._omni_protected_prefix_depth()
+        while len(nodes) > depth:
+            old_node = nodes.pop(0)
+            try:
+                tree_cache.dec_lock_ref(old_node)
+            except Exception:
+                logger.exception(
+                    "OmniScheduler: failed to trim protected RTC prefix cache %s",
+                    namespace,
+                )
+        protected_nodes[namespace] = nodes
+        logger.debug(
+            "OmniScheduler: protected RTC prefix cache namespace=%s prefix_len=%d depth=%d",
+            namespace,
+            prefix_len,
+            len(nodes),
+        )
 
     def get_new_batch_prefill(self):
         """Keep RTC actual prefill ahead of background pre-run cache writes."""
@@ -1011,7 +1176,16 @@ class OmniScheduler:
         if self._is_prefill_only_no_token_result(batch, result):
             self._process_prefill_only_no_token_result(batch, result)
             return
+        reqs = list(getattr(batch, "reqs", []) or [])
         _Upstream.process_batch_result(self, batch, result)
+        for req in reqs:
+            finished = False
+            try:
+                finished = bool(req.finished())
+            except Exception:
+                finished = False
+            if finished or bool(getattr(req, "is_retracted", False)):
+                self._release_omni_protected_prefix_cache_for_req(req)
 
     @staticmethod
     def _is_prefill_only_no_token_result(batch, result) -> bool:
@@ -1042,6 +1216,7 @@ class OmniScheduler:
                 if req.finished():
                     self.maybe_collect_routed_experts(req)
                     release_kv_cache(req, self.tree_cache)
+                    self._protect_omni_latest_prefix_cache(req)
                     if time_stats is not None:
                         time_stats.completion_time = time.perf_counter()
                 elif (
@@ -1059,6 +1234,7 @@ class OmniScheduler:
             skip_req=skip_stream_req,
         )
 
+    @DynamicGradMode()
     def run_batch(self, batch, pp_proxy_tensors=None):
         try:
             return self._run_batch(batch, pp_proxy_tensors)
@@ -1076,6 +1252,8 @@ class OmniScheduler:
         a ``GenerationBatchResult``.  We bridge the two formats here.
         """
         self._emit_prefill_start_for_batch(batch)
+        self._disable_omni_rtc_actual_mamba_track(batch)
+        self._debug_omni_mamba_rtc_batch(batch)
         if self._model_runner is not None:
             sched_output = self._build_sched_output(batch)
             mr_output = self._model_runner.execute(sched_output)
@@ -1083,6 +1261,111 @@ class OmniScheduler:
             return self._make_batch_result(batch, mr_output)
         # Fallback: call upstream's run_batch (uses tp_worker directly)
         return _Upstream.run_batch(self, batch, pp_proxy_tensors)
+
+    @staticmethod
+    def _rtc_disable_actual_mamba_track_enabled() -> bool:
+        raw = os.getenv(_RTC_DISABLE_ACTUAL_MAMBA_TRACK_ENV, "").lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _is_omni_rtc_actual_req(req: Any) -> bool:
+        if "rtc:" not in str(getattr(req, "extra_key", "")):
+            return False
+        sampling_params = getattr(req, "sampling_params", None)
+        max_new_tokens = getattr(sampling_params, "max_new_tokens", None)
+        try:
+            return max_new_tokens is not None and int(max_new_tokens) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def _disable_omni_rtc_actual_mamba_track(self, batch: Any) -> None:
+        if not self._rtc_disable_actual_mamba_track_enabled():
+            return
+        track_mask = getattr(batch, "mamba_track_mask", None)
+        if track_mask is None:
+            return
+        reqs = list(getattr(batch, "reqs", []) or [])
+        disabled_indices = [
+            idx for idx, req in enumerate(reqs) if self._is_omni_rtc_actual_req(req)
+        ]
+        if not disabled_indices:
+            return
+        for idx in disabled_indices:
+            track_mask[idx] = False
+        track_seqlens = getattr(batch, "mamba_track_seqlens", None)
+        if track_seqlens is not None:
+            for idx in disabled_indices:
+                track_seqlens[idx] = -1
+        if os.getenv(_DEBUG_MAMBA_RTC_ENV, "").lower() in {"1", "true", "yes", "on"}:
+            logger.info(
+                "omni_mamba_rtc_disable_actual_track indices=%s forward_mode=%s",
+                disabled_indices,
+                getattr(batch, "forward_mode", None),
+            )
+
+    def _debug_omni_mamba_rtc_batch(self, batch: Any) -> None:
+        raw = os.getenv(_DEBUG_MAMBA_RTC_ENV, "").lower()
+        if raw not in {"1", "true", "yes", "on"}:
+            return
+        reqs = list(getattr(batch, "reqs", []) or [])
+        rows = []
+        for idx, req in enumerate(reqs):
+            extra_key = getattr(req, "extra_key", None)
+            if "rtc:" not in str(extra_key):
+                continue
+            prefix_indices = getattr(req, "prefix_indices", None)
+            prefix_len = len(prefix_indices) if prefix_indices is not None else 0
+            rows.append(
+                {
+                    "idx": idx,
+                    "rid": getattr(req, "rid", None),
+                    "max_new_tokens": getattr(
+                        getattr(req, "sampling_params", None), "max_new_tokens", None
+                    ),
+                    "prefix_len": prefix_len,
+                    "extend_input_len": getattr(req, "extend_input_len", None),
+                    "origin_input_len": len(getattr(req, "origin_input_ids", []) or []),
+                    "mamba_branching_seqlen": getattr(
+                        req, "mamba_branching_seqlen", None
+                    ),
+                    "omni_mamba_branching_seqlen": getattr(
+                        req, "_omni_mamba_branching_seqlen", None
+                    ),
+                    "mamba_last_track_seqlen": getattr(
+                        req, "mamba_last_track_seqlen", None
+                    ),
+                    "mamba_pool_idx": str(getattr(req, "mamba_pool_idx", None)),
+                    "extra_key": extra_key,
+                }
+            )
+        if not rows:
+            return
+        logger.info(
+            "omni_mamba_rtc_batch forward_mode=%s is_prefill_only=%s "
+            "is_extend_in_batch=%s extend_prefix_lens=%s extend_seq_lens=%s "
+            "mamba_track_mask=%s mamba_track_seqlens=%s mamba_track_indices=%s rows=%s",
+            getattr(batch, "forward_mode", None),
+            bool(getattr(batch, "is_prefill_only", False)),
+            bool(getattr(batch, "is_extend_in_batch", False)),
+            getattr(batch, "extend_prefix_lens_cpu", None),
+            getattr(batch, "extend_seq_lens_cpu", None),
+            (
+                getattr(batch, "mamba_track_mask", None).detach().cpu().tolist()
+                if getattr(batch, "mamba_track_mask", None) is not None
+                else None
+            ),
+            (
+                getattr(batch, "mamba_track_seqlens", None).detach().cpu().tolist()
+                if getattr(batch, "mamba_track_seqlens", None) is not None
+                else None
+            ),
+            (
+                getattr(batch, "mamba_track_indices", None).detach().cpu().tolist()
+                if getattr(batch, "mamba_track_indices", None) is not None
+                else None
+            ),
+            rows,
+        )
 
     def _build_sched_output(self, batch):
         """Wrap a ScheduleBatch into the SchedulerOutput the model runner
@@ -1330,6 +1613,9 @@ class OmniScheduler:
         self.__dict__.setdefault("_first_emit_done", set()).discard(request_id)
         self.__dict__.setdefault("_prefill_start_done", set()).discard(request_id)
         self._forget_priority_prefill_rid(request_id)
+        queued_reqs = [req for req in self.waiting_queue if req.rid == request_id]
+        for req in queued_reqs:
+            self._release_omni_protected_prefix_cache_for_req(req)
         self.waiting_queue = [
             req for req in self.waiting_queue if req.rid != request_id
         ]
@@ -1375,6 +1661,7 @@ class OmniScheduler:
                     continue
                 seen.add(id(req))
                 self._release_request_kv_cache(req)
+                self._release_omni_protected_prefix_cache_for_req(req)
 
     def _release_request_kv_cache(self, req: Any) -> None:
         if req.req_pool_idx is None and req.mamba_pool_idx is None:

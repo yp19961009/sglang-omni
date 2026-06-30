@@ -22,7 +22,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.models.qwen3_next import Qwen3NextForCausalLM
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo, TOP_K_ALL
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import DynamicGradMode, add_prefix
 
 from sglang_omni.models.qwen3_5_omni.components.subtalker import (
     Qwen35ResidualCodePredictor,
@@ -586,7 +586,7 @@ class Qwen3OmniNextTalkerForConditionalGeneration(nn.Module):
         )
         device = self.activation_dtype_device
         dtype = self.activation_dtype
-        with torch.inference_mode():
+        with DynamicGradMode():
             for size in sizes:
                 layer0_codes = torch.zeros(size, dtype=torch.long, device=device)
                 talker_hidden = torch.zeros(

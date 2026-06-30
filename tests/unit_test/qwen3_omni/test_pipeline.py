@@ -1126,7 +1126,7 @@ def test_qwen_visual_item_cache_miss_chunks_by_cost(monkeypatch) -> None:
     item_cost = qwen_stages._visual_item_cost(items[0], model=model)
     monkeypatch.setattr(
         qwen_stages,
-        "QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES",
+        "QWEN3_IMAGE_ENCODER_ITEM_BATCH_BUDGET_BYTES",
         item_cost * 2,
     )
     state = make_qwen_state()

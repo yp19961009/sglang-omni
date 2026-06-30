@@ -105,18 +105,19 @@ def test_qwen35_code2wav_compile_warmup_matches_first_chunk_shape(monkeypatch):
     assert model.calls[0].dtype == torch.long
 
 
-def test_qwen35_code2wav_compile_warmup_defaults_off(monkeypatch):
+def test_qwen35_code2wav_compile_warmup_defaults_on(monkeypatch):
     monkeypatch.delenv("SGLANG_OMNI_QWEN35_CODE2WAV_COMPILE_WARMUP", raising=False)
     model = _WarmupModel()
 
-    assert not _warmup_code2wav_decode(
+    assert _warmup_code2wav_decode(
         model,
         device="cpu",
         stream_chunk_size=4,
         left_context_size=25,
     )
 
-    assert model.calls == []
+    assert len(model.calls) == 1
+    assert tuple(model.calls[0].shape) == (1, 32, 16)
 
 
 def test_qwen35_code2wav_compile_warmup_can_be_disabled(monkeypatch):

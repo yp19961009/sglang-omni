@@ -26,6 +26,84 @@ def _make_scheduler(*, waiting_queue, running_batch):
     return scheduler
 
 
+
+
+def test_priority_first_stream_queue_prioritizes_talker_streams_by_default(monkeypatch):
+    monkeypatch.delenv("SGLANG_OMNI_PRIORITY_TALKER_STREAM", raising=False)
+    outbox = omni_scheduler._PriorityFirstStreamQueue()
+    result = omni_scheduler.OutgoingMessage(
+        request_id="done",
+        type="result",
+        data="result",
+    )
+    decode_stream = omni_scheduler.OutgoingMessage(
+        request_id="text",
+        type="stream",
+        data="decode",
+        target="decode",
+    )
+    talker_stream = omni_scheduler.OutgoingMessage(
+        request_id="audio",
+        type="stream",
+        data="talker",
+        target="talker_ar",
+    )
+
+    outbox.put(result)
+    outbox.put(decode_stream)
+    outbox.put(talker_stream)
+
+    assert outbox.get_nowait() is talker_stream
+    assert outbox.get_nowait() is result
+    assert outbox.get_nowait() is decode_stream
+
+
+def test_priority_first_stream_queue_talker_priority_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_PRIORITY_TALKER_STREAM", "0")
+    outbox = omni_scheduler._PriorityFirstStreamQueue()
+    result = omni_scheduler.OutgoingMessage(
+        request_id="done",
+        type="result",
+        data="result",
+    )
+    talker_stream = omni_scheduler.OutgoingMessage(
+        request_id="audio",
+        type="stream",
+        data="talker",
+        target="talker_ar",
+    )
+
+    outbox.put(result)
+    outbox.put(talker_stream)
+
+    assert outbox.get_nowait() is result
+    assert outbox.get_nowait() is talker_stream
+
+
+def test_priority_first_stream_queue_talker_stream_preempts_first_stream(monkeypatch):
+    monkeypatch.delenv("SGLANG_OMNI_PRIORITY_TALKER_STREAM", raising=False)
+    outbox = omni_scheduler._PriorityFirstStreamQueue()
+    first_text_stream = omni_scheduler.OutgoingMessage(
+        request_id="fresh",
+        type="stream",
+        data="first",
+        target="decode",
+    )
+    setattr(first_text_stream, omni_scheduler._PRIORITY_MARKER_ATTR, True)
+    talker_stream = omni_scheduler.OutgoingMessage(
+        request_id="audio",
+        type="stream",
+        data="talker",
+        target="talker_ar",
+    )
+
+    outbox.put(first_text_stream)
+    outbox.put(talker_stream)
+
+    assert outbox.get_nowait() is talker_stream
+    assert outbox.get_nowait() is first_text_stream
+
+
 def test_get_new_batch_prefill_defers_while_priority_decode_runs(monkeypatch):
     hidden_req = SimpleNamespace()
     scheduler = _make_scheduler(
@@ -381,4 +459,141 @@ def test_process_batch_result_prefill_only_without_token_finishes_empty(monkeypa
     assert seen["routed"] == [req]
     assert seen["released"] == [(req, scheduler.tree_cache)]
     assert seen["streamed"] == ([req], False, None)
+
+
+
+
+def test_omni_scheduler_protects_latest_rtc_prefix_cache():
+    scheduler = object.__new__(omni_scheduler.OmniScheduler)
+
+    class FakeTreeCache:
+        def __init__(self):
+            self.root_node = object()
+            self.matched_node = object()
+            self.locked = []
+            self.unlocked = []
+            self.seen_key = None
+
+        def match_prefix(self, key):
+            self.seen_key = key
+            return SimpleNamespace(
+                device_indices=[11, 12, 13],
+                last_device_node=self.matched_node,
+            )
+
+        def inc_lock_ref(self, node):
+            self.locked.append(node)
+
+        def dec_lock_ref(self, node):
+            self.unlocked.append(node)
+
+    tree_cache = FakeTreeCache()
+    old_node = object()
+    scheduler.tree_cache = tree_cache
+    scheduler._omni_protected_prefix_nodes = {"rtc:req-0": old_node}
+    req = SimpleNamespace(
+        _omni_protect_latest_prefix_cache=True,
+        _omni_rtc_cache_namespace="rtc:req-0",
+        origin_input_ids=[1, 2],
+        output_ids=[3, 4],
+        extra_key="media-cache:audio=rtc:req-0:audio",
+    )
+
+    omni_scheduler.OmniScheduler._protect_omni_latest_prefix_cache(scheduler, req)
+
+    assert tree_cache.unlocked == [old_node]
+    assert tree_cache.locked == [tree_cache.matched_node]
+    assert scheduler._omni_protected_prefix_nodes == {
+        "rtc:req-0": [tree_cache.matched_node]
+    }
+    assert list(tree_cache.seen_key.token_ids) == [1, 2, 3, 4]
+    assert tree_cache.seen_key.extra_key == "media-cache:audio=rtc:req-0:audio"
+
+
+def test_omni_scheduler_keeps_recent_rtc_prefix_cache_depth(monkeypatch):
+    scheduler = object.__new__(omni_scheduler.OmniScheduler)
+    monkeypatch.setenv("QWEN35_RTC_PROTECT_PRERUN_PREFIX_CACHE_DEPTH", "2")
+
+    class FakeTreeCache:
+        def __init__(self):
+            self.root_node = object()
+            self.nodes = [object(), object(), object()]
+            self.locked = []
+            self.unlocked = []
+            self.index = 0
+
+        def match_prefix(self, key):
+            del key
+            node = self.nodes[self.index]
+            self.index += 1
+            return SimpleNamespace(device_indices=[1], last_device_node=node)
+
+        def inc_lock_ref(self, node):
+            self.locked.append(node)
+
+        def dec_lock_ref(self, node):
+            self.unlocked.append(node)
+
+    tree_cache = FakeTreeCache()
+    scheduler.tree_cache = tree_cache
+    scheduler._omni_protected_prefix_nodes = {}
+    req = SimpleNamespace(
+        _omni_protect_latest_prefix_cache=True,
+        _omni_rtc_cache_namespace="rtc:req-0",
+        origin_input_ids=[1],
+        output_ids=[],
+        extra_key="media-cache:audio=rtc:req-0:audio",
+    )
+
+    for _ in range(3):
+        omni_scheduler.OmniScheduler._protect_omni_latest_prefix_cache(scheduler, req)
+
+    assert tree_cache.locked == tree_cache.nodes
+    assert tree_cache.unlocked == [tree_cache.nodes[0]]
+    assert scheduler._omni_protected_prefix_nodes == {
+        "rtc:req-0": tree_cache.nodes[1:]
+    }
+
+
+def test_omni_scheduler_releases_protected_rtc_prefix_when_actual_finishes(
+    monkeypatch,
+):
+    scheduler = object.__new__(omni_scheduler.OmniScheduler)
+    protected_node = object()
+    protected_node_2 = object()
+    released = []
+    scheduler.tree_cache = SimpleNamespace(
+        dec_lock_ref=lambda node: released.append(node)
+    )
+    scheduler._omni_protected_prefix_nodes = {
+        "rtc:req-0": [protected_node, protected_node_2]
+    }
+
+    req = SimpleNamespace(
+        _omni_rtc_cache_namespace="rtc:req-0",
+        _omni_release_protected_prefix_cache_on_finish=True,
+        is_retracted=False,
+        finished_reason=None,
+    )
+    req.finished = lambda: req.finished_reason is not None
+
+    def fake_upstream_process_batch_result(self, batch, result):
+        del self, batch, result
+        req.finished_reason = object()
+
+    monkeypatch.setattr(
+        omni_scheduler._Upstream,
+        "process_batch_result",
+        fake_upstream_process_batch_result,
+    )
+
+    scheduler.process_batch_result(
+        SimpleNamespace(reqs=[req], is_prefill_only=False),
+        SimpleNamespace(next_token_ids=[1]),
+    )
+
+    assert released == [protected_node, protected_node_2]
+    assert scheduler._omni_protected_prefix_nodes == {}
+    assert req._omni_release_protected_prefix_cache_on_finish is False
+
 

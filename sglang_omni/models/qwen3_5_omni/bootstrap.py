@@ -332,7 +332,8 @@ def create_thinker_scheduler(
         thinker_config=thinker_config,
     )
     stream_output_builder = make_thinker_stream_output_builder(
-        required_aux_hidden_key=required_aux_hidden_key
+        required_aux_hidden_key=required_aux_hidden_key,
+        vocab_size=model_config.vocab_size,
     )
 
     return OmniScheduler(

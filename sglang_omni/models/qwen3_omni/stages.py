@@ -52,6 +52,9 @@ _STORE_ITEM_PLAN_COMBINED_CACHE_ENV = (
 _IMAGE_ENCODER_BATCH_BUDGET_BYTES_ENV = (
     "SGLANG_OMNI_IMAGE_ENCODER_BATCH_BUDGET_BYTES"
 )
+_IMAGE_ENCODER_ITEM_BATCH_BUDGET_BYTES_ENV = (
+    "SGLANG_OMNI_IMAGE_ENCODER_ITEM_BATCH_BUDGET_BYTES"
+)
 _VISUAL_ITEM_BATCH_STATS_ENV = "SGLANG_OMNI_VISUAL_ITEM_BATCH_STATS"
 _COMPACT_VISUAL_ENCODER_RESULTS_ENV = "SGLANG_OMNI_COMPACT_VISUAL_ENCODER_RESULTS"
 _COMPACT_AUDIO_ENCODER_RESULTS_ENV = "SGLANG_OMNI_COMPACT_AUDIO_ENCODER_RESULTS"
@@ -82,6 +85,10 @@ QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES = _env_int(
     10 * 1024**3,
 )
 QWEN3_IMAGE_ENCODER_ACTIVATION_MULTIPLIER = 5
+QWEN3_IMAGE_ENCODER_ITEM_BATCH_BUDGET_BYTES = _env_int(
+    _IMAGE_ENCODER_ITEM_BATCH_BUDGET_BYTES_ENV,
+    QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES,
+)
 
 
 # CPU LRU cap for repeated-media encoder outputs.
@@ -839,7 +846,7 @@ def _chunk_visual_items_by_cost(
 ) -> list[list[dict[str, Any]]]:
     if not items:
         return []
-    budget = int(QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES)
+    budget = int(QWEN3_IMAGE_ENCODER_ITEM_BATCH_BUDGET_BYTES)
     if budget <= 0:
         return [items]
 
@@ -1010,7 +1017,7 @@ def _execute_visual_item_cache_plans(
                 for chunk in chunks
             ]
             logger.info(
-                "visual_item_batch_stats raw_missing_items=%d unique_items=%d duplicate_items=%d chunks=%d chunk_sizes=%s chunk_costs=%s budget=%d",
+                "visual_item_batch_stats raw_missing_items=%d unique_items=%d duplicate_items=%d chunks=%d chunk_sizes=%s chunk_costs=%s request_budget=%d item_budget=%d",
                 raw_missing_count,
                 len(missing_items),
                 duplicate_count,
@@ -1018,6 +1025,7 @@ def _execute_visual_item_cache_plans(
                 [len(chunk) for chunk in chunks],
                 costs,
                 QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES,
+                QWEN3_IMAGE_ENCODER_ITEM_BATCH_BUDGET_BYTES,
             )
         for chunk in chunks:
             _encode_visual_item_batch(chunk, model=model, cache=cache)

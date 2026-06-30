@@ -165,9 +165,13 @@ def test_qwen35_talker_warms_subtalker_code_predictor(monkeypatch):
     monkeypatch.setattr(talker, "_max_running_requests", lambda: 8)
     model = talker.Qwen3OmniNextTalkerModel(_config())
     calls = []
+    contexts = []
 
     def _fake_code_predictor_forward(layer0_codes, talker_hidden, requests=None):
         calls.append((tuple(layer0_codes.shape), tuple(talker_hidden.shape), requests))
+        contexts.append(
+            (torch.is_grad_enabled(), torch.is_inference_mode_enabled())
+        )
         return None
 
     monkeypatch.setattr(
@@ -258,6 +262,7 @@ def test_qwen35_talker_warms_subtalker_code_predictor(monkeypatch):
         5,
     ]
 
+    assert contexts == [(False, False)] * len(calls)
 
 def test_qwen35_talker_accepts_split_config_with_none_subconfig(monkeypatch):
     _install_fakes(monkeypatch)

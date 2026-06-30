@@ -46,6 +46,7 @@ _DECODE_STREAM_IMMEDIATE_TOKEN_COUNT_ENV = (
 _DECODE_STREAM_BATCH_STATE_MAX = 10000
 _DEBUG_THINKER_INPUTS_ENV = "SGLANG_OMNI_DEBUG_THINKER_INPUTS"
 _DEBUG_THINKER_INPUTS_ALL_ENV = "SGLANG_OMNI_DEBUG_THINKER_INPUTS_ALL"
+_DEBUG_MAMBA_RTC_ENV = "SGLANG_OMNI_DEBUG_MAMBA_RTC"
 
 # Note(Chenchen Hong): PyTorch sampling_seed must fit a positive int32.
 MAX_INT32_POSITIVE = 0x7FFFFFFF
@@ -203,13 +204,29 @@ class _DecodeStreamTokenBatcher:
         while len(items) > _DECODE_STREAM_BATCH_STATE_MAX:
             items.popitem(last=False)
 
-    def build(self, request_id: str, token_id: int) -> OutgoingMessage | None:
-        batch_size = _decode_stream_token_batch_size()
+    def build(
+        self,
+        request_id: str,
+        token_id: int,
+        *,
+        batch_size: int | None = None,
+        immediate_token_count: int | None = None,
+    ) -> OutgoingMessage | None:
+        batch_size = (
+            _decode_stream_token_batch_size()
+            if batch_size is None
+            else max(1, int(batch_size))
+        )
         if batch_size <= 1:
             return _make_decode_stream_message(request_id, [token_id])
 
         sent_count = self._sent_counts.get(request_id, 0)
-        if sent_count < _decode_stream_immediate_token_count():
+        immediate_token_count = (
+            _decode_stream_immediate_token_count()
+            if immediate_token_count is None
+            else max(1, int(immediate_token_count))
+        )
+        if sent_count < immediate_token_count:
             self._sent_counts[request_id] = sent_count + 1
             self._sent_counts.move_to_end(request_id)
             self._evict_oldest(self._sent_counts)
@@ -360,18 +377,65 @@ def _install_mamba_branching_hint_patch(Req: Any) -> None:
     original = Req.init_next_round_input
 
     def _init_next_round_input_with_omni_mamba_hint(self, tree_cache=None):
-        result = original(self, tree_cache)
+        debug_mamba_rtc = os.getenv(_DEBUG_MAMBA_RTC_ENV, "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         hint = getattr(self, "_omni_mamba_branching_seqlen", None)
-        if hint is None or getattr(self, "mamba_branching_seqlen", None) is not None:
-            return result
         try:
-            hint = int(hint)
+            hint = int(hint) if hint is not None else None
         except (TypeError, ValueError):
-            return result
+            hint = None
+
+        cache_limit = getattr(self, "_omni_mamba_prefix_cache_limit", None)
+        if cache_limit is None:
+            cache_limit = getattr(self, "_omni_max_prefix_cache_len", None)
+        try:
+            cache_limit = int(cache_limit) if cache_limit is not None else None
+        except (TypeError, ValueError):
+            cache_limit = None
+
+        if cache_limit is not None and tree_cache is not None:
+            old_return_logprob = self.return_logprob
+            old_logprob_start_len = self.logprob_start_len
+            try:
+                self.return_logprob = True
+                if old_return_logprob and old_logprob_start_len >= 0:
+                    self.logprob_start_len = min(
+                        int(old_logprob_start_len), int(cache_limit)
+                    )
+                else:
+                    self.logprob_start_len = int(cache_limit)
+                result = original(self, tree_cache)
+            finally:
+                self.return_logprob = old_return_logprob
+                self.logprob_start_len = old_logprob_start_len
+        else:
+            result = original(self, tree_cache)
+
+        current_before = getattr(self, "mamba_branching_seqlen", None)
         prefix_indices = getattr(self, "prefix_indices", None)
         prefix_len = len(prefix_indices) if prefix_indices is not None else 0
-        if hint > prefix_len:
+        if hint is not None and current_before is None and hint > prefix_len:
             self.mamba_branching_seqlen = hint
+        if debug_mamba_rtc and "rtc:" in str(getattr(self, "extra_key", "")):
+            logger.info(
+                "qwen3_omni_mamba_hint rid=%s max_new_tokens=%s prefix_len=%s "
+                "extend_input_len=%s origin_input_len=%s hint=%s "
+                "branch_before=%s branch_after=%s cache_limit=%s extra_key=%s",
+                getattr(self, "rid", None),
+                getattr(getattr(self, "sampling_params", None), "max_new_tokens", None),
+                prefix_len,
+                getattr(self, "extend_input_len", None),
+                len(getattr(self, "origin_input_ids", []) or []),
+                hint,
+                current_before,
+                getattr(self, "mamba_branching_seqlen", None),
+                cache_limit,
+                getattr(self, "extra_key", None),
+            )
         return result
 
     Req._omni_original_init_next_round_input_for_mamba_hint = original

@@ -102,6 +102,7 @@ _VOICE_TO_SPK_MAPPING = {
 _VOICE_CONTROL_SUFFIXES = ("prefix_caching",)
 _QWEN35_TALKER_NUM_OUTPUT_IN_CHUNK = 4
 _QWEN35_TALKER_TEXT_FEEDBACK_STRIDE = _QWEN35_TALKER_NUM_OUTPUT_IN_CHUNK
+_QWEN35_RTC_DECODE_STREAM_TOKEN_BATCH_SIZE = 8
 _QWEN35_RTC_TEXT_FILLER_PER_CHUNK = 20
 _QWEN35_RTC_AUDIO_ROWS_PER_CHUNK = 14
 _VOICE_PARAM_KEYS = ("speaker", "voice", "voice_type")
@@ -134,6 +135,36 @@ def _qwen35_talker_text_feedback_stride() -> int:
             raw,
         )
         return _QWEN35_TALKER_TEXT_FEEDBACK_STRIDE
+
+
+def _qwen35_talker_text_chunk_size() -> int:
+    raw = os.environ.get("QWEN35_TALKER_TEXT_CHUNK_SIZE")
+    if raw is None:
+        return _QWEN35_TALKER_NUM_OUTPUT_IN_CHUNK
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid QWEN35_TALKER_TEXT_CHUNK_SIZE=%r",
+            raw,
+        )
+        return _QWEN35_TALKER_NUM_OUTPUT_IN_CHUNK
+
+
+def _qwen35_rtc_decode_stream_token_batch_size() -> int:
+    raw = os.environ.get("QWEN35_RTC_DECODE_STREAM_TOKEN_BATCH_SIZE")
+    if raw is None:
+        raw = os.environ.get("SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE")
+    if raw is None:
+        return _QWEN35_RTC_DECODE_STREAM_TOKEN_BATCH_SIZE
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid Qwen3.5 RTC decode stream batch size=%r",
+            raw,
+        )
+        return _QWEN35_RTC_DECODE_STREAM_TOKEN_BATCH_SIZE
 
 
 _VOICE_STYLE_TRAILING_PREFIX = re.compile(r"^(?:[>\s]|\\[nrt])*")
@@ -1523,6 +1554,187 @@ def _validate_qwen35_multimodal_feature_lengths(
     _validate_qwen35_multimodal_metadata_lengths(model_inputs)
 
 
+def _int_list_from_1d(value: Any) -> list[int] | None:
+    if isinstance(value, torch.Tensor):
+        return [int(item) for item in value.to(dtype=torch.long).reshape(-1).tolist()]
+    if isinstance(value, (list, tuple)):
+        try:
+            return [int(item) for item in value]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _prefix_item_count_for_token_rows(
+    token_counts: list[int] | None,
+    *,
+    expected_rows: int,
+    actual_rows: int,
+) -> int | None:
+    if token_counts is None or sum(token_counts) != actual_rows:
+        return None
+    if expected_rows == 0:
+        return 0
+
+    total = 0
+    for idx, count in enumerate(token_counts):
+        total += int(count)
+        if total == expected_rows:
+            return idx + 1
+        if total > expected_rows:
+            return None
+    return None
+
+
+def _visual_token_counts_from_grid(
+    model_inputs: dict[str, Any],
+    *,
+    token_counts_key: str,
+    grid_key: str,
+    thinker_config: Any,
+) -> list[int] | None:
+    counts = _int_list_from_1d(model_inputs.get(token_counts_key))
+    grid = model_inputs.get(grid_key)
+    if counts is not None:
+        return counts
+    if not isinstance(grid, torch.Tensor):
+        return None
+    vision_config = getattr(thinker_config, "vision_config", SimpleNamespace())
+    merge = int(getattr(vision_config, "spatial_merge_size", 1)) ** 2
+    if merge <= 0:
+        return None
+    grid = grid.to(dtype=torch.long).reshape(-1, 3)
+    return [int(item) for item in (grid.prod(dim=-1) // merge).tolist()]
+
+
+def _trim_feature_rows(value: Any, rows: int) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value[:rows]
+    if isinstance(value, list):
+        remaining = rows
+        trimmed = []
+        for item in value:
+            item_rows = _count_feature_rows(item)
+            if item_rows is None:
+                trimmed.append(item)
+                continue
+            if remaining <= 0:
+                trimmed.append(_trim_feature_rows(item, 0))
+            elif remaining >= item_rows:
+                trimmed.append(item)
+                remaining -= item_rows
+            else:
+                trimmed.append(_trim_feature_rows(item, remaining))
+                remaining = 0
+        return trimmed
+    if isinstance(value, tuple):
+        return tuple(_trim_feature_rows(list(value), rows))
+    return value
+
+
+def _trim_token_aligned_value(value: Any, rows: int) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value[:rows]
+    if isinstance(value, list):
+        return [_trim_token_aligned_value(item, rows) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_trim_token_aligned_value(item, rows) for item in value)
+    return value
+
+
+def _trim_item_aligned_value(value: Any, item_count: int) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value[:item_count]
+    if isinstance(value, list):
+        return value[:item_count]
+    if isinstance(value, tuple):
+        return value[:item_count]
+    return value
+
+
+def _trim_qwen35_visual_features_to_prompt_tokens(
+    input_ids: torch.Tensor,
+    model_inputs: dict[str, Any],
+    thinker_config: Any,
+) -> None:
+    input_ids = input_ids.to(dtype=torch.long).reshape(-1)
+    for spec in (
+        {
+            "modality": "image",
+            "feature_key": "image_embeds",
+            "token_attr": "image_token_id",
+            "token_counts_key": "image_token_counts",
+            "grid_key": "image_grid_thw",
+            "deepstack_keys": (
+                "image_deepstack_visual_embeds",
+                "deepstack_visual_embeds_image",
+            ),
+            "item_keys": (),
+        },
+        {
+            "modality": "video",
+            "feature_key": "video_embeds",
+            "token_attr": "video_token_id",
+            "token_counts_key": "video_token_counts",
+            "grid_key": "video_grid_thw",
+            "deepstack_keys": (
+                "video_deepstack_visual_embeds",
+                "deepstack_visual_embeds_video",
+            ),
+            "item_keys": ("use_audio_in_video",),
+        },
+    ):
+        feature_key = str(spec["feature_key"])
+        feature_value = model_inputs.get(feature_key)
+        actual_rows = _count_feature_rows(feature_value)
+        if actual_rows is None:
+            continue
+        token_id = getattr(thinker_config, str(spec["token_attr"]), None)
+        if token_id is None:
+            continue
+        expected_rows = int((input_ids == int(token_id)).sum().item())
+        if actual_rows <= expected_rows:
+            continue
+        token_counts = _visual_token_counts_from_grid(
+            model_inputs,
+            token_counts_key=str(spec["token_counts_key"]),
+            grid_key=str(spec["grid_key"]),
+            thinker_config=thinker_config,
+        )
+        keep_items = _prefix_item_count_for_token_rows(
+            token_counts,
+            expected_rows=expected_rows,
+            actual_rows=actual_rows,
+        )
+        if keep_items is None:
+            continue
+
+        model_inputs[feature_key] = _trim_feature_rows(feature_value, expected_rows)
+        for key in (str(spec["token_counts_key"]), str(spec["grid_key"])):
+            if key in model_inputs:
+                model_inputs[key] = _trim_item_aligned_value(
+                    model_inputs[key], keep_items
+                )
+        for key in spec["deepstack_keys"]:
+            if key in model_inputs:
+                model_inputs[key] = _trim_token_aligned_value(
+                    model_inputs[key], expected_rows
+                )
+        for key in spec["item_keys"]:
+            if key in model_inputs:
+                model_inputs[key] = _trim_item_aligned_value(
+                    model_inputs[key], keep_items
+                )
+        logger.warning(
+            "Trimmed trailing Qwen3.5 %s encoder items to match prompt tokens: "
+            "features=%d prompt_tokens=%d kept_items=%d",
+            spec["modality"],
+            actual_rows,
+            expected_rows,
+            keep_items,
+        )
+
+
 def _env_flag_enabled(raw: str | None, *, default: bool = False) -> bool:
     if raw is None or raw == "":
         return default
@@ -1567,6 +1779,26 @@ def _rtc_isolate_prerun_prefill_enabled() -> bool:
     return _env_flag_enabled(raw, default=True)
 
 
+def _rtc_actual_prefix_cache_limit() -> int | None:
+    raw = os.getenv("QWEN35_RTC_ACTUAL_PREFIX_CACHE_LIMIT")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 0 if _env_flag_enabled(raw, default=False) else None
+    return value if value > 0 else None
+
+
+def _rtc_actual_prefix_cache_limit_enabled() -> bool:
+    return _rtc_actual_prefix_cache_limit() is not None
+
+
+def _rtc_prerun_prefix_cache_protection_enabled() -> bool:
+    raw = os.getenv("QWEN35_RTC_PROTECT_PRERUN_PREFIX_CACHE")
+    return _env_flag_enabled(raw, default=False)
+
+
 def _rtc_prerun_thinker_terminal_enabled() -> bool:
     raw = os.getenv("QWEN35_RTC_PRERUN_THINKER_TERMINAL")
     return _env_flag_enabled(raw, default=True)
@@ -1588,12 +1820,54 @@ def _is_qwen35_rtc_thinker_terminal_prerun(request: Any) -> bool:
     )
 
 
+_RTC_MEDIA_CACHE_NAMESPACE_RE = re.compile(r"(rtc:[^|=\s]+)")
+_RTC_MEDIA_CACHE_MODALITY_SUFFIXES = (":audio", ":video", ":image")
+
+
+def _rtc_namespace_from_media_cache_key(extra_key: Any) -> str | None:
+    if not isinstance(extra_key, str) or "rtc:" not in extra_key:
+        return None
+    match = _RTC_MEDIA_CACHE_NAMESPACE_RE.search(extra_key)
+    if match is None:
+        return None
+    namespace = match.group(1)
+    for suffix in _RTC_MEDIA_CACHE_MODALITY_SUFFIXES:
+        if namespace.endswith(suffix):
+            namespace = namespace[: -len(suffix)]
+            break
+    return namespace if namespace.startswith("rtc:") else None
+
+
+def _qwen35_rtc_cache_namespace(request: Any, req: Any | None = None) -> str | None:
+    metadata = getattr(request, "metadata", None)
+    if isinstance(metadata, dict):
+        namespace = metadata.get("media_cache_namespace")
+        if isinstance(namespace, str) and namespace.startswith("rtc:"):
+            return namespace
+    if req is None:
+        return None
+    return _rtc_namespace_from_media_cache_key(getattr(req, "extra_key", None))
+
+
 def _is_qwen35_rtc_actual(request: Any) -> bool:
     metadata = getattr(request, "metadata", None)
-    if not isinstance(metadata, dict) or bool(metadata.get("pre_run")):
+    if isinstance(metadata, dict) and bool(metadata.get("pre_run")):
         return False
-    namespace = metadata.get("media_cache_namespace")
-    return isinstance(namespace, str) and namespace.startswith("rtc:")
+    return _qwen35_rtc_cache_namespace(request) is not None
+
+
+def _is_qwen35_rtc_actual_req(request: Any, req: Any) -> bool:
+    metadata = getattr(request, "metadata", None)
+    if isinstance(metadata, dict) and bool(metadata.get("pre_run")):
+        return False
+    sampling_params = getattr(req, "sampling_params", None)
+    max_new_tokens = getattr(sampling_params, "max_new_tokens", None)
+    try:
+        if max_new_tokens is not None and int(max_new_tokens) <= 0:
+            return False
+    except (TypeError, ValueError):
+        pass
+    return _qwen35_rtc_cache_namespace(request, req) is not None
 
 
 def _params_for_qwen35_prerun(params: dict[str, Any], request: Any) -> dict[str, Any]:
@@ -1818,6 +2092,15 @@ def _prepare_qwen35_thinker_inputs(
     thinker_inputs = state.thinker_inputs or {}
     model_inputs = thinker_inputs.get("model_inputs", {})
     if isinstance(model_inputs, dict):
+        model_inputs = dict(model_inputs)
+        _trim_qwen35_visual_features_to_prompt_tokens(
+            torch.as_tensor(input_ids),
+            model_inputs,
+            thinker_config,
+        )
+        thinker_inputs = dict(thinker_inputs)
+        thinker_inputs["model_inputs"] = model_inputs
+        state.thinker_inputs = thinker_inputs
         _validate_qwen35_multimodal_feature_lengths(
             torch.as_tensor(input_ids),
             model_inputs,
@@ -1862,14 +2145,33 @@ def make_thinker_scheduler_adapters(
             ),
         )
         req = getattr(req_data, "req", None)
-        if (
-            _rtc_isolate_prerun_prefill_enabled()
-            and _is_qwen35_rtc_prerun(payload.request)
-            and req is not None
-        ):
-            req._omni_isolate_prefill_batch = True
-        if _is_qwen35_rtc_actual(payload.request) and req is not None:
+        rtc_namespace = (
+            _qwen35_rtc_cache_namespace(payload.request, req)
+            if req is not None
+            else None
+        )
+        if req is not None and rtc_namespace is not None:
+            req._omni_rtc_cache_namespace = rtc_namespace
+        if req is not None and _is_qwen35_rtc_prerun(payload.request):
+            if _rtc_isolate_prerun_prefill_enabled():
+                req._omni_isolate_prefill_batch = True
+            if (
+                rtc_namespace is not None
+                and _rtc_prerun_prefix_cache_protection_enabled()
+            ):
+                req._omni_protect_latest_prefix_cache = True
+        if req is not None and _is_qwen35_rtc_actual_req(payload.request, req):
             req._omni_prioritize_prefill = True
+            if rtc_namespace is not None:
+                req._omni_release_protected_prefix_cache_on_finish = True
+            cache_limit = _rtc_actual_prefix_cache_limit()
+            if cache_limit is not None:
+                if cache_limit <= 1:
+                    cache_limit = getattr(req, "_omni_mamba_branching_seqlen", None)
+                if cache_limit is not None:
+                    cache_limit = int(cache_limit)
+                    req._omni_mamba_prefix_cache_limit = cache_limit
+                    req._omni_max_prefix_cache_len = cache_limit
         req_data.stage_payload = payload
         return req_data
 
@@ -1896,7 +2198,11 @@ def make_thinker_scheduler_adapters(
     return request_builder, result_adapter
 
 
-def make_thinker_stream_output_builder(required_aux_hidden_key: Any = None):
+def make_thinker_stream_output_builder(
+    required_aux_hidden_key: Any = None,
+    *,
+    vocab_size: int | None = None,
+):
     aux_hidden_key = _normalize_aux_hidden_key(required_aux_hidden_key)
     decode_stream_batcher = qwen3_request_builders._DecodeStreamTokenBatcher()
 
@@ -1943,12 +2249,31 @@ def make_thinker_stream_output_builder(required_aux_hidden_key: Any = None):
             stage_payload is not None
             and (stage_payload.request.params or {}).get("stream", False)
         )
+        generate_audio = should_generate_audio_output(stage_payload)
         if is_streaming:
-            decode_msg = decode_stream_batcher.build(request_id, token_id)
+            decode_batch_size = None
+            is_qwen35_rtc_actual = False
+            if stage_payload is not None:
+                if req is not None:
+                    is_qwen35_rtc_actual = _is_qwen35_rtc_actual_req(
+                        stage_payload.request,
+                        req,
+                    )
+                else:
+                    is_qwen35_rtc_actual = _is_qwen35_rtc_actual(stage_payload.request)
+            if is_qwen35_rtc_actual:
+                decode_batch_size = _qwen35_rtc_decode_stream_token_batch_size()
+            decode_msg = decode_stream_batcher.build(
+                request_id,
+                token_id,
+                batch_size=decode_batch_size,
+            )
             if decode_msg is not None:
                 messages.append(decode_msg)
 
-        if not should_generate_audio_output(stage_payload):
+        if not generate_audio:
+            return messages
+        if vocab_size is not None and not (0 <= token_id < int(vocab_size)):
             return messages
 
         extra = req_output.extra
@@ -4102,13 +4427,21 @@ def make_talker_scheduler_adapters(
             mrope_position_builder=_compute_qwen35_mrope_positions,
         )
         if hasattr(req_data, "req"):
+            req = req_data.req
+            is_streaming = bool(params.get("stream"))
+            if (
+                is_streaming
+                and should_generate_audio_output(payload)
+                and _is_qwen35_rtc_actual(payload.request)
+            ):
+                req._omni_prioritize_prefill = True
             req_data.req._qwen35_subtalker_sampling_params = subtalker_sampling
             req_data.subtalker_sampling_params = subtalker_sampling
             req_data.talker_decode_input_mode = "qwen35_external"
             feedback_stride = _qwen35_talker_text_feedback_stride()
             req_data.talker_text_feedback_stride = feedback_stride
             req_data.talker_text_feedback_countdown = feedback_stride
-            req_data.talker_text_chunk_size = _QWEN35_TALKER_NUM_OUTPUT_IN_CHUNK
+            req_data.talker_text_chunk_size = _qwen35_talker_text_chunk_size()
             req_data.talker_text_chunk_remaining = 0
             req_data.talker_text_outputs_to_drop = 0
             req_data.last_talker_decode_should_emit = True
