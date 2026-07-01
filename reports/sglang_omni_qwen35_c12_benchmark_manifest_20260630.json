@@ -1,0 +1,405 @@
+{
+  "generated_at": "2026-06-30",
+  "remote_repo": "/myapp/sglang-omni",
+  "commit": "6115ffd fix qwen35 rtc partial visual feature trim",
+    "benchmark_shape": {
+      "model": "qwen3_5-omni",
+      "concurrency": 12,
+      "trunk_size": 40,
+      "total_samples": 12,
+      "stagger_ms": 0,
+      "temperature": 1.0,
+      "voice": "m02",
+      "mode": "barrier-prerun text+audio"
+    },
+    "current_active_service": {
+      "port": 8162,
+      "run_dir": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimpartial_cache2048_64g_run12_c2w4_relay1024_cvd345_8162_20260630_145321",
+      "config_commit": "6115ffd",
+      "health_model": "qwen3_5-omni",
+      "log_checks": {
+        "http_500": 0,
+        "oom": 0,
+        "feature_token_mismatch": 0,
+        "omitted_payload_cache_miss": 0
+      },
+      "note": "Service was clean-restarted after the failed sil680 negative experiment. No C12 benchmark is attached to this latest run directory; C12 evidence is recorded in stable_best, post_commit_validation_sil672, and same_offset_warmed_sil672."
+    },
+    "local_artifacts": {
+    "delivery_readme": "reports/README_qwen35_c12_delivery_20260630.md",
+    "final_delivery_note": "reports/qwen35_c12_final_delivery_note_20260701.md",
+    "delivery_bundle": "reports/qwen35_c12_delivery_bundle_20260630.tar.gz",
+    "delivery_bundle_sha256": "reports/qwen35_c12_delivery_bundle_20260630.tar.gz.sha256",
+    "delivery_ready_snapshot": "reports/delivery_ready_snapshot_20260630.txt",
+    "stable_lock": "reports/sglang_omni_qwen35_c12_stable_lock_20260630.md",
+    "delivery_audit": "reports/sglang_omni_qwen35_c12_delivery_audit_20260630.md",
+    "perf_report": "reports/sglang_omni_qwen35_c12_perf_report_20260630.md",
+    "benchmark_summary_csv": "reports/sglang_omni_qwen35_c12_benchmark_summary_20260630.csv",
+    "stage_summary_csv": "reports/sglang_omni_qwen35_c12_stage_summary_20260630.csv",
+        "audio_index": "reports/sglang_omni_qwen35_c12_audio_index_20260630.md",
+        "audio_outputs_csv": "reports/sglang_omni_qwen35_c12_audio_outputs_20260630.csv",
+        "audio_validation_md": "reports/sglang_omni_qwen35_c12_audio_validation_20260630.md",
+        "audio_validation_csv": "reports/sglang_omni_qwen35_c12_audio_validation_20260630.csv",
+        "audio_player_html": "reports/qwen35_c12_stable_best_audio_player_20260630.html",
+        "local_stable_best_audio_dir": "reports/audio/stable_best_sil672",
+    "delivery_ready_check": "reports/check_sglang_qwen35_delivery_ready.sh",
+    "stable_server_script": "reports/run_sglang_qwen35_stable_server.sh",
+    "benchmark_script": "reports/run_sglang_qwen35_stable_c12_benchmark.sh"
+  },
+  "stable_best": {
+    "name": "sg_mem080_c2w4_best_run12",
+    "status": "selected",
+    "path": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimfix_cache2048_64g_run12_relay1024_cvd345_8162_20260630_103902/client_c12_realtime_audio_vllmstyle_sil672_stagger0_temp1_barrier_104103",
+    "config": {
+      "CUDA_VISIBLE_DEVICES": "3,4,5",
+      "SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE": 8,
+      "SGLANG_OMNI_TALKER_READY_SUBSET_MIN_SIZE": 1,
+      "SGLANG_OMNI_RELAY_SLOT_SIZE_MB": 1024,
+      "SGLANG_OMNI_RELAY_CREDITS": 2,
+      "SGLANG_OMNI_IMAGE_ENCODER_ITEM_BATCH_BUDGET_BYTES": 268435456,
+      "SGLANG_OMNI_ENCODER_CACHE_MAX_ENTRIES": 2048,
+      "SGLANG_OMNI_ENCODER_CACHE_MAX_BYTES": 68719476736,
+      "SGLANG_OMNI_STORE_ITEM_PLAN_COMBINED_ENCODER_CACHE": 0,
+      "SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS": 1,
+      "QWEN35_TRIM_PARTIAL_TRAILING_VISUAL_FEATURES": 1,
+      "QWEN35_TALKER_ALLOW_PARTIAL_TEXT_CHUNK_BEFORE_DONE": 0,
+      "QWEN35_TALKER_PARTIAL_TEXT_CHUNK_WAIT_SKIPS": 0,
+      "QWEN35_TALKER_ALLOW_UNBOUNDED_EMPTY_TEXT_FEEDBACK": 0,
+      "thinker_mem_fraction_static": 0.80,
+      "thinker_max_running_requests": 12,
+      "talker_max_running_requests": 12,
+      "code2wav_stream_chunk_size": 4
+    },
+    "metrics": {
+      "completed": 12,
+      "failed": 0,
+      "actual_elapsed_s": 36.188,
+      "ttft_avg_ms": 7808.845,
+      "ttft_p99_ms": 12813.277,
+      "ttfa_avg_ms": 10013.029,
+      "ttfa_p99_ms": 10067.803,
+      "last_audio_avg_ms": 24275.350,
+      "last_audio_p99_ms": 27465.785,
+      "e2e_avg_ms": 33794.737,
+      "e2e_p99_ms": 36180.092,
+      "audio_duration_avg_s": 8.967,
+      "bang_count": 0
+    }
+  },
+  "profile_run": {
+    "name": "sg_mem080_c2w4_profile",
+    "path": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimfix_cache2048_64g_run12_c2w4_profile_relay1024_cvd345_8162_20260630_122447/client_c12_realtime_audio_vllmstyle_sil700_stagger0_temp1_barrier_profile_stable_c12_c2w4_122641",
+    "profile_json": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimfix_cache2048_64g_run12_c2w4_profile_relay1024_cvd345_8162_20260630_122447/client_c12_realtime_audio_vllmstyle_sil700_stagger0_temp1_barrier_profile_stable_c12_c2w4_122641/request_profile_stable_c12_c2w4_122641.json",
+    "metrics": {
+      "completed": 12,
+      "failed": 0,
+      "actual_elapsed_s": 36.637,
+      "ttft_avg_ms": 7700.349,
+      "ttft_p99_ms": 16892.954,
+      "ttfa_avg_ms": 10007.168,
+      "ttfa_p99_ms": 10058.165,
+      "last_audio_avg_ms": 28353.527,
+      "last_audio_p99_ms": 32864.698,
+      "e2e_avg_ms": 34465.752,
+      "e2e_p99_ms": 36625.400,
+      "audio_duration_avg_s": 9.300,
+      "bang_count": 0
+    },
+    "log_checks": {
+      "http_500": 0,
+      "oom": 0,
+      "feature_token_mismatch": 0,
+      "omitted_payload_cache_miss": 0
+    }
+  },
+  "post_fix_validation": {
+    "name": "sg_mem080_c2w4_trimpartial_sil712",
+    "status": "valid_stability_validation",
+    "path": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimpartial_cache2048_64g_run12_c2w4_relay1024_cvd345_8162_20260630_124917/client_c12_realtime_audio_vllmstyle_sil712_stagger0_temp1_barrier_validation_125117",
+    "metrics": {
+      "completed": 12,
+      "failed": 0,
+      "actual_elapsed_s": 36.639,
+      "ttft_avg_ms": 9559.216,
+      "ttft_p99_ms": 11654.261,
+      "ttfa_avg_ms": 12005.846,
+      "ttfa_p99_ms": 12472.420,
+      "last_audio_avg_ms": 27338.002,
+      "last_audio_p99_ms": 31411.020,
+      "e2e_avg_ms": 34503.004,
+      "e2e_p99_ms": 36629.714,
+      "audio_duration_avg_s": 9.047,
+      "bang_count": 0
+    },
+    "log_checks": {
+      "http_500": 0,
+      "oom": 0,
+      "feature_token_mismatch": 0,
+      "partial_trim_events": 0,
+      "omitted_payload_cache_miss": 0
+    },
+    "note": "Clean restart validation with QWEN35_TRIM_PARTIAL_TRAILING_VISUAL_FEATURES=1 after the reused-service sil712 mismatch."
+  },
+    "post_fix_validation_sil724": {
+      "name": "sg_mem080_c2w4_trimpartial_sil724",
+      "status": "valid_independent_stability_validation",
+      "path": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimpartial_cache2048_64g_run12_c2w4_relay1024_cvd345_8162_20260630_124917/client_c12_realtime_audio_vllmstyle_sil724_stagger0_temp1_barrier_validation_130217",
+    "metrics": {
+      "completed": 12,
+      "failed": 0,
+      "actual_elapsed_s": 37.314,
+      "ttft_avg_ms": 10573.433,
+      "ttft_p99_ms": 17901.535,
+      "ttfa_avg_ms": 10791.364,
+      "ttfa_p99_ms": 12761.604,
+      "last_audio_avg_ms": 28875.111,
+      "last_audio_p99_ms": 33975.936,
+      "e2e_avg_ms": 33421.284,
+      "e2e_p99_ms": 37302.095,
+      "audio_duration_avg_s": 8.700,
+      "bang_count": 0
+    },
+    "log_checks": {
+      "http_500": 0,
+      "oom": 0,
+      "feature_token_mismatch": 0,
+      "omitted_payload_cache_miss": 0
+      },
+      "note": "New sil-offset validation on the current 8162 trimpartial service. Stable, but slower than the selected best and therefore not selected as the performance best."
+    },
+    "post_commit_validation_sil672": {
+      "name": "sg_mem080_c2w4_post_commit_sil672",
+      "status": "valid_current_active_service_validation",
+      "run_dir": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimpartial_cache2048_64g_run12_c2w4_relay1024_cvd345_8162_20260630_142141",
+      "path": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimpartial_cache2048_64g_run12_c2w4_relay1024_cvd345_8162_20260630_142141/client_c12_realtime_audio_vllmstyle_sil672_stagger0_temp1_barrier_validation_142334",
+      "config": {
+        "commit": "6115ffd",
+        "CUDA_VISIBLE_DEVICES": "3,4,5",
+        "thinker_mem_fraction_static": 0.8,
+        "thinker_max_running_requests": 12,
+        "talker_max_running_requests": 12,
+        "code2wav_stream_chunk_size": 4
+      },
+      "metrics": {
+        "completed": 12,
+        "failed": 0,
+        "elapsed_s": 338.046,
+        "actual_elapsed_s": 38.776,
+        "ttft_avg_ms": 9961.157,
+        "ttft_p99_ms": 16504.078,
+        "ttfa_avg_ms": 11899.373,
+        "ttfa_p99_ms": 13906.542,
+        "last_audio_avg_ms": 25306.965,
+        "last_audio_p99_ms": 30541.845,
+        "e2e_avg_ms": 31685.279,
+        "e2e_p99_ms": 38764.072,
+        "audio_duration_avg_s": 8.873,
+        "bang_count": 0
+      },
+      "log_checks": {
+        "http_500": 0,
+        "oom": 0,
+        "feature_token_mismatch": 0,
+        "omitted_payload_cache_miss": 0
+      },
+      "note": "Post-commit clean-start validation for commit 6115ffd. This validates the selected code/config; it is slower than the selected historical best and is not selected as the performance best."
+    },
+    "same_offset_warmed_sil672": {
+      "name": "sg_mem080_c2w4_warmed_sil672_same_offset",
+      "status": "valid_cache_warmed_upper_bound_not_selected",
+      "path": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimpartial_cache2048_64g_run12_c2w4_relay1024_cvd345_8162_20260630_142141/client_c12_realtime_audio_vllmstyle_sil672_stagger0_temp1_barrier_validation_143808",
+      "metrics": {
+        "completed": 12,
+        "failed": 0,
+        "elapsed_s": 169.783,
+        "actual_elapsed_s": 29.848,
+        "ttft_avg_ms": 7226.803,
+        "ttft_p99_ms": 11231.070,
+        "ttfa_avg_ms": 7438.401,
+        "ttfa_p99_ms": 10471.216,
+        "last_audio_avg_ms": 15308.464,
+        "last_audio_p99_ms": 18952.963,
+        "e2e_avg_ms": 21092.356,
+        "e2e_p99_ms": 29836.452,
+        "audio_duration_avg_s": 9.173,
+        "bang_count": 0
+      },
+      "note": "Same-offset warmed rerun after a post-commit sil672 validation. This is a useful upper bound for cache-warmed service behavior, but it is not selected as stable best because the independent sil680 run failed."
+    },
+    "independent_sil680_failed": {
+      "name": "sg_mem080_c2w4_sil680_independent_failed",
+      "status": "failed_not_selected",
+      "path": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimpartial_cache2048_64g_run12_c2w4_relay1024_cvd345_8162_20260630_142141/client_c12_realtime_audio_vllmstyle_sil680_stagger0_temp1_barrier_validation_144121",
+      "metrics": {
+        "completed": 0,
+        "failed": 12,
+        "elapsed_s": 308.553,
+        "actual_elapsed_s": 12.733,
+        "bang_count": 0
+      },
+      "failure": "All actual requests failed with ClientPayloadError after GPU0 CUDA OOM. This invalidates treating the same-offset warmed sil672 result as a stable generalized best."
+    },
+    "same_offset_prefillwait20_comparison": {
+    "status": "not_selected",
+    "note": "SGLANG_OMNI_PRIORITY_PREFILL_BATCH_WAIT_MS=20 slightly improves same-offset last_audio/e2e on sil732, but worsens TTFT/TTFA and fails a sil672 challenge run with thinker scheduler crash.",
+    "baseline_sil732": {
+      "path": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimpartial_cache2048_64g_run12_c2w4_relay1024_cvd345_8162_20260630_124917/client_c12_realtime_audio_vllmstyle_sil732_stagger0_temp1_barrier_validation_132400",
+      "metrics": {
+        "completed": 12,
+        "failed": 0,
+        "actual_elapsed_s": 36.782,
+        "ttft_avg_ms": 8454.135,
+        "ttft_p99_ms": 13943.093,
+        "ttfa_avg_ms": 9377.062,
+        "ttfa_p99_ms": 12431.207,
+        "last_audio_avg_ms": 26639.250,
+        "last_audio_p99_ms": 32686.237,
+        "e2e_avg_ms": 31025.279,
+        "e2e_p99_ms": 36769.404,
+        "audio_duration_avg_s": 8.907,
+        "bang_count": 0
+      }
+    },
+    "wait20_sil732": {
+      "path": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimpartial_cache2048_64g_run12_c2w4_prefillwait20_relay1024_cvd012_8163_20260630_131428/client_c12_realtime_audio_vllmstyle_sil732_stagger0_temp1_barrier_wait20_131821",
+      "metrics": {
+        "completed": 12,
+        "failed": 0,
+        "actual_elapsed_s": 36.698,
+        "ttft_avg_ms": 10410.800,
+        "ttft_p99_ms": 14946.814,
+        "ttfa_avg_ms": 11498.963,
+        "ttfa_p99_ms": 13969.273,
+        "last_audio_avg_ms": 25217.779,
+        "last_audio_p99_ms": 31078.151,
+        "e2e_avg_ms": 30537.915,
+        "e2e_p99_ms": 36685.809,
+        "audio_duration_avg_s": 9.173,
+        "bang_count": 0
+      }
+    },
+    "wait20_sil672_failed": {
+      "path": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimpartial_cache2048_64g_run12_c2w4_prefillwait20_relay1024_cvd012_8163_20260630_131428/client_c12_realtime_audio_vllmstyle_sil672_stagger0_temp1_barrier_wait20_132958",
+      "metrics": {
+        "completed": 0,
+        "failed": 12,
+        "actual_elapsed_s": 13.451,
+        "bang_count": 0
+      },
+      "failure": "All actual requests failed with ClientPayloadError after thinker scheduler crashed: Committed KV cache already freed."
+    }
+  },
+  "scheduler_prefill_stats": [
+    {
+      "run": "best_sil672",
+      "prefill_rows": 333,
+      "new_seq_distribution": {"1": 238, "2": 63, "3": 16, "4": 9, "5": 3, "9": 1, "10": 1, "11": 2},
+      "avg_new_seq": 1.51
+    },
+    {
+      "run": "profile_sil700",
+      "prefill_rows": 717,
+      "new_seq_distribution": {"1": 560, "2": 110, "3": 19, "4": 12, "5": 3, "6": 5, "7": 1, "8": 1, "9": 2, "10": 1, "11": 3},
+      "avg_new_seq": 1.40
+    },
+    {
+      "run": "trimpartial_8162",
+      "prefill_rows": 1119,
+      "new_seq_distribution": {"1": 904, "2": 147, "3": 25, "4": 24, "5": 5, "6": 5, "8": 2, "9": 1, "10": 3, "11": 3},
+      "avg_new_seq": 1.35
+    },
+    {
+      "run": "prefillwait20_8163",
+      "prefill_rows": 866,
+      "new_seq_distribution": {"1": 732, "2": 88, "3": 19, "4": 8, "5": 6, "6": 3, "7": 1, "9": 3, "10": 3, "11": 3},
+      "avg_new_seq": 1.32,
+      "status": "unstable"
+    }
+  ],
+  "experiments": [
+    {
+      "name": "sg_mem080_c2w2_ttfa",
+      "status": "valid_ttfa_variant",
+      "path": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimfix_cache2048_64g_run12_c2w2_relay1024_cvd345_8162_20260630_105806/client_c12_realtime_audio_vllmstyle_sil720_stagger0_temp1_barrier_105955",
+      "metrics": {
+        "completed": 12,
+        "failed": 0,
+        "actual_elapsed_s": 37.752,
+        "ttfa_avg_ms": 8767.781,
+        "last_audio_avg_ms": 26802.252,
+        "e2e_avg_ms": 34110.671,
+        "bang_count": 0
+      },
+      "note": "TTFA is better, but last_audio and actual elapsed are worse than the selected stable best."
+    },
+    {
+      "name": "sg_mem084_c2w4",
+      "status": "valid_but_not_selected",
+      "path": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem084_item256m_omitcached_trimfix_cache2048_64g_run12_c2w4_relay1024_cvd345_8162_20260630_120818/client_c12_realtime_audio_vllmstyle_sil688_stagger0_temp1_barrier_121009",
+      "metrics": {
+        "completed": 12,
+        "failed": 0,
+        "actual_elapsed_s": 36.829,
+        "ttft_avg_ms": 7262.232,
+        "ttfa_avg_ms": 10283.129,
+        "last_audio_avg_ms": 27262.971,
+        "e2e_avg_ms": 34508.305,
+        "bang_count": 0
+      },
+      "note": "TTFT improves, but tail and e2e are worse; mem0.84 also has less GPU memory headroom."
+    },
+    {
+      "name": "sg_partial_text",
+      "status": "negative",
+      "path": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimfix_cache2048_64g_run12_partialtext_relay1024_cvd345_8162_20260630_104939/client_c12_realtime_audio_vllmstyle_sil704_stagger0_temp1_barrier_105128",
+      "metrics": {
+        "completed": 12,
+        "failed": 0,
+        "actual_elapsed_s": 38.980,
+        "ttfa_avg_ms": 11665.092,
+        "last_audio_avg_ms": 30620.868,
+        "e2e_avg_ms": 36931.138,
+        "bang_count": 0
+      },
+      "note": "Partial text handoff slows TTFA and tail."
+    },
+    {
+      "name": "mem084_c2w2",
+      "status": "failed",
+      "path": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem084_item256m_omitcached_trimfix_cache2048_64g_run12_c2w2_relay1024_cvd345_8162_20260630_121615/client_c12_realtime_audio_vllmstyle_sil696_stagger0_temp1_barrier_121806",
+      "failure": "prerun 500 due GPU0 CUDA OOM"
+    },
+    {
+      "name": "code2wav_dynamic_chunk",
+      "status": "invalid",
+      "path": "/myapp/sglang-omni/results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimfix_cache2048_64g_run12_c2wdyn_relay1024_cvd345_8162_20260630_110723/client_c12_realtime_audio_vllmstyle_sil736_stagger0_temp1_barrier_115615",
+      "failure": "actual run stalled with torch/inductor compile workers; no metrics.json or wav outputs"
+    }
+  ],
+  "vllm_reference": [
+    {
+      "name": "vllm_rtc_trunk40_c12_rerun_fa3off_20260624_214308",
+      "path": "/myapp/sglang-omni/results/vllm_rtc_trunk40_c12_rerun_fa3off_20260624_214308/rtc_20260624_215521/trunk_40_conc_12/metrics.json",
+      "avg_ttft_ms": 1911.015,
+      "p99_ttft_ms": 2674.077,
+      "avg_ttfa_ms": 2511.764,
+      "p99_ttfa_ms": 3406.268
+    },
+    {
+      "name": "vllm_rtc_trunk40_c12_mt64_compile_fa3off_20260624_114111",
+      "path": "/myapp/sglang-omni/results/vllm_rtc_trunk40_c12_mt64_compile_fa3off_20260624_114111/rtc_20260624_115330/trunk_40_conc_12/metrics.json",
+      "avg_ttft_ms": 1565.571,
+      "p99_ttft_ms": 2785.816,
+      "avg_ttfa_ms": 3168.279,
+      "p99_ttfa_ms": 5665.678
+    },
+    {
+      "name": "vllm_rtc_trunk40_c12_current_fa3off_20260626_211730",
+      "path": "/myapp/sglang-omni/results/vllm_rtc_trunk40_c12_current_fa3off_20260626_211730/client_perf/rtc_20260626_212935/trunk_40_conc_12/metrics.json",
+      "avg_ttft_ms": 1990.025,
+      "p99_ttft_ms": 3131.819,
+      "avg_ttfa_ms": 2616.778,
+      "p99_ttfa_ms": 3647.978
+    }
+  ]
+}
