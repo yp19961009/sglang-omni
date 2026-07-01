@@ -5,9 +5,37 @@ REMOTE_HOST="${REMOTE_HOST:-H20-ecs-gangouyu}"
 CONTAINER="${CONTAINER:-b5f665f3d883}"
 REMOTE_REPO="${REMOTE_REPO:-/myapp/sglang-omni}"
 PORT="${PORT:-8162}"
+MODE="${MODE:-auto}"
 FORCE_RESTART="${FORCE_RESTART:-0}"
 
-ssh "$REMOTE_HOST" "docker exec -i $CONTAINER bash" <<SH
+if [ "$MODE" = "auto" ]; then
+  if [ -d "$REMOTE_REPO" ]; then
+    MODE="local"
+  elif command -v docker >/dev/null 2>&1 && docker inspect "$CONTAINER" >/dev/null 2>&1; then
+    MODE="docker"
+  else
+    MODE="ssh"
+  fi
+fi
+
+case "$MODE" in
+  local)
+    runner=(bash)
+    ;;
+  docker)
+    runner=(docker exec -i "$CONTAINER" bash)
+    ;;
+  ssh)
+    runner=(ssh "$REMOTE_HOST" "docker exec -i $CONTAINER bash")
+    ;;
+  *)
+    echo "MODE must be auto, local, docker, or ssh; got: $MODE" >&2
+    exit 1
+    ;;
+esac
+
+echo "mode=$MODE repo=$REMOTE_REPO port=$PORT force_restart=$FORCE_RESTART" >&2
+"${runner[@]}" <<SH
 set -euo pipefail
 cd "$REMOTE_REPO"
 
