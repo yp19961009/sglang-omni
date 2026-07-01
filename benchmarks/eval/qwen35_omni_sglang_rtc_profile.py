@@ -272,6 +272,11 @@ def _combine_wav_chunks(
 class RequestMetrics:
     request_id: str
     text: str
+    first_output_ms: float | None
+    first_output_type: str | None
+    first_text_event_ms: float | None
+    first_audio_event_ms: float | None
+    text_audio_event_gap_ms: float | None
     ttft_ms: float | None
     ttfa_ms: float | None
     e2e_total_ms: float
@@ -293,6 +298,8 @@ async def post_chat(
 ) -> RequestMetrics:
     start = time.perf_counter()
     text_parts: list[str] = []
+    first_output_at: float | None = None
+    first_output_type: str | None = None
     first_text_at: float | None = None
     first_audio_at: float | None = None
     last_audio_at: float | None = None
@@ -312,10 +319,16 @@ async def post_chat(
                     text_parts.append(text_delta)
                     if first_text_at is None:
                         first_text_at = now
+                    if first_output_at is None:
+                        first_output_at = now
+                        first_output_type = "text"
                 audio_obj = _event_audio_obj(evt)
                 if audio_obj is not None:
                     if first_audio_at is None:
                         first_audio_at = now
+                    if first_output_at is None:
+                        first_output_at = now
+                        first_output_type = "audio"
                     if last_audio_at is not None:
                         inter_chunk_ms.append((now - last_audio_at) * 1000.0)
                     last_audio_at = now
@@ -338,6 +351,8 @@ async def post_chat(
             if text:
                 text_parts.append(text)
                 first_text_at = time.perf_counter()
+                first_output_at = first_text_at
+                first_output_type = "text"
             usage = body.get("usage") or {}
 
     end = time.perf_counter()
@@ -348,11 +363,31 @@ async def post_chat(
         output_wav.write_bytes(full_wav)
         wav_path = str(output_wav)
 
+    first_output_ms = (
+        (first_output_at - start) * 1000.0 if first_output_at is not None else None
+    )
+    first_text_event_ms = (
+        (first_text_at - start) * 1000.0 if first_text_at is not None else None
+    )
+    first_audio_event_ms = (
+        (first_audio_at - start) * 1000.0 if first_audio_at is not None else None
+    )
+    text_audio_event_gap_ms = (
+        first_audio_event_ms - first_text_event_ms
+        if first_text_event_ms is not None and first_audio_event_ms is not None
+        else None
+    )
+
     return RequestMetrics(
         request_id=str(payload.get("metadata", {}).get("request_id") or ""),
         text="".join(text_parts),
-        ttft_ms=(first_text_at - start) * 1000.0 if first_text_at is not None else None,
-        ttfa_ms=(first_audio_at - start) * 1000.0 if first_audio_at is not None else None,
+        first_output_ms=first_output_ms,
+        first_output_type=first_output_type,
+        first_text_event_ms=first_text_event_ms,
+        first_audio_event_ms=first_audio_event_ms,
+        text_audio_event_gap_ms=text_audio_event_gap_ms,
+        ttft_ms=first_text_event_ms,
+        ttfa_ms=first_audio_event_ms,
         e2e_total_ms=(end - start) * 1000.0,
         audio_chunk_count=audio_chunks,
         audio_duration_s=audio_duration_s if audio_duration_s > 0 else None,
@@ -576,6 +611,17 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "avg_ttft_ms": ttft_ms,
         "p50_ttft_ms": ttft_ms,
         "p99_ttft_ms": ttft_ms,
+        "ttft_semantics": "first streamed text event",
+        "ttfa_semantics": "first streamed audio event",
+        "first_output_ms": measured.first_output_ms,
+        "first_output_type": measured.first_output_type,
+        "first_text_event_ms": measured.first_text_event_ms,
+        "first_audio_event_ms": measured.first_audio_event_ms,
+        "text_audio_event_gap_ms": measured.text_audio_event_gap_ms,
+        "audio_before_text_event": (
+            measured.text_audio_event_gap_ms is not None
+            and measured.text_audio_event_gap_ms < 0
+        ),
         "avg_ttfa_ms": ttfa_ms,
         "p50_ttfa_ms": ttfa_ms,
         "p99_ttfa_ms": ttfa_ms,
@@ -612,6 +658,11 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "text": measured.text,
         "ttft_ms": ttft_ms,
         "ttfa_ms": ttfa_ms,
+        "first_output_ms": measured.first_output_ms,
+        "first_output_type": measured.first_output_type,
+        "first_text_event_ms": measured.first_text_event_ms,
+        "first_audio_event_ms": measured.first_audio_event_ms,
+        "text_audio_event_gap_ms": measured.text_audio_event_gap_ms,
         "e2e_total_ms": e2e_ms,
         "audio_chunk_count": measured.audio_chunk_count,
         "audio_duration_s": audio_dur,

@@ -8,10 +8,13 @@ set -euo pipefail
 #   CONCURRENCY=12 TOTAL_SAMPLES=12 RUN_LABEL=c12 \
 #     bash reports/run_sglang_qwen35_stable_c12_benchmark.sh
 #
-# This measures the realtime final chunk: prefix-extension requests populate
-# the first TRUNK_SIZE-1 chunks, then the measured request streams chunk
-# TRUNK_SIZE. See reports/README_qwen35_realtime_benchmark_20260701.md for
-# current C1/C12 reference numbers.
+# This follows the vLLM run_rtc_profile concurrency shape by default: each
+# worker incrementally sends pre-run chunks 1..TRUNK_SIZE, then immediately
+# streams the measured actual request for the same TRUNK_SIZE. Set
+# BARRIER_PREFIX=1 to use the older all-prefixes-first barrier shape. See
+# reports/README_qwen35_realtime_benchmark_20260701.md for reference numbers.
+# Request profiling is enabled by default so summaries include vLLM-style
+# profile_* metrics. Set PROFILE_REQUESTS=0 to skip request profiling.
 
 REPO="${REPO:-/myapp/sglang-omni}"
 PORT="${PORT:-8162}"
@@ -22,18 +25,34 @@ TRUNK_SIZE="${TRUNK_SIZE:-40}"
 STAGGER_MS="${STAGGER_MS:-0}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 VOICE="${VOICE:-m02}"
-BARRIER_PREFIX="${BARRIER_PREFIX:-${BARRIER_PRERUN:-1}}"
-PREFIX_MAX_TOKENS="${PREFIX_MAX_TOKENS:-${PRERUN_MAX_TOKENS:-0}}"
+BARRIER_PREFIX="${BARRIER_PREFIX:-${BARRIER_PRERUN:-0}}"
+PREFIX_MAX_TOKENS="${PREFIX_MAX_TOKENS:-${PRERUN_MAX_TOKENS:-2}}"
+PROFILE_REQUESTS="${PROFILE_REQUESTS:-1}"
 RUN_LABEL="${RUN_LABEL:-c${CONCURRENCY}}"
 RUN_DIR="${RUN_DIR:-}"
 
 cd "$REPO"
 
 case "$BARRIER_PREFIX" in
-  1|true|TRUE|yes|YES) barrier_args=(--barrier-prefix) ;;
-  0|false|FALSE|no|NO) barrier_args=() ;;
+  1|true|TRUE|yes|YES)
+    barrier_args=(--barrier-prefix); RUN_SHAPE="barrier_prefix" ;;
+  0|false|FALSE|no|NO)
+    barrier_args=(); RUN_SHAPE="vllm_pipeline" ;;
   *)
     echo "BARRIER_PREFIX must be 1/0, true/false, or yes/no; got: $BARRIER_PREFIX" >&2
+    exit 1
+    ;;
+esac
+
+case "$PROFILE_REQUESTS" in
+  1|true|TRUE|yes|YES)
+    PROFILE_RUN_ID="sg_${RUN_LABEL}_c${CONCURRENCY}_t${TRUNK_SIZE}_$(date +%H%M%S)"
+    profile_args=(--profile-actual-run-id "$PROFILE_RUN_ID") ;;
+  0|false|FALSE|no|NO)
+    PROFILE_RUN_ID=""
+    profile_args=() ;;
+  *)
+    echo "PROFILE_REQUESTS must be 1/0, true/false, or yes/no; got: $PROFILE_REQUESTS" >&2
     exit 1
     ;;
 esac
@@ -50,7 +69,7 @@ echo "Using RUN_DIR=$RUN_DIR"
 echo "Checking active $PORT service..."
 ps -eo pid,etimes,args | grep 'sglang_omni.cli serve' | grep -- "--port $PORT" | grep -v grep
 
-OUT_DIR="$RUN_DIR/client_c${CONCURRENCY}_rtcflow_prefix_sil${SIL_OFFSET}_trunk${TRUNK_SIZE}_samples${TOTAL_SAMPLES}_stagger${STAGGER_MS}_temp${TEMPERATURE}_barrier${BARRIER_PREFIX}_${RUN_LABEL}_$(date +%H%M%S)"
+OUT_DIR="$RUN_DIR/client_c${CONCURRENCY}_rtcflow_${RUN_SHAPE}_sil${SIL_OFFSET}_trunk${TRUNK_SIZE}_samples${TOTAL_SAMPLES}_stagger${STAGGER_MS}_temp${TEMPERATURE}_prefixmt${PREFIX_MAX_TOKENS}_${RUN_LABEL}_$(date +%H%M%S)"
 echo "$OUT_DIR" > "$RUN_DIR/latest_validation_client_dir.txt"
 
 echo "--- benchmark config ---"
@@ -63,8 +82,12 @@ echo "sil_offset=$SIL_OFFSET"
 echo "temperature=$TEMPERATURE"
 echo "voice=$VOICE"
 echo "barrier_prefix=$BARRIER_PREFIX"
-echo "realtime_shape=prefix-extension flow, then measured final trunk $TRUNK_SIZE"
+echo "realtime_shape=$RUN_SHAPE: per-worker prefix chunks 1..$TRUNK_SIZE, then measured actual chunk $TRUNK_SIZE"
 echo "prefix_max_tokens=$PREFIX_MAX_TOKENS"
+echo "profile_requests=$PROFILE_REQUESTS"
+if [ -n "$PROFILE_RUN_ID" ]; then
+  echo "profile_run_id=$PROFILE_RUN_ID"
+fi
 echo "out_dir=$OUT_DIR"
 
 PYTHONPATH=. python benchmarks/eval/qwen35_omni_sglang_rtc_concurrency.py \
@@ -79,7 +102,8 @@ PYTHONPATH=. python benchmarks/eval/qwen35_omni_sglang_rtc_concurrency.py \
   --temperature "$TEMPERATURE" \
   --voice "$VOICE" \
   --prefix-max-tokens "$PREFIX_MAX_TOKENS" \
-  "${barrier_args[@]}"
+  "${barrier_args[@]}" \
+  "${profile_args[@]}"
 
 echo "--- metrics ---"
 python - <<PY
@@ -88,9 +112,21 @@ out = "$OUT_DIR"
 m = json.load(open(os.path.join(out, "metrics.json")))
 for k in [
     "completed", "failed", "actual_elapsed_s",
-    "prefix_max_tokens",
+    "concurrency_shape", "prefix_max_tokens",
+    "ttft_semantics", "ttfa_semantics",
     "ttft_avg_ms", "ttft_p99_ms",
     "ttfa_avg_ms", "ttfa_p99_ms",
+    "first_output_avg_ms", "first_output_p99_ms", "first_output_type_counts",
+    "profile_num_requests", "profile_stats_source",
+    "profile_ttft_avg_ms", "profile_ttft_p99_ms",
+    "profile_ttfa_avg_ms", "profile_ttfa_p99_ms",
+    "profile_ttfa_thinker_prefill_avg_ms",
+    "profile_ttfa_hf_preproc_avg_ms",
+    "profile_ttfa_talker_prefill_avg_ms",
+    "profile_ttfa_code2wav_first_chunk_avg_ms",
+    "first_text_event_avg_ms", "first_text_event_p99_ms",
+    "first_audio_event_avg_ms", "first_audio_event_p99_ms",
+    "audio_before_text_event_count", "audio_before_text_sample_indices",
     "last_audio_avg_ms", "last_audio_p99_ms",
     "e2e_avg_ms", "e2e_p99_ms",
     "audio_duration_avg_s", "bang_count", "errors",

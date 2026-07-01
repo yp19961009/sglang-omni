@@ -36,8 +36,8 @@ TRACE_CACHE=1 FORCE_RESTART=1 \
 
 `TRACE_CACHE=1` defaults to `TRACE_CACHE_SCOPE=actual`, so only measured
 requests emit cache summaries. This keeps prefix-extension requests off the
-hot logging path while still showing the final-chunk `39 hits + 1 miss`
-behavior. Use `TRACE_CACHE_SCOPE=all` only when you need the old full-prefix
+hot logging path while still showing the final-chunk `40 hits + 0 misses`
+vLLM-style behavior. Use `TRACE_CACHE_SCOPE=all` only when you need the old full-prefix
 log stream.
 
 Use `TRACE_CACHE_DETAIL=1` only for detailed item-level cache debugging. It is
@@ -59,25 +59,59 @@ CONCURRENCY=12 TOTAL_SAMPLES=12 RUN_LABEL=c12 \
   bash reports/run_sglang_qwen35_stable_c12_benchmark.sh
 ```
 
+vLLM-style request-profiler metrics are enabled by default. Disable them only
+when you need pure client-SSE timing without profiler overhead:
+
+```bash
+PROFILE_REQUESTS=0 CONCURRENCY=1 TOTAL_SAMPLES=1 RUN_LABEL=c1_no_profile \
+  bash reports/run_sglang_qwen35_stable_c12_benchmark.sh
+```
+
 Both commands default to `TRUNK_SIZE=40`, `SIL_OFFSET=700`, `TEMPERATURE=1.0`,
-and `BARRIER_PREFIX=1`.
+`BARRIER_PREFIX=0`, `PREFIX_MAX_TOKENS=2`, and `PROFILE_REQUESTS=1`. The
+profiler post-processes only actual requests, matching vLLM's pre-run filtering
+style.
 
 ## Realtime measurement shape
 
-The benchmark does not send a separate warmup request. For each sample it
-extends one realtime session prefix chunk by chunk, then measures the final
-streamed chunk.
+The benchmark does not send a separate warmup request. By default it mirrors
+the vLLM `run_rtc_profile.sh` concurrency shape: each concurrency worker runs
+one realtime session, sends incremental `pre_run` requests for chunks
+`1..TRUNK_SIZE`, then immediately sends the measured actual request for the
+same `TRUNK_SIZE`.
+
+For `CONCURRENCY=12`, that means 12 workers execute this sequence in parallel:
+
+```text
+session N: pre_run chunk 1 -> ... -> pre_run chunk 40 -> actual chunk 40
+```
+
+The default `PREFIX_MAX_TOKENS=2` also mirrors vLLM's current pre-run behavior.
+Set `PREFIX_MAX_TOKENS=0` if you specifically want pure cache-extension
+pre-runs, or set `BARRIER_PREFIX=1` to use the older all-prefixes-first barrier
+shape where measured actual requests start together after every prefix is done.
 
 For `TRUNK_SIZE=40`, the expected final chunk cache behavior is:
 
 ```text
-processor audio/video: 39 hits + 1 miss
-encoder audio/video:   39 hits + 1 miss
+processor audio/video: 40 hits + 0 misses
+encoder audio/video:   40 hits + 0 misses
 ```
 
-If a final request shows `40 hits + 0 misses`, it is probably reusing cache
-from a previous benchmark run and is not the correct realtime final-chunk
-measurement.
+Because the vLLM-style sequence pre-runs chunk 40 before the actual chunk 40,
+`40 hits + 0 misses` is the normal cache-hit result for the measured request.
+
+## Metric semantics
+
+`ttft_ms` is the first streamed text event observed by the client, and
+`ttfa_ms` is the first streamed audio event. `first_output_ms` records whichever
+streamed output event arrives first, with `first_output_type` showing whether it
+was text or audio. The raw SSE event timings are also saved as
+`first_text_event_ms` and `first_audio_event_ms`, with
+`text_audio_event_gap_ms = first_audio_event_ms - first_text_event_ms`. A
+negative gap means the server delivered an audio SSE event before a text SSE
+event; in that case `first_output_ms` is the best client-visible first-output
+latency, while `ttft_ms` remains strict text-event latency.
 
 ## Current reference numbers
 

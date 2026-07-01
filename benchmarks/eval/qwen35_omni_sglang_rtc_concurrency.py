@@ -3,8 +3,10 @@
 """Run concurrent SGLang Qwen3.5-Omni RTC-style sessions.
 
 Each session feeds realtime prefix chunks incrementally, then measures the
-final streamed chunk. The prefix requests are max_tokens=0 cache-extension
-requests, not separate warmup traffic.
+final streamed chunk. By default this mirrors the vLLM run_rtc_profile shape:
+each worker sends pre-run chunks 1..TRUNK_SIZE with max_tokens=2, then
+immediately streams the actual request for the same TRUNK_SIZE. Use
+--prefix-max-tokens 0 for pure cache-extension pre-runs.
 """
 
 from __future__ import annotations
@@ -77,6 +79,294 @@ def _audio_tail_rtf(row: dict[str, Any]) -> float | None:
     if tail_ms is None or duration_s is None or float(duration_s) <= 0:
         return None
     return float(tail_ms) / (float(duration_s) * 1000.0)
+
+
+def _profile_event_matches(
+    event: dict[str, Any],
+    *,
+    stage: str | None = None,
+    name: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> bool:
+    if stage is not None and event.get("stage") != stage:
+        return False
+    if name is not None and event.get("event_name") != name:
+        return False
+    if metadata:
+        event_metadata = event.get("metadata") or {}
+        for key, value in metadata.items():
+            if event_metadata.get(key) != value:
+                return False
+    return True
+
+
+def _profile_first_ms(
+    events: list[dict[str, Any]],
+    *,
+    stage: str | None = None,
+    name: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> float | None:
+    for event in events:
+        if _profile_event_matches(event, stage=stage, name=name, metadata=metadata):
+            value = event.get("t_rel_ms")
+            return float(value) if value is not None else None
+    return None
+
+
+def _profile_last_ms(
+    events: list[dict[str, Any]],
+    *,
+    stage: str | None = None,
+    name: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> float | None:
+    for event in reversed(events):
+        if _profile_event_matches(event, stage=stage, name=name, metadata=metadata):
+            value = event.get("t_rel_ms")
+            return float(value) if value is not None else None
+    return None
+
+
+def _profile_interval_ms(
+    events: list[dict[str, Any]],
+    *,
+    stage: str,
+    start: str,
+    end: str,
+    start_metadata: dict[str, Any] | None = None,
+    end_metadata: dict[str, Any] | None = None,
+) -> float | None:
+    start_ms = _profile_first_ms(
+        events, stage=stage, name=start, metadata=start_metadata
+    )
+    end_ms = _profile_first_ms(events, stage=stage, name=end, metadata=end_metadata)
+    if start_ms is None or end_ms is None:
+        return None
+    return max(0.0, end_ms - start_ms)
+
+
+def _profile_count_events(
+    events: list[dict[str, Any]],
+    *,
+    stage: str | None = None,
+    name: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> int:
+    return sum(
+        1
+        for event in events
+        if _profile_event_matches(event, stage=stage, name=name, metadata=metadata)
+    )
+
+
+def _profile_values(rows: list[dict[str, Any]], key: str) -> list[float]:
+    return [float(row[key]) for row in rows if row.get(key) is not None]
+
+
+def _profile_stat_fields(
+    rows: list[dict[str, Any]], key: str, prefix: str
+) -> dict[str, float | None]:
+    values = _profile_values(rows, key)
+    return {
+        f"{prefix}_avg_ms": _mean(values),
+        f"{prefix}_p50_ms": _percentile(values, 50),
+        f"{prefix}_p95_ms": _percentile(values, 95),
+        f"{prefix}_p99_ms": _percentile(values, 99),
+    }
+
+
+def _extract_vllm_style_profile_rows(
+    profile: dict[str, Any] | None, actual_request_ids: set[str]
+) -> list[dict[str, Any]]:
+    if not profile:
+        return []
+    timelines = profile.get("timelines") or {}
+    rows: list[dict[str, Any]] = []
+    for request_id, raw_events in timelines.items():
+        if request_id.startswith(("__prefix__", "__pr__")):
+            continue
+        events = sorted(raw_events, key=lambda event: float(event.get("t_rel_ms") or 0.0))
+        if not events:
+            continue
+
+        thinker_first_emit_ms = _profile_first_ms(
+            events, stage="thinker", name="scheduler_first_emit"
+        )
+        thinker_first_stream_sent_ms = _profile_first_ms(
+            events,
+            stage="thinker",
+            name="stage_first_stream_chunk_sent",
+            metadata={"to_stage": "decode"},
+        )
+        first_text_sent_ms = _profile_first_ms(
+            events,
+            stage="decode",
+            name="stage_first_stream_chunk_sent",
+            metadata={"modality": "text"},
+        )
+        first_text_received_ms = _profile_first_ms(
+            events,
+            stage="coordinator",
+            name="stage_stream_chunk_received",
+            metadata={"from_stage": "decode", "modality": "text"},
+        )
+        first_audio_sent_ms = _profile_first_ms(
+            events,
+            stage="code2wav",
+            name="stage_first_stream_chunk_sent",
+            metadata={"modality": "audio"},
+        )
+        first_audio_received_ms = _profile_first_ms(
+            events,
+            stage="coordinator",
+            name="stage_stream_chunk_received",
+            metadata={"from_stage": "code2wav", "modality": "audio"},
+        )
+        first_code2wav_input_ms = _profile_first_ms(
+            events,
+            stage="code2wav",
+            name="stage_stream_chunk_received",
+            metadata={"from_stage": "talker_ar"},
+        )
+        last_audio_received_ms = _profile_last_ms(
+            events,
+            stage="coordinator",
+            name="stage_stream_chunk_received",
+            metadata={"from_stage": "code2wav", "modality": "audio"},
+        )
+        profile_e2e_ms = (
+            float(events[-1].get("t_rel_ms")) if events[-1].get("t_rel_ms") is not None else None
+        )
+        if first_audio_sent_ms is None and first_audio_received_ms is None:
+            continue
+        code2wav_first_chunk_ms = (
+            first_audio_sent_ms - first_code2wav_input_ms
+            if first_audio_sent_ms is not None and first_code2wav_input_ms is not None
+            else None
+        )
+
+        row = {
+            "profile_request_id": request_id,
+            "profile_start_timestamp_ns": events[0].get("timestamp_ns"),
+            "profile_thinker_ttft_ms": thinker_first_emit_ms,
+            "profile_thinker_first_stream_sent_ms": thinker_first_stream_sent_ms,
+            "profile_e2e_ttfa_ms": first_audio_received_ms or first_audio_sent_ms,
+            "profile_first_audio_sent_ms": first_audio_sent_ms,
+            "profile_first_audio_received_ms": first_audio_received_ms,
+            "profile_first_text_sent_ms": first_text_sent_ms,
+            "profile_first_text_received_ms": first_text_received_ms,
+            "profile_e2e_total_ms": profile_e2e_ms,
+            "profile_last_audio_received_ms": last_audio_received_ms,
+            "profile_ttfa_thinker_prefill_ms": thinker_first_emit_ms,
+            "profile_hf_preproc_ms": _profile_interval_ms(
+                events,
+                stage="preprocessing",
+                start="preprocess_hf_processor_start",
+                end="preprocess_hf_processor_end",
+            ),
+            "profile_preprocessing_ms": _profile_interval_ms(
+                events,
+                stage="preprocessing",
+                start="stage_input_received",
+                end="stage_complete",
+            ),
+            "profile_image_encoder_ms": _profile_interval_ms(
+                events,
+                stage="image_encoder",
+                start="stage_input_received",
+                end="stage_complete",
+            ),
+            "profile_audio_encoder_ms": _profile_interval_ms(
+                events,
+                stage="audio_encoder",
+                start="stage_input_received",
+                end="stage_complete",
+            ),
+            "profile_mm_aggregate_ms": _profile_interval_ms(
+                events,
+                stage="mm_aggregate",
+                start="stage_input_received",
+                end="stage_complete",
+            ),
+            "profile_thinker_prefill_inner_ms": _profile_interval_ms(
+                events,
+                stage="thinker",
+                start="scheduler_prefill_start",
+                end="scheduler_first_emit",
+            ),
+            "profile_talker_prefill_ms": _profile_interval_ms(
+                events,
+                stage="talker_ar",
+                start="scheduler_prefill_start",
+                end="stage_first_stream_chunk_sent",
+            ),
+            "profile_code2wav_first_chunk_ms": code2wav_first_chunk_ms,
+            "profile_code2wav_total_ms": _profile_interval_ms(
+                events,
+                stage="code2wav",
+                start="stage_input_received",
+                end="stage_complete",
+            ),
+            "profile_audio_chunk_count": _profile_count_events(
+                events,
+                stage="code2wav",
+                name="stage_stream_chunk_sent",
+                metadata={"modality": "audio"},
+            ),
+        }
+        rows.append(row)
+    rows.sort(key=lambda row: int(row.get("profile_start_timestamp_ns") or 0))
+    return rows
+
+
+def _vllm_style_profile_metrics(profile_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not profile_rows:
+        return {"profile_num_requests": 0}
+    metrics: dict[str, Any] = {
+        "profile_num_requests": len(profile_rows),
+        "profile_stats_source": "sglang_request_profiler_vllm_style",
+        "profile_actual_filter": "timeline has code2wav audio stream output",
+        "profile_ttft_semantics": "request_admission->thinker.scheduler_first_emit",
+        "profile_ttfa_semantics": (
+            "request_admission->coordinator first audio chunk received from code2wav"
+        ),
+    }
+    metrics.update(
+        _profile_stat_fields(
+            profile_rows, "profile_thinker_ttft_ms", "profile_ttft"
+        )
+    )
+    metrics.update(
+        _profile_stat_fields(profile_rows, "profile_e2e_ttfa_ms", "profile_ttfa")
+    )
+    metrics.update(
+        _profile_stat_fields(
+            profile_rows, "profile_e2e_total_ms", "profile_e2e_total"
+        )
+    )
+    metrics.update(
+        _profile_stat_fields(
+            profile_rows, "profile_ttfa_thinker_prefill_ms", "profile_ttfa_thinker_prefill"
+        )
+    )
+    metrics.update(
+        _profile_stat_fields(profile_rows, "profile_hf_preproc_ms", "profile_ttfa_hf_preproc")
+    )
+    metrics.update(
+        _profile_stat_fields(
+            profile_rows, "profile_talker_prefill_ms", "profile_ttfa_talker_prefill"
+        )
+    )
+    metrics.update(
+        _profile_stat_fields(
+            profile_rows, "profile_code2wav_first_chunk_ms", "profile_ttfa_code2wav_first_chunk"
+        )
+    )
+    metrics["profile_audio_chunk_count_avg"] = _mean(
+        _profile_values(profile_rows, "profile_audio_chunk_count")
+    )
+    return metrics
 
 
 def _compact_error(exc: BaseException) -> str:
@@ -351,6 +641,9 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
 
     rows: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
+    profile_json: dict[str, Any] | None = None
+    profile_rows: list[dict[str, Any]] = []
+    profile_metrics: dict[str, Any] = {"profile_num_requests": 0}
     lock = asyncio.Lock()
 
     async def actual_worker(
@@ -550,12 +843,30 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                                 flush=True,
                             )
 
-            t0 = time.perf_counter()
-            await asyncio.gather(
-                *(session_worker(i) for i in range(args.concurrency))
-            )
-            elapsed_s = time.perf_counter() - t0
-            actual_elapsed_s = None
+            profile_started = False
+            try:
+                if profile_actual_run_id:
+                    await _start_request_profile(
+                        session,
+                        base_url=base_url,
+                        run_id=profile_actual_run_id,
+                        event_dir=profile_actual_event_dir,
+                    )
+                    profile_started = True
+
+                t0 = time.perf_counter()
+                await asyncio.gather(
+                    *(session_worker(i) for i in range(args.concurrency))
+                )
+                elapsed_s = time.perf_counter() - t0
+                actual_elapsed_s = None
+            finally:
+                if profile_started:
+                    await _stop_request_profile(
+                        session,
+                        base_url=base_url,
+                        run_id=profile_actual_run_id,
+                    )
 
     rows.sort(key=lambda item: int(item["sample_idx"]))
     errors.sort(key=lambda item: int(item["sample_idx"]))
@@ -563,6 +874,31 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     failed = len(errors)
     ttft = [float(row["ttft_ms"]) for row in rows if row.get("ttft_ms") is not None]
     ttfa = [float(row["ttfa_ms"]) for row in rows if row.get("ttfa_ms") is not None]
+    first_output = [
+        float(row["first_output_ms"])
+        for row in rows
+        if row.get("first_output_ms") is not None
+    ]
+    first_text_event = [
+        float(row["first_text_event_ms"])
+        for row in rows
+        if row.get("first_text_event_ms") is not None
+    ]
+    first_audio_event = [
+        float(row["first_audio_event_ms"])
+        for row in rows
+        if row.get("first_audio_event_ms") is not None
+    ]
+    text_audio_event_gap = [
+        float(row["text_audio_event_gap_ms"])
+        for row in rows
+        if row.get("text_audio_event_gap_ms") is not None
+    ]
+    audio_before_text_sample_indices = [
+        int(row["sample_idx"])
+        for row in rows
+        if (row.get("text_audio_event_gap_ms") or 0) < 0
+    ]
     last_audio = [
         float(row["last_audio_ms"])
         for row in rows
@@ -621,6 +957,21 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             ],
             check=True,
         )
+        profile_json = json.loads(profile_actual_json.read_text(encoding="utf-8"))
+        profile_rows = _extract_vllm_style_profile_rows(profile_json, set())
+        profile_by_request_id = {
+            str(row["profile_request_id"]): row for row in profile_rows
+        }
+        matched_profile_rows = 0
+        for row in rows:
+            profile_row = profile_by_request_id.get(str(row.get("request_id")))
+            if profile_row:
+                row.update(profile_row)
+                matched_profile_rows += 1
+        if matched_profile_rows == 0 and len(profile_rows) == len(rows):
+            for row, profile_row in zip(rows, profile_rows):
+                row.update(profile_row)
+        profile_metrics = _vllm_style_profile_metrics(profile_rows)
 
     metrics = {
         "trunk_size": args.trunk_size,
@@ -638,12 +989,21 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "skip_prerun": bool(args.skip_prerun),
         "realtime_prefix_trunk_size": args.trunk_size,
         "qps": completed / elapsed_s if elapsed_s > 0 else None,
+        "concurrency_shape": (
+            "serialized_prefix"
+            if args.serialize_prerun
+            else "barrier_prefix"
+            if args.barrier_prerun
+            else "vllm_pipeline"
+        ),
         "mode": "text" if args.text_only else "text_audio",
         "max_tokens": args.max_tokens,
         "prefix_max_tokens": args.prerun_max_tokens,
         "prerun_max_tokens": args.prerun_max_tokens,
         "bang_count": len(bang_sample_indices),
         "bang_sample_indices": bang_sample_indices,
+        "ttft_semantics": "first streamed text event",
+        "ttfa_semantics": "first streamed audio event",
         "ttft_avg_ms": _mean(ttft),
         "ttft_p50_ms": _percentile(ttft, 50),
         "ttft_p95_ms": _percentile(ttft, 95),
@@ -652,6 +1012,28 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "ttfa_p50_ms": _percentile(ttfa, 50),
         "ttfa_p95_ms": _percentile(ttfa, 95),
         "ttfa_p99_ms": _percentile(ttfa, 99),
+        "first_output_avg_ms": _mean(first_output),
+        "first_output_p50_ms": _percentile(first_output, 50),
+        "first_output_p95_ms": _percentile(first_output, 95),
+        "first_output_p99_ms": _percentile(first_output, 99),
+        "first_text_event_avg_ms": _mean(first_text_event),
+        "first_text_event_p50_ms": _percentile(first_text_event, 50),
+        "first_text_event_p95_ms": _percentile(first_text_event, 95),
+        "first_text_event_p99_ms": _percentile(first_text_event, 99),
+        "first_audio_event_avg_ms": _mean(first_audio_event),
+        "first_audio_event_p50_ms": _percentile(first_audio_event, 50),
+        "first_audio_event_p95_ms": _percentile(first_audio_event, 95),
+        "first_audio_event_p99_ms": _percentile(first_audio_event, 99),
+        "text_audio_event_gap_avg_ms": _mean(text_audio_event_gap),
+        "text_audio_event_gap_p50_ms": _percentile(text_audio_event_gap, 50),
+        "text_audio_event_gap_p95_ms": _percentile(text_audio_event_gap, 95),
+        "text_audio_event_gap_p99_ms": _percentile(text_audio_event_gap, 99),
+        "audio_before_text_event_count": len(audio_before_text_sample_indices),
+        "audio_before_text_sample_indices": audio_before_text_sample_indices,
+        "first_output_type_counts": {
+            name: sum(1 for row in rows if row.get("first_output_type") == name)
+            for name in ("text", "audio")
+        },
         "last_audio_avg_ms": _mean(last_audio),
         "last_audio_p50_ms": _percentile(last_audio, 50),
         "last_audio_p95_ms": _percentile(last_audio, 95),
@@ -692,6 +1074,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "errors": errors,
     }
+    metrics.update(profile_metrics)
     (out_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2, ensure_ascii=False),
         encoding="utf-8",
@@ -744,7 +1127,7 @@ def parse_args() -> argparse.Namespace:
         "--prefix-max-tokens",
         dest="prerun_max_tokens",
         type=int,
-        default=0,
+        default=2,
     )
     parser.add_argument(
         "--post-prerun-sleep-ms",
@@ -804,8 +1187,9 @@ def parse_args() -> argparse.Namespace:
         "--profile-actual-run-id",
         default=None,
         help=(
-            "Start request profiling after barrier/serialized prefix extension "
-            "completes, then stop it after the measured final chunk requests."
+            "Enable request profiling and write vLLM-style profile metrics. "
+            "In pipeline mode this profiles prefix and actual requests, then "
+            "filters prefix request IDs during post-processing."
         ),
     )
     parser.add_argument(
@@ -827,12 +1211,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--serialize-prefix and --barrier-prefix are mutually exclusive")
     if args.skip_prerun and (args.serialize_prerun or args.barrier_prerun):
         parser.error("--skip-prefix cannot be combined with prefix modes")
-    if args.profile_actual_run_id and not (
-        args.serialize_prerun or args.barrier_prerun
-    ):
-        parser.error(
-            "--profile-actual-run-id requires --serialize-prefix or --barrier-prefix"
-        )
     return args
 
 
