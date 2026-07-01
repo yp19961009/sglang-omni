@@ -33,6 +33,10 @@ _INLINE_CPU_STREAM_CHUNK_MAX_BYTES_ENV = (
     "SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES"
 )
 _INLINE_CPU_STREAM_CHUNK_DEFAULT_MAX_BYTES = 0
+_PREFERRED_INLINE_CPU_STREAM_CHUNK_DEFAULT_MAX_BYTES = 64 * 1024
+_PREFER_INLINE_CPU_STREAM_CHUNK_METADATA_KEY = (
+    "_prefer_inline_cpu_stream_chunk"
+)
 
 
 def _dtype_alignment(dtype: torch.dtype) -> int:
@@ -425,14 +429,19 @@ def _env_enabled(name: str) -> bool:
     return value.lower() not in ("", "0", "false", "no", "off")
 
 
-def _inline_cpu_stream_chunk_max_bytes() -> int:
+def _inline_cpu_stream_chunk_max_bytes(*, prefer_inline: bool = False) -> int:
     raw = os.getenv(_INLINE_CPU_STREAM_CHUNK_MAX_BYTES_ENV)
     if raw is None or raw == "":
+        if prefer_inline:
+            return _PREFERRED_INLINE_CPU_STREAM_CHUNK_DEFAULT_MAX_BYTES
         return _INLINE_CPU_STREAM_CHUNK_DEFAULT_MAX_BYTES
     try:
-        return max(0, int(raw))
+        configured = max(0, int(raw))
     except ValueError:
-        return _INLINE_CPU_STREAM_CHUNK_DEFAULT_MAX_BYTES
+        configured = _INLINE_CPU_STREAM_CHUNK_DEFAULT_MAX_BYTES
+    if prefer_inline and configured <= 0:
+        return _PREFERRED_INLINE_CPU_STREAM_CHUNK_DEFAULT_MAX_BYTES
+    return configured
 
 
 def _full_payload_cuda_ipc_max_control_bytes() -> int:
@@ -534,22 +543,29 @@ def _try_serialize_inline_cpu_chunk(
     data: Any,
     metadata: dict | None,
 ) -> dict[str, Any] | None:
-    max_bytes = _inline_cpu_stream_chunk_max_bytes()
+    prefer_inline = bool(
+        isinstance(metadata, dict)
+        and metadata.get(_PREFER_INLINE_CPU_STREAM_CHUNK_METADATA_KEY)
+    )
+    max_bytes = _inline_cpu_stream_chunk_max_bytes(prefer_inline=prefer_inline)
     if max_bytes <= 0:
         return None
+    inline_metadata = dict(metadata) if metadata else None
+    if inline_metadata:
+        inline_metadata.pop(_PREFER_INLINE_CPU_STREAM_CHUNK_METADATA_KEY, None)
     if _contains_cuda_tensor(data) or _contains_cuda_tensor(metadata):
         return None
     # Metadata tensors are often hidden states or codec-side side channels; keep
     # them on the relay path so the control plane only carries tiny token data.
-    if _contains_cpu_tensor(metadata):
+    if _contains_cpu_tensor(inline_metadata):
         return None
     try:
-        inline_metadata = serialize_inline_cpu_chunk(data, metadata)
+        serialized = serialize_inline_cpu_chunk(data, inline_metadata)
     except Exception:
         return None
-    if inline_metadata["payload_pickle_bytes"] > max_bytes:
+    if serialized["payload_pickle_bytes"] > max_bytes:
         return None
-    return inline_metadata
+    return serialized
 
 
 def deserialize_ipc_metadata(value: Any) -> Any:

@@ -722,8 +722,8 @@ def test_stage_streaming_payload_to_stream_target_uses_stream_endpoint() -> None
             role="single",
             get_next=lambda request_id, output: None,
             gpu_id=None,
-            endpoints={"decode": "inproc://decode"},
-            stream_endpoints={"decode": "inproc://decode-stream"},
+            endpoints={"talker_ar": "inproc://talker"},
+            stream_endpoints={"talker_ar": "inproc://talker-stream"},
             control_plane=control_plane,
             relay=relay,
             scheduler=SimpleNamespace(),
@@ -737,9 +737,9 @@ def test_stage_streaming_payload_to_stream_target_uses_stream_endpoint() -> None
         await asyncio.wait_for(
             stage._send_to_stage(
                 "req",
-                "decode",
+                "talker_ar",
                 payload,
-                stream_targets_for_request={"decode"},
+                stream_targets_for_request={"talker_ar"},
             ),
             timeout=0.5,
         )
@@ -748,8 +748,8 @@ def test_stage_streaming_payload_to_stream_target_uses_stream_endpoint() -> None
         assert control_plane.stage_messages == []
         assert len(control_plane.stream_stage_messages) == 1
         target, endpoint, msg = control_plane.stream_stage_messages[0]
-        assert target == "decode"
-        assert endpoint == "inproc://decode-stream"
+        assert target == "talker_ar"
+        assert endpoint == "inproc://talker-stream"
         assert isinstance(msg, DataReadyMessage)
         assert len(relay.puts) == 1
         assert len(stage._stream_relay_completion_tasks) == 1
@@ -870,6 +870,41 @@ def test_send_stream_chunk_uses_relay_for_cpu_chunk_by_default() -> None:
         assert len(control_plane.stage_messages) == 1
         _, _, msg = control_plane.stage_messages[0]
         assert "_inline_cpu" not in msg.shm_metadata
+
+    asyncio.run(_run())
+
+
+def test_send_stream_chunk_prefers_inline_cpu_chunk_by_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "0")
+
+    async def _run() -> None:
+        control_plane = _FakeControlPlane()
+        relay = _FakeRelay()
+
+        await relay_io.send_stream_chunk(
+            relay,
+            control_plane,
+            request_id="req",
+            data=11,
+            target_stage="decode",
+            target_endpoint="inproc://decode",
+            from_stage="thinker",
+            chunk_id=0,
+            metadata={
+                "token_id": 11,
+                "_prefer_inline_cpu_stream_chunk": True,
+            },
+        )
+
+        assert relay.puts == []
+        assert len(control_plane.stage_messages) == 1
+        _, _, msg = control_plane.stage_messages[0]
+        assert msg.shm_metadata["_inline_cpu"] is True
+        data, metadata = relay_io.deserialize_inline_cpu_chunk(msg.shm_metadata)
+        assert data == 11
+        assert metadata == {"token_id": 11}
 
     asyncio.run(_run())
 
@@ -1247,6 +1282,27 @@ def test_inline_cpu_stream_chunk_survives_control_plane_serialization() -> None:
     assert metadata == {"token_id": 123}
 
 
+def test_control_plane_decode_stream_priority_burst_defaults_high(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SGLANG_OMNI_STREAM_PRIORITY_BURST", raising=False)
+    monkeypatch.delenv("SGLANG_OMNI_STREAM_PRIORITY_BURST_DECODE", raising=False)
+
+    decode_plane = StageControlPlane(
+        "decode",
+        "inproc://decode-normal",
+        "inproc://coord",
+        "inproc://abort",
+        stream_recv_endpoint="inproc://decode-stream",
+    )
+    other_plane = StageControlPlane(
+        "talker_ar", "inproc://talker", "inproc://coord", "inproc://abort"
+    )
+
+    assert decode_plane._stream_priority_burst == 128
+    assert other_plane._stream_priority_burst == 4
+
+
 def test_control_plane_stream_priority_allows_normal_payload_fairness(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1467,6 +1523,45 @@ def test_async_stream_ingest_preserves_per_request_order(
 
     asyncio.run(_run())
 
+
+def test_decode_streaming_payload_stays_on_normal_endpoint() -> None:
+    scheduler = SimpleNamespace(
+        outbox=queue.Queue(),
+        inbox=queue.Queue(),
+        abort=lambda request_id: None,
+    )
+    stage = Stage(
+        name="thinker",
+        role="single",
+        get_next=lambda request_id, output: None,
+        gpu_id=None,
+        endpoints={
+            "decode": "inproc://decode-normal",
+            "talker_ar": "inproc://talker-normal",
+        },
+        stream_endpoints={
+            "decode": "inproc://decode-stream",
+            "talker_ar": "inproc://talker-stream",
+        },
+        control_plane=_FakeControlPlane(),
+        relay=_FakeRelay(),
+        scheduler=scheduler,
+    )
+    payload = StagePayload(
+        request_id="req",
+        request=OmniRequest(inputs={}, params={"stream": True}),
+        data={},
+    )
+
+    assert (
+        stage._payload_stream_endpoint(
+            "decode", payload, stream_targets_for_request={"decode"}
+        )
+        is None
+    )
+    assert stage._payload_stream_endpoint(
+        "talker_ar", payload, stream_targets_for_request={"talker_ar"}
+    ) == "inproc://talker-stream"
 
 def test_async_stream_ingest_yield_interval_can_be_stage_specific(
     monkeypatch: pytest.MonkeyPatch,

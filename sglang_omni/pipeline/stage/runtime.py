@@ -1284,6 +1284,10 @@ class Stage:
     ) -> str | None:
         if not _stream_payload_on_stream_endpoint_enabled():
             return None
+        if target == "decode":
+            # Decode accepts text token streams before the terminal payload; keep
+            # its stream endpoint reserved for latency-sensitive token chunks.
+            return None
         if stream_targets_for_request is None or target not in stream_targets_for_request:
             return None
         endpoint = self.stream_endpoints.get(target)

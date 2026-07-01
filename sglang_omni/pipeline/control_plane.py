@@ -331,12 +331,13 @@ class StageControlPlane:
         self._abort_socket: SubSocket | None = None
         self._next_stage_sockets: dict[str, PushSocket] = {}
         self._next_stage_stream_sockets: dict[str, PushSocket] = {}
+        stream_priority_burst_default = 128 if stage_name == "decode" else 4
         self._stream_priority_burst = max(
             1,
             _stage_env_int(
                 "SGLANG_OMNI_STREAM_PRIORITY_BURST",
                 stage_name,
-                4,
+                stream_priority_burst_default,
             ),
         )
         self._stream_priority_normal_wait_ms = max(

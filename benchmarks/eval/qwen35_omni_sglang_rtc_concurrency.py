@@ -575,6 +575,7 @@ async def _run_actual(
         "video_start_idx": offsets["video_start_idx"],
         "question_idx": offsets["question_idx"],
     }
+    row["client_first_text_event_ms"] = row.get("first_text_event_ms")
     row["last_audio_ms"] = _last_audio_ms(row)
     row["audio_tail_ms"] = _audio_tail_ms(row)
     row["finish_tail_ms"] = _finish_tail_ms(row)
@@ -872,14 +873,13 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     errors.sort(key=lambda item: int(item["sample_idx"]))
     completed = len(rows)
     failed = len(errors)
-    ttft = [float(row["ttft_ms"]) for row in rows if row.get("ttft_ms") is not None]
     ttfa = [float(row["ttfa_ms"]) for row in rows if row.get("ttfa_ms") is not None]
     first_output = [
         float(row["first_output_ms"])
         for row in rows
         if row.get("first_output_ms") is not None
     ]
-    first_text_event = [
+    client_first_text_event = [
         float(row["first_text_event_ms"])
         for row in rows
         if row.get("first_text_event_ms") is not None
@@ -964,14 +964,34 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         }
         matched_profile_rows = 0
         for row in rows:
+            row.setdefault("client_first_text_event_ms", row.get("first_text_event_ms"))
             profile_row = profile_by_request_id.get(str(row.get("request_id")))
             if profile_row:
                 row.update(profile_row)
                 matched_profile_rows += 1
         if matched_profile_rows == 0 and len(profile_rows) == len(rows):
             for row, profile_row in zip(rows, profile_rows):
+                row.setdefault("client_first_text_event_ms", row.get("first_text_event_ms"))
                 row.update(profile_row)
         profile_metrics = _vllm_style_profile_metrics(profile_rows)
+
+    profile_ttft = _profile_values(rows, "profile_thinker_ttft_ms")
+    if profile_ttft:
+        ttft = profile_ttft
+        ttft_semantics = "first token: request_admission->thinker.scheduler_first_emit"
+        for row in rows:
+            if row.get("profile_thinker_ttft_ms") is not None:
+                row.setdefault("client_first_text_event_ms", row.get("first_text_event_ms"))
+                row["ttft_ms"] = row["profile_thinker_ttft_ms"]
+                row["ttft_semantics"] = ttft_semantics
+    else:
+        ttft = client_first_text_event
+        ttft_semantics = "first streamed text event (fallback; request profile unavailable)"
+        for row in rows:
+            row.setdefault("client_first_text_event_ms", row.get("first_text_event_ms"))
+            row["ttft_semantics"] = ttft_semantics
+
+    first_text_event = client_first_text_event
 
     metrics = {
         "trunk_size": args.trunk_size,
@@ -1002,7 +1022,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "prerun_max_tokens": args.prerun_max_tokens,
         "bang_count": len(bang_sample_indices),
         "bang_sample_indices": bang_sample_indices,
-        "ttft_semantics": "first streamed text event",
+        "ttft_semantics": ttft_semantics,
         "ttfa_semantics": "first streamed audio event",
         "ttft_avg_ms": _mean(ttft),
         "ttft_p50_ms": _percentile(ttft, 50),
@@ -1020,6 +1040,10 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "first_text_event_p50_ms": _percentile(first_text_event, 50),
         "first_text_event_p95_ms": _percentile(first_text_event, 95),
         "first_text_event_p99_ms": _percentile(first_text_event, 99),
+        "client_first_text_event_avg_ms": _mean(client_first_text_event),
+        "client_first_text_event_p50_ms": _percentile(client_first_text_event, 50),
+        "client_first_text_event_p95_ms": _percentile(client_first_text_event, 95),
+        "client_first_text_event_p99_ms": _percentile(client_first_text_event, 99),
         "first_audio_event_avg_ms": _mean(first_audio_event),
         "first_audio_event_p50_ms": _percentile(first_audio_event, 50),
         "first_audio_event_p95_ms": _percentile(first_audio_event, 95),
@@ -1075,6 +1099,17 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "errors": errors,
     }
     metrics.update(profile_metrics)
+    for row in rows:
+        try:
+            sample_idx = int(row["sample_idx"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        result_path = out_dir / f"sample_{sample_idx:02d}" / "result.json"
+        if result_path.exists():
+            result_path.write_text(
+                json.dumps(row, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
     (out_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2, ensure_ascii=False),
         encoding="utf-8",

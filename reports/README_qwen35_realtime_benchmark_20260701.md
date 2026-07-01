@@ -103,15 +103,17 @@ Because the vLLM-style sequence pre-runs chunk 40 before the actual chunk 40,
 
 ## Metric semantics
 
-`ttft_ms` is the first streamed text event observed by the client, and
+`ttft_ms` / `ttft_*` means first token by default. When request profiling is
+enabled, it is measured from request admission to `thinker.scheduler_first_emit`,
+matching the vLLM-style TTFT definition. If the profiler is unavailable, the
+benchmark falls back to the first streamed text event and records that fallback
+in `ttft_semantics`. The client-observed first text event is kept separately as
+`client_first_text_event_ms` and as the backward-compatible `first_text_event_ms`.
+
 `ttfa_ms` is the first streamed audio event. `first_output_ms` records whichever
 streamed output event arrives first, with `first_output_type` showing whether it
-was text or audio. The raw SSE event timings are also saved as
-`first_text_event_ms` and `first_audio_event_ms`, with
-`text_audio_event_gap_ms = first_audio_event_ms - first_text_event_ms`. A
-negative gap means the server delivered an audio SSE event before a text SSE
-event; in that case `first_output_ms` is the best client-visible first-output
-latency, while `ttft_ms` remains strict text-event latency.
+was text or audio. Raw SSE timing also includes `first_audio_event_ms` and
+`text_audio_event_gap_ms = first_audio_event_ms - first_text_event_ms`.
 
 ## Current reference numbers
 

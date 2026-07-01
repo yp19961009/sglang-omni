@@ -125,6 +125,7 @@ for k in [
     "profile_ttfa_talker_prefill_avg_ms",
     "profile_ttfa_code2wav_first_chunk_avg_ms",
     "first_text_event_avg_ms", "first_text_event_p99_ms",
+    "client_first_text_event_avg_ms", "client_first_text_event_p99_ms",
     "first_audio_event_avg_ms", "first_audio_event_p99_ms",
     "audio_before_text_event_count", "audio_before_text_sample_indices",
     "last_audio_avg_ms", "last_audio_p99_ms",

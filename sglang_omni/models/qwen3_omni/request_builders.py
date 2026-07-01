@@ -43,6 +43,9 @@ _DECODE_STREAM_TOKEN_BATCH_SIZE_ENV = "SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZ
 _DECODE_STREAM_IMMEDIATE_TOKEN_COUNT_ENV = (
     "SGLANG_OMNI_DECODE_STREAM_IMMEDIATE_TOKEN_COUNT"
 )
+_PREFER_INLINE_CPU_STREAM_CHUNK_METADATA_KEY = (
+    "_prefer_inline_cpu_stream_chunk"
+)
 _DECODE_STREAM_BATCH_STATE_MAX = 10000
 _DEBUG_THINKER_INPUTS_ENV = "SGLANG_OMNI_DEBUG_THINKER_INPUTS"
 _DEBUG_THINKER_INPUTS_ALL_ENV = "SGLANG_OMNI_DEBUG_THINKER_INPUTS_ALL"
@@ -167,21 +170,19 @@ def _make_decode_stream_message(
     token_ids: list[int],
 ) -> OutgoingMessage:
     if len(token_ids) == 1:
-        metadata = {"token_id": token_ids[0]}
-        if _inline_cpu_stream_chunks_enabled():
-            data: int | list[int] | torch.Tensor = token_ids[0]
-        else:
-            data = torch.tensor(token_ids, dtype=torch.long)
+        metadata = {
+            "token_id": token_ids[0],
+            _PREFER_INLINE_CPU_STREAM_CHUNK_METADATA_KEY: True,
+        }
+        data: int | list[int] | torch.Tensor = token_ids[0]
     else:
         metadata = {
             "token_id": token_ids[-1],
             "token_ids": list(token_ids),
             "token_count": len(token_ids),
+            _PREFER_INLINE_CPU_STREAM_CHUNK_METADATA_KEY: True,
         }
-        if _inline_cpu_stream_chunks_enabled():
-            data = list(token_ids)
-        else:
-            data = torch.tensor(token_ids, dtype=torch.long)
+        data = list(token_ids)
 
     return OutgoingMessage(
         request_id=request_id,
