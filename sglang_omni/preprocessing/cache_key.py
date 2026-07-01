@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+import os
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -8,6 +10,27 @@ import numpy as np
 import torch
 import xxhash
 from PIL import Image
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return max(int(value), 0)
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+_PATH_HASH_CACHE_SIZE = _env_int("SGLANG_OMNI_MEDIA_PATH_HASH_CACHE_SIZE", 8192)
+_HASH_IN_MEMORY_MEDIA = _env_bool("SGLANG_OMNI_MEDIA_IN_MEMORY_HASH", False)
 
 
 def _is_url_like(s: str) -> bool:
@@ -24,6 +47,27 @@ def hash_bytes(payload: bytes | bytearray | memoryview) -> str:
     return xxhash.xxh3_64(payload).hexdigest()
 
 
+@lru_cache(maxsize=_PATH_HASH_CACHE_SIZE)
+def _hash_file_sampled_cached(
+    path: str,
+    file_size: int,
+    mtime_ns: int,
+    head_size: int,
+    tail_size: int,
+) -> str:
+    del mtime_ns
+    with open(path, "rb") as f:
+        head = f.read(head_size)
+        if file_size > head_size + tail_size:
+            f.seek(-tail_size, 2)
+            tail = f.read(tail_size)
+        else:
+            tail = b""
+
+    payload = head + tail + f"|size:{file_size}".encode()
+    return xxhash.xxh3_64(payload).hexdigest()
+
+
 def hash_file_sampled(
     path: str | Path,
     head_size: int = 8192,
@@ -36,18 +80,14 @@ def hash_file_sampled(
     affects file size and/or head/tail bytes.
     """
     path = Path(path)
-    file_size = path.stat().st_size
-
-    with open(path, "rb") as f:
-        head = f.read(head_size)
-        if file_size > head_size + tail_size:
-            f.seek(-tail_size, 2)  # Seek from end
-            tail = f.read(tail_size)
-        else:
-            tail = b""  # Small file, head already covers it
-
-    payload = head + tail + f"|size:{file_size}".encode()
-    return xxhash.xxh3_64(payload).hexdigest()
+    stat = path.stat()
+    return _hash_file_sampled_cached(
+        str(path),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(head_size),
+        int(tail_size),
+    )
 
 
 def hash_media_item(item: Any) -> str | None:
@@ -55,10 +95,9 @@ def hash_media_item(item: Any) -> str | None:
 
     Supported types:
     - str/Path: local file -> sampled hash; URL -> string hash
-    - PIL.Image: mode + size + content hash
-    - numpy.ndarray: dtype + shape + content hash
-    - torch.Tensor: dtype + shape + content hash
-    - bytes/bytearray: content hash
+    - PIL.Image / numpy.ndarray / torch.Tensor / bytes: content hash only when
+      SGLANG_OMNI_MEDIA_IN_MEMORY_HASH=1. The default avoids expensive
+      tobytes()/GPU-to-CPU copies in hot request paths.
 
     Returns None for unsupported types (caller should skip caching).
     """
@@ -74,18 +113,24 @@ def hash_media_item(item: Any) -> str | None:
 
     # PIL Image
     if isinstance(item, Image.Image):
+        if not _HASH_IN_MEMORY_MEDIA:
+            return None
         meta = f"{item.mode}|{item.size}"
         content_hash = hash_bytes(item.tobytes())
         return f"pil:{meta}:{content_hash}"
 
     # numpy array
     if isinstance(item, np.ndarray):
+        if not _HASH_IN_MEMORY_MEDIA:
+            return None
         meta = f"{item.dtype}|{item.shape}"
         content_hash = hash_bytes(item.tobytes())
         return f"np:{meta}:{content_hash}"
 
     # torch Tensor
     if isinstance(item, torch.Tensor):
+        if not _HASH_IN_MEMORY_MEDIA:
+            return None
         cpu = item.detach().cpu()
         meta = f"{cpu.dtype}|{tuple(cpu.shape)}"
         content_hash = hash_bytes(cpu.numpy().tobytes())
@@ -93,6 +138,8 @@ def hash_media_item(item: Any) -> str | None:
 
     # Raw bytes
     if isinstance(item, (bytes, bytearray, memoryview)):
+        if not _HASH_IN_MEMORY_MEDIA:
+            return None
         return f"bytes:{hash_bytes(item)}"
 
     # Unsupported type

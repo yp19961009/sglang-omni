@@ -704,6 +704,12 @@ class Qwen3OmniPreprocessor:
 
     async def _call_impl(self, payload: StagePayload) -> StagePayload:
         inputs = payload.request.inputs
+        request_metadata = getattr(payload.request, "metadata", None)
+        media_cache_namespace = None
+        if isinstance(request_metadata, dict):
+            namespace = request_metadata.get("media_cache_namespace")
+            if isinstance(namespace, str) and namespace:
+                media_cache_namespace = namespace
         if isinstance(inputs, dict):
             messages = inputs.get("messages", [])
             tools = inputs.get("tools")
@@ -1063,6 +1069,7 @@ class Qwen3OmniPreprocessor:
 
         contextual_image_cache_key = _contextualize_cache_key(
             image_cache_key,
+            cache_namespace=media_cache_namespace,
             min_pixels=resolved_image_min_pixels,
             max_pixels=resolved_image_max_pixels,
         )
@@ -1070,6 +1077,7 @@ class Qwen3OmniPreprocessor:
             raw_value=raw_images,
             compute_cache_key=compute_image_cache_key,
             context_by_index=lambda _index: {
+                "cache_namespace": media_cache_namespace,
                 "min_pixels": resolved_image_min_pixels,
                 "max_pixels": resolved_image_max_pixels,
             },
@@ -1081,6 +1089,7 @@ class Qwen3OmniPreprocessor:
             effective_video_fps = (resolved_video_fps,)
         contextual_video_cache_key = _contextualize_cache_key(
             video_cache_key,
+            cache_namespace=media_cache_namespace,
             fps=effective_video_fps,
             max_frames=resolved_video_max_frames,
             min_frames=resolved_video_min_frames,
@@ -1104,6 +1113,7 @@ class Qwen3OmniPreprocessor:
             else:
                 fps_context = None
             return {
+                "cache_namespace": media_cache_namespace,
                 "fps": fps_context,
                 "max_frames": resolved_video_max_frames,
                 "min_frames": resolved_video_min_frames,
@@ -1122,7 +1132,10 @@ class Qwen3OmniPreprocessor:
         audio_item_cache_keys = _media_item_cache_keys_for_request(
             raw_value=raw_audios,
             compute_cache_key=compute_audio_cache_key,
-            context_by_index=lambda _index: {"target_sr": int(audio_target_sr)},
+            context_by_index=lambda _index: {
+                "cache_namespace": media_cache_namespace,
+                "target_sr": int(audio_target_sr),
+            },
         )
         processor_kwargs = self._processor_kwargs_for_request(
             request_inputs=inputs,
@@ -1254,6 +1267,7 @@ class Qwen3OmniPreprocessor:
         contextualized_audio_cache_key = _contextualize_cache_key(
             raw_audio_cache_key,
             audio_is_dependent=audio_is_dependent,
+            cache_namespace=media_cache_namespace,
             target_sr=audio_target_sr,
             use_audio_in_video=(
                 self._processor_use_audio_in_video_value(use_audio_in_video)
@@ -1267,6 +1281,7 @@ class Qwen3OmniPreprocessor:
                 _contextualize_cache_key(
                     video_cache_key,
                     audio_is_dependent=audio_is_dependent,
+                    cache_namespace=media_cache_namespace,
                     extracted_audio=True,
                     target_sr=audio_target_sr,
                     use_audio_in_video=(

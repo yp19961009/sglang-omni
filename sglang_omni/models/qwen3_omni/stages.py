@@ -55,6 +55,8 @@ _IMAGE_ENCODER_BATCH_BUDGET_BYTES_ENV = (
 _IMAGE_ENCODER_ITEM_BATCH_BUDGET_BYTES_ENV = (
     "SGLANG_OMNI_IMAGE_ENCODER_ITEM_BATCH_BUDGET_BYTES"
 )
+_TRACE_ENCODER_CACHE_ENV = "SGLANG_OMNI_TRACE_ENCODER_CACHE"
+_TRACE_ENCODER_CACHE_DETAIL_ENV = "SGLANG_OMNI_TRACE_ENCODER_CACHE_DETAIL"
 _VISUAL_ITEM_BATCH_STATS_ENV = "SGLANG_OMNI_VISUAL_ITEM_BATCH_STATS"
 _COMPACT_VISUAL_ENCODER_RESULTS_ENV = "SGLANG_OMNI_COMPACT_VISUAL_ENCODER_RESULTS"
 _COMPACT_AUDIO_ENCODER_RESULTS_ENV = "SGLANG_OMNI_COMPACT_AUDIO_ENCODER_RESULTS"
@@ -539,12 +541,29 @@ def _visual_item_pixel_present(
     return [bool(item) for item in raw_mask]
 
 
+def _visual_item_pixel_fallbacks(
+    request: Any,
+    *,
+    modality: str,
+    rows: int,
+) -> list[Any | None] | None:
+    if rows <= 0:
+        return []
+    raw_fallbacks = getattr(request, "item_pixel_fallbacks", {}).get(modality)
+    if raw_fallbacks is None:
+        return [None] * rows
+    if len(raw_fallbacks) != rows:
+        return None
+    return list(raw_fallbacks)
+
+
 def _split_visual_items(
     *,
     model_inputs: dict[str, Any],
     modality: str,
     item_keys: list[str | None],
     pixel_present: list[bool],
+    pixel_fallbacks: list[Any | None] | None = None,
     merge: int,
 ) -> list[dict[str, Any]] | None:
     if modality == "image":
@@ -565,6 +584,8 @@ def _split_visual_items(
     if len(item_keys) != int(grid.shape[0]):
         return None
     if len(pixel_present) != int(grid.shape[0]):
+        return None
+    if pixel_fallbacks is not None and len(pixel_fallbacks) != int(grid.shape[0]):
         return None
 
     grid_long = grid.to(dtype=torch.long)
@@ -587,6 +608,9 @@ def _split_visual_items(
                 "modality": modality,
                 "cache_key": item_keys[row],
                 "pixels": pixels[cursor:end] if has_pixels else None,
+                "fallback_pixels": (
+                    None if pixel_fallbacks is None else pixel_fallbacks[row]
+                ),
                 "grid": grid[row : row + 1],
                 "token_count": patch_count // merge,
                 "result": None,
@@ -604,30 +628,35 @@ def _lookup_visual_item_result(
 ) -> bool:
     cache_key = item.get("cache_key")
     if cache is None or cache_key is None:
+        item["cache_status"] = "no_key"
         return False
     cached = cache.get(cache_key)
     if cached is None:
+        item["cache_status"] = "miss"
+        if _encoder_cache_detail_enabled():
+            _trace_encoder_cache(
+                IMAGE_STAGE,
+                "item_miss",
+                request_id=request_id,
+                cache_key=cache_key,
+                input_bytes=_nested_tensor_bytes(
+                    {"pixels": item.get("pixels"), "grid": item.get("grid")}
+                ),
+            )
+        return False
+    item["result"] = cached
+    item["cache_status"] = "hit"
+    if _encoder_cache_detail_enabled():
         _trace_encoder_cache(
             IMAGE_STAGE,
-            "item_miss",
+            "item_hit",
             request_id=request_id,
             cache_key=cache_key,
             input_bytes=_nested_tensor_bytes(
                 {"pixels": item.get("pixels"), "grid": item.get("grid")}
             ),
+            output_bytes=_nested_tensor_bytes(cached),
         )
-        return False
-    item["result"] = cached
-    _trace_encoder_cache(
-        IMAGE_STAGE,
-        "item_hit",
-        request_id=request_id,
-        cache_key=cache_key,
-        input_bytes=_nested_tensor_bytes(
-            {"pixels": item.get("pixels"), "grid": item.get("grid")}
-        ),
-        output_bytes=_nested_tensor_bytes(cached),
-    )
     return True
 
 
@@ -662,6 +691,14 @@ def _prepare_visual_item_cache_plan(
     )
     if image_pixel_present is None or video_pixel_present is None:
         return None
+    image_pixel_fallbacks = _visual_item_pixel_fallbacks(
+        request, modality="image", rows=image_rows
+    )
+    video_pixel_fallbacks = _visual_item_pixel_fallbacks(
+        request, modality="video", rows=video_rows
+    )
+    if image_pixel_fallbacks is None or video_pixel_fallbacks is None:
+        return None
     if not any(key is not None for key in (*image_keys, *video_keys)):
         return None
 
@@ -671,6 +708,7 @@ def _prepare_visual_item_cache_plan(
         modality="image",
         item_keys=image_keys,
         pixel_present=image_pixel_present,
+        pixel_fallbacks=image_pixel_fallbacks,
         merge=merge,
     )
     video_items = _split_visual_items(
@@ -678,6 +716,7 @@ def _prepare_visual_item_cache_plan(
         modality="video",
         item_keys=video_keys,
         pixel_present=video_pixel_present,
+        pixel_fallbacks=video_pixel_fallbacks,
         merge=merge,
     )
     if image_items is None or video_items is None:
@@ -689,11 +728,14 @@ def _prepare_visual_item_cache_plan(
             item=item, request_id=payload.request_id, cache=cache
         )
         if item["result"] is None and item.get("pixels") is None:
+            item["pixels"] = item.get("fallback_pixels")
+        if item["result"] is None and item.get("pixels") is None:
             raise RuntimeError(
                 "Visual item payload was omitted but encoder item cache missed "
                 f"for {item['modality']} key={item.get('cache_key')!r}. "
-                "Disable SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS or "
-                "increase the encoder cache capacity."
+                "Disable SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS, "
+                "enable SGLANG_OMNI_CACHED_VIDEO_PIXEL_FALLBACKS, or increase "
+                "the encoder cache capacity."
             )
 
     return _VisualItemCachePlan(
@@ -977,16 +1019,18 @@ def _encode_visual_item_batch(
         cache_key = item.get("cache_key")
         if cache is not None and cache_key is not None:
             cache.put(cache_key, item_result)
-            _trace_encoder_cache(
-                IMAGE_STAGE,
-                "item_store",
-                request_id=str(item.get("request_id", "item")),
-                cache_key=cache_key,
-                input_bytes=_nested_tensor_bytes(
-                    {"pixels": item.get("pixels"), "grid": item.get("grid")}
-                ),
-                output_bytes=_nested_tensor_bytes(item_result),
-            )
+            item["cache_stored"] = True
+            if _encoder_cache_detail_enabled():
+                _trace_encoder_cache(
+                    IMAGE_STAGE,
+                    "item_store",
+                    request_id=str(item.get("request_id", "item")),
+                    cache_key=cache_key,
+                    input_bytes=_nested_tensor_bytes(
+                        {"pixels": item.get("pixels"), "grid": item.get("grid")}
+                    ),
+                    output_bytes=_nested_tensor_bytes(item_result),
+                )
     del combined, batched_inputs
     _empty_image_encoder_cache_if_requested()
 
@@ -1032,6 +1076,11 @@ def _execute_visual_item_cache_plans(
         _copy_visual_item_results_to_duplicates(missing_items, duplicate_items)
 
     for plan in plans:
+        _trace_encoder_item_cache_summary(
+            IMAGE_STAGE,
+            plan.payload.request_id,
+            [*plan.image_items, *plan.video_items],
+        )
         stage_result = _combine_visual_item_results(plan)
         if _store_item_plan_combined_encoder_cache_enabled():
             _store_cached_encoder_output(
@@ -1099,12 +1148,21 @@ def _create_image_encoder_request_cost_fn(
         )
         if image_pixel_present is None or video_pixel_present is None:
             return None
+        image_pixel_fallbacks = _visual_item_pixel_fallbacks(
+            request, modality="image", rows=image_rows
+        )
+        video_pixel_fallbacks = _visual_item_pixel_fallbacks(
+            request, modality="video", rows=video_rows
+        )
+        if image_pixel_fallbacks is None or video_pixel_fallbacks is None:
+            return None
 
         image_items = _split_visual_items(
             model_inputs=model_inputs,
             modality="image",
             item_keys=image_keys,
             pixel_present=image_pixel_present,
+            pixel_fallbacks=image_pixel_fallbacks,
             merge=merge,
         )
         video_items = _split_visual_items(
@@ -1112,6 +1170,7 @@ def _create_image_encoder_request_cost_fn(
             modality="video",
             item_keys=video_keys,
             pixel_present=video_pixel_present,
+            pixel_fallbacks=video_pixel_fallbacks,
             merge=merge,
         )
         if image_items is None or video_items is None:
@@ -1122,6 +1181,8 @@ def _create_image_encoder_request_cost_fn(
             cache_key = item.get("cache_key")
             if cache_key is not None and _cache_has(cache_key):
                 continue
+            if item.get("pixels") is None:
+                item["pixels"] = item.get("fallback_pixels")
             if item.get("pixels") is None:
                 continue
             cost += _visual_item_cost(item, model=model)
@@ -1157,7 +1218,14 @@ def _nested_tensor_bytes(value: Any) -> int:
 
 
 def _encoder_cache_trace_enabled() -> bool:
-    return _env_bool("SGLANG_OMNI_TRACE_ENCODER_CACHE", default=False)
+    return _env_bool(_TRACE_ENCODER_CACHE_ENV, default=False)
+
+
+def _encoder_cache_detail_enabled() -> bool:
+    return _encoder_cache_trace_enabled() and _env_bool(
+        _TRACE_ENCODER_CACHE_DETAIL_ENV,
+        default=False,
+    )
 
 
 def _store_item_plan_combined_encoder_cache_enabled() -> bool:
@@ -1203,6 +1271,59 @@ def _trace_encoder_cache(
     logger.info("encoder_cache %s", " ".join(parts))
 
 
+def _trace_encoder_item_cache_summary(
+    stage_name: str,
+    request_id: str,
+    items: list[dict[str, Any]],
+) -> None:
+    if not _encoder_cache_trace_enabled() or not items:
+        return
+    by_modality: dict[str, dict[str, int]] = {}
+    for item in items:
+        modality = str(item.get("modality") or stage_name)
+        stats = by_modality.setdefault(
+            modality,
+            {
+                "items": 0,
+                "keyed": 0,
+                "hits": 0,
+                "misses": 0,
+                "stores": 0,
+                "no_key": 0,
+            },
+        )
+        stats["items"] += 1
+        if item.get("cache_key") is None:
+            stats["no_key"] += 1
+        else:
+            stats["keyed"] += 1
+        status = item.get("cache_status")
+        if status == "hit":
+            stats["hits"] += 1
+        elif status == "miss":
+            stats["misses"] += 1
+        if item.get("cache_stored"):
+            stats["stores"] += 1
+
+    for modality, stats in by_modality.items():
+        keyed = stats["keyed"]
+        hit_rate = (stats["hits"] / keyed) if keyed > 0 else 0.0
+        logger.info(
+            "encoder_cache_summary stage=%s req=%s modality=%s items=%s "
+            "keyed=%s hits=%s misses=%s stores=%s no_key=%s hit_rate=%.4f",
+            stage_name,
+            request_id,
+            modality,
+            stats["items"],
+            keyed,
+            stats["hits"],
+            stats["misses"],
+            stats["stores"],
+            stats["no_key"],
+            hit_rate,
+        )
+
+
 def _lookup_cached_encoder_output(
     *,
     request: Any,
@@ -1213,13 +1334,16 @@ def _lookup_cached_encoder_output(
     if cache is None or request.cache_key is None:
         return None
     cached = cache.get(request.cache_key)
+    trace_detail = _encoder_cache_detail_enabled()
     if cached is None:
         _trace_encoder_cache(
             stage_name,
             "miss",
             request_id=request_id,
             cache_key=request.cache_key,
-            input_bytes=_nested_tensor_bytes(request.model_inputs),
+            input_bytes=(
+                _nested_tensor_bytes(request.model_inputs) if trace_detail else None
+            ),
         )
         return None
     _trace_encoder_cache(
@@ -1227,8 +1351,10 @@ def _lookup_cached_encoder_output(
         "hit",
         request_id=request_id,
         cache_key=request.cache_key,
-        input_bytes=_nested_tensor_bytes(request.model_inputs),
-        output_bytes=_nested_tensor_bytes(cached),
+        input_bytes=(
+            _nested_tensor_bytes(request.model_inputs) if trace_detail else None
+        ),
+        output_bytes=_nested_tensor_bytes(cached) if trace_detail else None,
     )
     return cached
 
@@ -1244,13 +1370,16 @@ def _store_cached_encoder_output(
     if cache is None or request.cache_key is None:
         return
     cache.put(request.cache_key, result)
+    trace_detail = _encoder_cache_detail_enabled()
     _trace_encoder_cache(
         stage_name,
         "store",
         request_id=request_id,
         cache_key=request.cache_key,
-        input_bytes=_nested_tensor_bytes(request.model_inputs),
-        output_bytes=_nested_tensor_bytes(result),
+        input_bytes=(
+            _nested_tensor_bytes(request.model_inputs) if trace_detail else None
+        ),
+        output_bytes=_nested_tensor_bytes(result) if trace_detail else None,
     )
 
 
@@ -1320,12 +1449,17 @@ def _batch_image_encoder_payloads(
         cache_key = request.cache_key
         if cache_key is not None and cache_key in active_cache_keys:
             duplicate_waiters.setdefault(cache_key, []).append((idx, payload, state))
+            trace_detail = _encoder_cache_detail_enabled()
             _trace_encoder_cache(
                 IMAGE_STAGE,
                 "dedup_same_batch",
                 request_id=payload.request_id,
                 cache_key=cache_key,
-                input_bytes=_nested_tensor_bytes(request.model_inputs),
+                input_bytes=(
+                    _nested_tensor_bytes(request.model_inputs)
+                    if trace_detail
+                    else None
+                ),
                 detail=f"leader={active_cache_leaders[cache_key]}",
             )
             continue
@@ -1588,12 +1722,32 @@ def _lookup_audio_item_result(
 ) -> None:
     cache_key = item.get("cache_key")
     if cache is None or cache_key is None:
+        item["cache_status"] = "no_key"
         return
     cached = cache.get(cache_key)
     if cached is None:
+        item["cache_status"] = "miss"
+        if _encoder_cache_detail_enabled():
+            _trace_encoder_cache(
+                AUDIO_STAGE,
+                "item_miss",
+                request_id=request_id,
+                cache_key=cache_key,
+                input_bytes=_nested_tensor_bytes(
+                    {
+                        "features": item.get("features"),
+                        "mask": item.get("mask"),
+                        "length": item.get("length"),
+                    }
+                ),
+            )
+        return
+    item["result"] = cached
+    item["cache_status"] = "hit"
+    if _encoder_cache_detail_enabled():
         _trace_encoder_cache(
             AUDIO_STAGE,
-            "item_miss",
+            "item_hit",
             request_id=request_id,
             cache_key=cache_key,
             input_bytes=_nested_tensor_bytes(
@@ -1603,23 +1757,8 @@ def _lookup_audio_item_result(
                     "length": item.get("length"),
                 }
             ),
+            output_bytes=_nested_tensor_bytes(cached),
         )
-        return
-    item["result"] = cached
-    _trace_encoder_cache(
-        AUDIO_STAGE,
-        "item_hit",
-        request_id=request_id,
-        cache_key=cache_key,
-        input_bytes=_nested_tensor_bytes(
-            {
-                "features": item.get("features"),
-                "mask": item.get("mask"),
-                "length": item.get("length"),
-            }
-        ),
-        output_bytes=_nested_tensor_bytes(cached),
-    )
 
 
 def _prepare_audio_item_cache_plan(
@@ -1643,6 +1782,7 @@ def _prepare_audio_item_cache_plan(
     for row, cache_key in enumerate(item_keys):
         length = lengths[row : row + 1]
         item = {
+            "modality": "audio",
             "cache_key": cache_key,
             "features": features[row : row + 1],
             "mask": mask[row : row + 1],
@@ -1733,22 +1873,29 @@ def _execute_audio_item_cache_plans(
             cache_key = item.get("cache_key")
             if cache is not None and cache_key is not None:
                 cache.put(cache_key, item_result)
-                _trace_encoder_cache(
-                    AUDIO_STAGE,
-                    "item_store",
-                    request_id=str(item.get("request_id", "item")),
-                    cache_key=cache_key,
-                    input_bytes=_nested_tensor_bytes(
-                        {
-                            "features": item.get("features"),
-                            "mask": item.get("mask"),
-                            "length": item.get("length"),
-                        }
-                    ),
-                    output_bytes=_nested_tensor_bytes(item_result),
-                )
+                item["cache_stored"] = True
+                if _encoder_cache_detail_enabled():
+                    _trace_encoder_cache(
+                        AUDIO_STAGE,
+                        "item_store",
+                        request_id=str(item.get("request_id", "item")),
+                        cache_key=cache_key,
+                        input_bytes=_nested_tensor_bytes(
+                            {
+                                "features": item.get("features"),
+                                "mask": item.get("mask"),
+                                "length": item.get("length"),
+                            }
+                        ),
+                        output_bytes=_nested_tensor_bytes(item_result),
+                    )
 
     for plan in plans:
+        _trace_encoder_item_cache_summary(
+            AUDIO_STAGE,
+            plan.payload.request_id,
+            plan.items,
+        )
         stage_result = _combine_audio_item_results(plan)
         if _store_item_plan_combined_encoder_cache_enabled():
             _store_cached_encoder_output(

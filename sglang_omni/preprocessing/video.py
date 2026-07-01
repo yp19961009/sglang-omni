@@ -86,6 +86,45 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _trace_video_preprocess_cache_enabled() -> bool:
+    return _env_bool("SGLANG_OMNI_TRACE_VIDEO_PREPROCESS_CACHE", default=False)
+
+
+def _short_cache_key(cache_key: str | None) -> str:
+    if not cache_key:
+        return "-"
+    if len(cache_key) <= 32:
+        return cache_key
+    return f"{cache_key[:16]}...{cache_key[-8:]}"
+
+
+def _trace_video_preprocess_cache(
+    action: str,
+    *,
+    cache_key: str | None,
+    path: str | Path | None = None,
+    size_bytes: int | None = None,
+    detail: str | None = None,
+) -> None:
+    if not _trace_video_preprocess_cache_enabled():
+        return
+    logger.info(
+        "video_preprocess_cache action=%s key=%s path=%s size_bytes=%s detail=%s",
+        action,
+        _short_cache_key(cache_key),
+        str(path) if path is not None else "-",
+        size_bytes if size_bytes is not None else "-",
+        detail or "-",
+    )
+
+
 def _video_preprocess_cache_max_entries() -> int:
     return _env_int(
         "SGLANG_OMNI_VIDEO_PREPROCESS_CACHE_MAX_ENTRIES",
@@ -131,8 +170,12 @@ def _video_preprocess_cache_get(
     with _VIDEO_PREPROCESS_CACHE_LOCK:
         entry = _VIDEO_PREPROCESS_CACHE.get(cache_key)
         if entry is None:
+            _trace_video_preprocess_cache("miss", cache_key=cache_key)
             return None
         _VIDEO_PREPROCESS_CACHE.move_to_end(cache_key)
+        _trace_video_preprocess_cache(
+            "hit", cache_key=cache_key, size_bytes=entry.size_bytes
+        )
         return entry.value
 
 
@@ -148,6 +191,12 @@ def _video_preprocess_cache_put(
         return
     size_bytes = _video_result_size_bytes(value)
     if size_bytes > max_bytes:
+        _trace_video_preprocess_cache(
+            "skip_store_oversize",
+            cache_key=cache_key,
+            size_bytes=size_bytes,
+            detail=f"max_bytes={max_bytes}",
+        )
         return
     with _VIDEO_PREPROCESS_CACHE_LOCK:
         old_entry = _VIDEO_PREPROCESS_CACHE.pop(cache_key, None)
@@ -159,12 +208,27 @@ def _video_preprocess_cache_put(
         )
         _VIDEO_PREPROCESS_CACHE_BYTES += size_bytes
         _VIDEO_PREPROCESS_CACHE.move_to_end(cache_key)
+        _trace_video_preprocess_cache(
+            "store", cache_key=cache_key, size_bytes=size_bytes
+        )
         while len(_VIDEO_PREPROCESS_CACHE) > max_entries:
-            _, entry = _VIDEO_PREPROCESS_CACHE.popitem(last=False)
+            evicted_key, entry = _VIDEO_PREPROCESS_CACHE.popitem(last=False)
             _VIDEO_PREPROCESS_CACHE_BYTES -= entry.size_bytes
+            _trace_video_preprocess_cache(
+                "evict_entries",
+                cache_key=evicted_key,
+                size_bytes=entry.size_bytes,
+                detail=f"max_entries={max_entries}",
+            )
         while _VIDEO_PREPROCESS_CACHE_BYTES > max_bytes and _VIDEO_PREPROCESS_CACHE:
-            _, entry = _VIDEO_PREPROCESS_CACHE.popitem(last=False)
+            evicted_key, entry = _VIDEO_PREPROCESS_CACHE.popitem(last=False)
             _VIDEO_PREPROCESS_CACHE_BYTES -= entry.size_bytes
+            _trace_video_preprocess_cache(
+                "evict_bytes",
+                cache_key=evicted_key,
+                size_bytes=entry.size_bytes,
+                detail=f"max_bytes={max_bytes}",
+            )
 
 
 def clear_video_preprocess_cache() -> None:
@@ -433,6 +497,7 @@ async def _load_local_video_with_cache(
 
     cached = _video_preprocess_cache_get(cache_key)
     if cached is not None:
+        _trace_video_preprocess_cache("return_hit", cache_key=cache_key, path=video_path)
         return cached
 
     loop = asyncio.get_running_loop()
@@ -441,6 +506,9 @@ async def _load_local_video_with_cache(
         inflight = _VIDEO_PREPROCESS_INFLIGHT.get(cache_key)
         if inflight is not None and inflight[0] is loop and not inflight[1].done():
             task = inflight[1]
+            _trace_video_preprocess_cache(
+                "wait_inflight", cache_key=cache_key, path=video_path
+            )
         else:
             task = loop.create_task(
                 _load_local_video_uncached(
@@ -458,6 +526,9 @@ async def _load_local_video_with_cache(
             )
             _VIDEO_PREPROCESS_INFLIGHT[cache_key] = (loop, task)
             is_leader = True
+            _trace_video_preprocess_cache(
+                "decode_start", cache_key=cache_key, path=video_path
+            )
 
     try:
         result = await asyncio.shield(task)

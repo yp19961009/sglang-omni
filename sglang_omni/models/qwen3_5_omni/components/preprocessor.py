@@ -87,6 +87,8 @@ _OMIT_CACHED_VISUAL_ITEM_PAYLOADS_ENV = (
 _VIDEO_PROCESSOR_CACHE_CLONE_ON_HIT_ENV = (
     "SGLANG_OMNI_VIDEO_PROCESSOR_CACHE_CLONE_ON_HIT"
 )
+_TRACE_PROCESSOR_CACHE_ENV = "SGLANG_OMNI_TRACE_PROCESSOR_CACHE"
+_TRACE_PROCESSOR_CACHE_DETAIL_ENV = "SGLANG_OMNI_TRACE_PROCESSOR_CACHE_DETAIL"
 _IMAGE_REQUEST_INPUT_ALIASES = (
     "images",
     "input_images",
@@ -162,6 +164,86 @@ def _request_bool_value_or_list(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_request_bool_value(item) for item in value]
     return _request_bool_value(value)
+
+
+def _trace_processor_cache_enabled() -> bool:
+    raw = os.getenv(_TRACE_PROCESSOR_CACHE_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _trace_processor_cache_detail_enabled() -> bool:
+    if not _trace_processor_cache_enabled():
+        return False
+    raw = os.getenv(_TRACE_PROCESSOR_CACHE_DETAIL_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _short_processor_cache_key(cache_key: Any) -> str:
+    if cache_key is None:
+        return "-"
+    text = repr(cache_key)
+    if len(text) <= 80:
+        return text
+    return f"{text[:48]}...{text[-16:]}"
+
+
+def _trace_processor_cache(
+    modality: str | None,
+    action: str,
+    *,
+    cache_key: Any,
+    index: int | None = None,
+    cache_entries: int | None = None,
+    detail: str | None = None,
+) -> None:
+    if not _trace_processor_cache_detail_enabled():
+        return
+    logger.info(
+        "qwen35_processor_cache modality=%s action=%s index=%s key=%s "
+        "cache_entries=%s detail=%s",
+        modality or "-",
+        action,
+        index if index is not None else "-",
+        _short_processor_cache_key(cache_key),
+        cache_entries if cache_entries is not None else "-",
+        detail or "-",
+    )
+
+
+def _trace_processor_cache_summary(
+    modality: str,
+    *,
+    item_count: int,
+    hit_count: int,
+    miss_count: int,
+    store_count: int,
+    no_key_count: int,
+    cache_entries: int,
+    detail: str | None = None,
+) -> None:
+    if not _trace_processor_cache_enabled():
+        return
+    keyed_count = item_count - no_key_count
+    hit_rate = (hit_count / keyed_count) if keyed_count > 0 else 0.0
+    logger.info(
+        "qwen35_processor_cache_summary modality=%s items=%s keyed=%s "
+        "hits=%s misses=%s stores=%s no_key=%s hit_rate=%.4f "
+        "cache_entries=%s detail=%s",
+        modality,
+        item_count,
+        keyed_count,
+        hit_count,
+        miss_count,
+        store_count,
+        no_key_count,
+        hit_rate,
+        cache_entries,
+        detail or "-",
+    )
 
 
 def _freeze_processor_cache_value(value: Any) -> Any:
@@ -288,6 +370,13 @@ def _video_processor_cache_clone_on_hit_enabled() -> bool:
     value = os.getenv(_VIDEO_PROCESSOR_CACHE_CLONE_ON_HIT_ENV)
     if value is None or value == "":
         return True
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def _cached_video_pixel_fallbacks_enabled() -> bool:
+    value = os.getenv("SGLANG_OMNI_CACHED_VIDEO_PIXEL_FALLBACKS")
+    if value is None or value == "":
+        return False
     return value.lower() not in ("0", "false", "no", "off")
 
 
@@ -534,6 +623,10 @@ class _Qwen35ProcessorShim:
                 audio_timestamp_interval=output_kwargs["audio_timestamp_interval"],
                 use_audio_in_video=iter(video_inputs.pop("use_audio_in_video", [])),
             )
+            video_pixel_fallbacks = video_inputs.pop(
+                "video_item_pixel_fallbacks",
+                None,
+            )
             _emit_processor_profile_event(
                 profile_request_id, "replace_tokens_end", profile_metadata
             )
@@ -554,10 +647,13 @@ class _Qwen35ProcessorShim:
             )
             from transformers.feature_extraction_utils import BatchFeature
 
-            return BatchFeature(
+            batch = BatchFeature(
                 data={**text_inputs, **image_inputs, **video_inputs, **audio_inputs},
                 tensor_type=return_tensors,
             )
+            if video_pixel_fallbacks is not None:
+                batch["video_item_pixel_fallbacks"] = video_pixel_fallbacks
+            return batch
         finally:
             _emit_processor_profile_event(
                 profile_request_id, "call_end", profile_metadata
@@ -825,6 +921,9 @@ class _Qwen35ProcessorShim:
         miss_indices: list[int] = []
         miss_audio: list[Any] = []
         cache_keys_by_index: list[Any | None] = []
+        hit_count = 0
+        no_key_count = 0
+        trace_detail = _trace_processor_cache_detail_enabled()
         for index, sample in enumerate(padded_audio):
             del sample
             cache_key = self._processor_item_cache_key(
@@ -835,14 +934,22 @@ class _Qwen35ProcessorShim:
             )
             cache_keys_by_index.append(cache_key)
             cached = self._processor_cache_get(
-                self._audio_item_processor_cache, cache_key
+                self._audio_item_processor_cache,
+                cache_key,
+                modality="audio",
+                index=index,
+                trace_detail=trace_detail,
             )
             if cached is not None:
+                hit_count += 1
                 entries[index] = cached
                 continue
+            if cache_key is None:
+                no_key_count += 1
             miss_indices.append(index)
             miss_audio.append(padded_audio[index])
 
+        store_count = 0
         if miss_audio:
             miss_inputs = self._extract_audio_features(miss_audio, audio_kwargs)
             miss_entries = self._split_batch_inputs(miss_inputs, len(miss_audio))
@@ -853,7 +960,22 @@ class _Qwen35ProcessorShim:
                     self._audio_item_processor_cache,
                     cache_keys_by_index[index],
                     entry,
+                    modality="audio",
+                    index=index,
+                    trace_detail=trace_detail,
                 )
+                if cache_keys_by_index[index] is not None:
+                    store_count += 1
+
+        _trace_processor_cache_summary(
+            "audio",
+            item_count=len(padded_audio),
+            hit_count=hit_count,
+            miss_count=len(miss_indices) - no_key_count,
+            store_count=store_count,
+            no_key_count=no_key_count,
+            cache_entries=len(self._audio_item_processor_cache),
+        )
 
         return self._combine_audio_entries(
             [entry for entry in entries if entry is not None]
@@ -899,6 +1021,12 @@ class _Qwen35ProcessorShim:
         miss_videos: list[Any] = []
         cache_keys_by_index: list[Any | None] = []
         pixel_present: list[bool] = []
+        pixel_fallbacks: list[Any | None] = [None] * len(videos)
+        omit_cached_pixels = _omit_cached_visual_item_payloads_enabled()
+        keep_pixel_fallbacks = omit_cached_pixels and _cached_video_pixel_fallbacks_enabled()
+        hit_count = 0
+        no_key_count = 0
+        trace_detail = _trace_processor_cache_detail_enabled()
         for index, video in enumerate(videos):
             per_item_kwargs = self._select_item_processor_kwargs(
                 video_kwargs,
@@ -914,16 +1042,32 @@ class _Qwen35ProcessorShim:
             cached = self._processor_cache_get(
                 self._video_item_processor_cache,
                 cache_key,
-                clone=_video_processor_cache_clone_on_hit_enabled(),
+                modality="video",
+                index=index,
+                clone=(
+                    _video_processor_cache_clone_on_hit_enabled()
+                    and not omit_cached_pixels
+                ),
+                trace_detail=trace_detail,
             )
             if cached is not None:
-                pixel_present.append(True)
-                entries[index] = cached
+                hit_count += 1
+                if omit_cached_pixels:
+                    pixel_present.append(False)
+                    if keep_pixel_fallbacks:
+                        pixel_fallbacks[index] = cached[0].get("pixel_values_videos")
+                    entries[index] = _video_entry_with_empty_pixels(cached)
+                else:
+                    pixel_present.append(True)
+                    entries[index] = cached
                 continue
+            if cache_key is None:
+                no_key_count += 1
             pixel_present.append(True)
             miss_indices.append(index)
             miss_videos.append(video)
 
+        store_count = 0
         if miss_videos:
             miss_kwargs = self._select_item_processor_kwargs(
                 video_kwargs,
@@ -945,13 +1089,33 @@ class _Qwen35ProcessorShim:
                     self._video_item_processor_cache,
                     cache_keys_by_index[index],
                     entry,
+                    modality="video",
+                    index=index,
+                    trace_detail=trace_detail,
                 )
+                if cache_keys_by_index[index] is not None:
+                    store_count += 1
 
         combined, metadata = self._combine_video_entries(
             [entry for entry in entries if entry is not None]
         )
         if pixel_present and not all(pixel_present):
             combined["video_item_pixel_present"] = pixel_present
+            if any(item is not None for item in pixel_fallbacks):
+                combined["video_item_pixel_fallbacks"] = pixel_fallbacks
+        _trace_processor_cache_summary(
+            "video",
+            item_count=len(videos),
+            hit_count=hit_count,
+            miss_count=len(miss_indices) - no_key_count,
+            store_count=store_count,
+            no_key_count=no_key_count,
+            cache_entries=len(self._video_item_processor_cache),
+            detail=(
+                f"omit_cached_pixels={int(omit_cached_pixels)} "
+                f"pixel_fallbacks={int(keep_pixel_fallbacks)}"
+            ),
+        )
         return combined, metadata
 
     def _can_use_item_cache(self, item_cache_keys, item_count: int) -> bool:
@@ -966,15 +1130,38 @@ class _Qwen35ProcessorShim:
         cache: OrderedDict,
         cache_key: Any,
         *,
+        modality: str | None = None,
+        index: int | None = None,
         clone: bool = True,
+        trace_detail: bool = False,
     ):
         if cache_key is None:
+            if trace_detail:
+                _trace_processor_cache(
+                    modality, "skip_get_no_key", cache_key=cache_key, index=index
+                )
             return None
         try:
             value = cache.pop(cache_key)
         except KeyError:
+            if trace_detail:
+                _trace_processor_cache(
+                    modality,
+                    "miss",
+                    cache_key=cache_key,
+                    index=index,
+                    cache_entries=len(cache),
+                )
             return None
         cache[cache_key] = value
+        if trace_detail:
+            _trace_processor_cache(
+                modality,
+                "hit",
+                cache_key=cache_key,
+                index=index,
+                cache_entries=len(cache),
+            )
         if clone:
             return _clone_processor_cache_value(value)
         return value
@@ -984,13 +1171,38 @@ class _Qwen35ProcessorShim:
         cache: OrderedDict,
         cache_key: Any,
         value: Any,
+        *,
+        modality: str | None = None,
+        index: int | None = None,
+        trace_detail: bool = False,
     ) -> None:
         if cache_key is None:
+            if trace_detail:
+                _trace_processor_cache(
+                    modality, "skip_store_no_key", cache_key=cache_key, index=index
+                )
             return
         cache[cache_key] = _clone_processor_cache_value(value)
         cache.move_to_end(cache_key)
+        if trace_detail:
+            _trace_processor_cache(
+                modality,
+                "store",
+                cache_key=cache_key,
+                index=index,
+                cache_entries=len(cache),
+            )
         while len(cache) > _PROCESSOR_ITEM_CACHE_MAX_ENTRIES:
-            cache.popitem(last=False)
+            evicted_key, _ = cache.popitem(last=False)
+            if trace_detail:
+                _trace_processor_cache(
+                    modality,
+                    "evict_entries",
+                    cache_key=evicted_key,
+                    index=index,
+                    cache_entries=len(cache),
+                    detail=f"max_entries={_PROCESSOR_ITEM_CACHE_MAX_ENTRIES}",
+                )
 
     def _processor_item_cache_key(
         self,

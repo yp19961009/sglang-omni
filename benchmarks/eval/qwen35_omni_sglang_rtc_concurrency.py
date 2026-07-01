@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Run concurrent SGLang Qwen3.5-Omni RTC-style sessions.
 
-Each session mirrors the vLLM RTC client shape: pre_run trunk 1..T to warm
-prefix/MM caches, then one measured actual_run at trunk T.
+Each session feeds realtime prefix chunks incrementally, then measures the
+final streamed chunk. The prefix requests are max_tokens=0 cache-extension
+requests, not separate warmup traffic.
 """
 
 from __future__ import annotations
@@ -168,7 +169,7 @@ def _apply_talker_request_options(
             payload[name] = value
 
 
-async def _run_preruns(
+async def _run_prefix_extensions(
     *,
     session: aiohttp.ClientSession,
     args: argparse.Namespace,
@@ -178,7 +179,7 @@ async def _run_preruns(
     request_id = context["request_id"]
     media_cache_namespace = context["media_cache_namespace"]
     offsets = context["offsets"]
-    pre_run_times: list[float] = []
+    prefix_times: list[float] = []
     for trunk in range(1, args.trunk_size + 1):
         messages = make_rtc_messages(
             test_dir=Path(args.rtc_test_dir),
@@ -202,17 +203,18 @@ async def _run_preruns(
             "stream": False,
             "video_fps": args.video_fps,
             "metadata": {
-                "request_id": f"__pr__{request_id}_t{trunk}",
+                "request_id": f"__prefix__{request_id}_t{trunk}",
                 "media_cache_namespace": media_cache_namespace,
                 "trunk_size": trunk,
                 "pre_run": True,
+                "realtime_prefix": True,
             },
         }
         _apply_video_request_options(payload, args)
         t0 = time.perf_counter()
         await post_chat(session, api_url=api_url, payload=payload, stream=False)
-        pre_run_times.append((time.perf_counter() - t0) * 1000.0)
-    return pre_run_times
+        prefix_times.append((time.perf_counter() - t0) * 1000.0)
+    return prefix_times
 
 
 async def _run_actual(
@@ -221,7 +223,7 @@ async def _run_actual(
     args: argparse.Namespace,
     api_url: str,
     context: dict[str, Any],
-    pre_run_times: list[float],
+    prefix_times: list[float],
 ) -> dict[str, Any]:
     request_id = context["request_id"]
     media_cache_namespace = context["media_cache_namespace"]
@@ -274,8 +276,10 @@ async def _run_actual(
         "sample_idx": sample_idx,
         "success": True,
         "error": None,
-        "pre_run_total_ms": sum(pre_run_times),
-        "pre_run_avg_ms": _mean(pre_run_times),
+        "prefix_total_ms": sum(prefix_times),
+        "prefix_avg_ms": _mean(prefix_times),
+        "pre_run_total_ms": sum(prefix_times),
+        "pre_run_avg_ms": _mean(prefix_times),
         "batch_idx": offsets["batch_idx"],
         "sil_start_idx": offsets["sil_start_idx"],
         "video_start_idx": offsets["video_start_idx"],
@@ -308,9 +312,9 @@ async def _run_session(
 ) -> dict[str, Any]:
     context = _session_context(args, out_dir, sample_idx)
     if args.skip_prerun:
-        pre_run_times = []
+        prefix_times = []
     else:
-        pre_run_times = await _run_preruns(
+        prefix_times = await _run_prefix_extensions(
             session=session, args=args, api_url=api_url, context=context
         )
         if args.post_prerun_sleep_ms > 0:
@@ -320,7 +324,7 @@ async def _run_session(
         args=args,
         api_url=api_url,
         context=context,
-        pre_run_times=pre_run_times,
+        prefix_times=prefix_times,
     )
 
 
@@ -353,7 +357,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         *,
         session: aiohttp.ClientSession,
         queue: asyncio.Queue[dict[str, Any] | None],
-        pre_run_by_sample: dict[int, list[float]],
+        prefix_by_sample: dict[int, list[float]],
         worker_idx: int,
     ) -> None:
         if worker_idx and args.stagger_ms > 0:
@@ -369,7 +373,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                     args=args,
                     api_url=api_url,
                     context=context,
-                    pre_run_times=pre_run_by_sample.get(sample_idx, []),
+                    prefix_times=prefix_by_sample.get(sample_idx, []),
                 )
                 async with lock:
                     rows.append(row)
@@ -395,21 +399,21 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 _session_context(args, out_dir, sample_idx)
                 for sample_idx in range(args.total_samples)
             ]
-            pre_run_by_sample: dict[int, list[float]] = {}
+            prefix_by_sample: dict[int, list[float]] = {}
 
-            pre_t0 = time.perf_counter()
+            prefix_t0 = time.perf_counter()
             if args.serialize_prerun:
                 for context in contexts:
                     sample_idx = int(context["sample_idx"])
-                    pre_run_by_sample[sample_idx] = await _run_preruns(
+                    prefix_by_sample[sample_idx] = await _run_prefix_extensions(
                         session=session,
                         args=args,
                         api_url=api_url,
                         context=context,
                     )
                     print(
-                        f"prerun completed sample={sample_idx} "
-                        f"total_ms={sum(pre_run_by_sample[sample_idx]):.3f}",
+                        f"prefix completed sample={sample_idx} "
+                        f"total_ms={sum(prefix_by_sample[sample_idx]):.3f}",
                         flush=True,
                     )
             else:
@@ -419,7 +423,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 for _ in range(args.concurrency):
                     pre_queue.put_nowait(None)
 
-                async def prerun_worker(worker_idx: int) -> None:
+                async def prefix_worker(worker_idx: int) -> None:
                     if worker_idx and args.stagger_ms > 0:
                         await asyncio.sleep(worker_idx * args.stagger_ms / 1000.0)
                     while True:
@@ -428,7 +432,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                             return
                         sample_idx = int(context["sample_idx"])
                         try:
-                            times = await _run_preruns(
+                            times = await _run_prefix_extensions(
                                 session=session,
                                 args=args,
                                 api_url=api_url,
@@ -443,28 +447,28 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                             async with lock:
                                 errors.append(err)
                                 print(
-                                    f"failed prerun sample={sample_idx}: "
+                                    f"failed prefix sample={sample_idx}: "
                                     f"{err['error']}",
                                     flush=True,
                                 )
                             continue
                         async with lock:
-                            pre_run_by_sample[sample_idx] = times
+                            prefix_by_sample[sample_idx] = times
                             print(
-                                f"prerun completed {len(pre_run_by_sample)}/"
+                                f"prefix completed {len(prefix_by_sample)}/"
                                 f"{args.total_samples} sample={sample_idx} "
                                 f"total_ms={sum(times):.3f}",
                                 flush=True,
                             )
 
                 await asyncio.gather(
-                    *(prerun_worker(i) for i in range(args.concurrency))
+                    *(prefix_worker(i) for i in range(args.concurrency))
                 )
-            pre_elapsed_s = time.perf_counter() - pre_t0
+            prefix_elapsed_s = time.perf_counter() - prefix_t0
 
             queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
             for context in contexts:
-                if int(context["sample_idx"]) not in pre_run_by_sample:
+                if int(context["sample_idx"]) not in prefix_by_sample:
                     continue
                 queue.put_nowait(context)
             for _ in range(args.concurrency):
@@ -489,7 +493,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                         actual_worker(
                             session=session,
                             queue=queue,
-                            pre_run_by_sample=pre_run_by_sample,
+                            prefix_by_sample=prefix_by_sample,
                             worker_idx=i,
                         )
                         for i in range(args.concurrency)
@@ -503,7 +507,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                         base_url=base_url,
                         run_id=profile_actual_run_id,
                     )
-            elapsed_s = pre_elapsed_s + actual_elapsed_s
+            elapsed_s = prefix_elapsed_s + actual_elapsed_s
         else:
             queue: asyncio.Queue[int | None] = asyncio.Queue()
             for sample_idx in range(args.total_samples):
@@ -626,12 +630,17 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "failed": failed,
         "elapsed_s": elapsed_s,
         "actual_elapsed_s": actual_elapsed_s,
+        "serialize_prefix": bool(args.serialize_prerun),
+        "barrier_prefix": bool(args.barrier_prerun),
+        "skip_prefix": bool(args.skip_prerun),
         "serialize_prerun": bool(args.serialize_prerun),
         "barrier_prerun": bool(args.barrier_prerun),
         "skip_prerun": bool(args.skip_prerun),
+        "realtime_prefix_trunk_size": args.trunk_size,
         "qps": completed / elapsed_s if elapsed_s > 0 else None,
         "mode": "text" if args.text_only else "text_audio",
         "max_tokens": args.max_tokens,
+        "prefix_max_tokens": args.prerun_max_tokens,
         "prerun_max_tokens": args.prerun_max_tokens,
         "bang_count": len(bang_sample_indices),
         "bang_sample_indices": bang_sample_indices,
@@ -730,8 +739,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-chunks-per-turn", type=int, default=6)
     parser.add_argument("--max-tokens", type=int, default=64)
-    parser.add_argument("--prerun-max-tokens", type=int, default=0)
-    parser.add_argument("--post-prerun-sleep-ms", type=int, default=0)
+    parser.add_argument(
+        "--prerun-max-tokens",
+        "--prefix-max-tokens",
+        dest="prerun_max_tokens",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--post-prerun-sleep-ms",
+        "--post-prefix-sleep-ms",
+        dest="post_prerun_sleep_ms",
+        type=int,
+        default=0,
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--talker-temperature", type=float, default=None)
     parser.add_argument("--talker-top-k", type=int, default=None)
@@ -750,35 +771,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-only", action="store_true")
     parser.add_argument(
         "--skip-prerun",
+        "--skip-prefix",
+        dest="skip_prerun",
         action="store_true",
         help=(
-            "Skip RTC cache-population pre-run requests and measure one actual "
-            "trunk-size request per session. This matches chunkwise realtime "
-            "latency runs where only the final streamed request is measured."
+            "Skip RTC prefix-extension requests and measure one full trunk-size "
+            "request per session."
         ),
     )
     parser.add_argument(
         "--serialize-prerun",
+        "--serialize-prefix",
+        dest="serialize_prerun",
         action="store_true",
         help=(
-            "Run all RTC pre-run cache population requests serially, then launch "
-            "the measured actual requests at the requested concurrency."
+            "Run all RTC prefix-extension requests serially, then launch the "
+            "measured final chunk requests at the requested concurrency."
         ),
     )
     parser.add_argument(
         "--barrier-prerun",
+        "--barrier-prefix",
+        dest="barrier_prerun",
         action="store_true",
         help=(
-            "Run RTC pre-run cache population requests concurrently at the requested "
-            "concurrency, wait for all of them, then launch measured actual requests."
+            "Run RTC prefix-extension requests concurrently at the requested "
+            "concurrency, wait for all of them, then launch measured final chunk "
+            "requests."
         ),
     )
     parser.add_argument(
         "--profile-actual-run-id",
         default=None,
         help=(
-            "Start request profiling after barrier/serialized pre-run completes, "
-            "then stop it after the measured actual requests."
+            "Start request profiling after barrier/serialized prefix extension "
+            "completes, then stop it after the measured final chunk requests."
         ),
     )
     parser.add_argument(
@@ -797,14 +824,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-s", type=float, default=1800)
     args = parser.parse_args()
     if args.serialize_prerun and args.barrier_prerun:
-        parser.error("--serialize-prerun and --barrier-prerun are mutually exclusive")
+        parser.error("--serialize-prefix and --barrier-prefix are mutually exclusive")
     if args.skip_prerun and (args.serialize_prerun or args.barrier_prerun):
-        parser.error("--skip-prerun cannot be combined with pre-run modes")
+        parser.error("--skip-prefix cannot be combined with prefix modes")
     if args.profile_actual_run_id and not (
         args.serialize_prerun or args.barrier_prerun
     ):
         parser.error(
-            "--profile-actual-run-id requires --serialize-prerun or --barrier-prerun"
+            "--profile-actual-run-id requires --serialize-prefix or --barrier-prefix"
         )
     return args
 
