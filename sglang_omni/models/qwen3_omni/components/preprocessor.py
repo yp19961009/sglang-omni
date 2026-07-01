@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 _OMIT_CACHED_VISUAL_ITEM_PAYLOADS_ENV = (
     "SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS"
 )
+_TRACE_CACHE_SUMMARY_SCOPE_ENV = "SGLANG_OMNI_TRACE_CACHE_SUMMARY_SCOPE"
+_TRACE_CACHE_SUMMARY_PROCESSOR_KEY = "_sglang_omni_trace_cache_summary"
 _OPENAI_AUDIO_OUTPUT_CONFIG_KEYS = frozenset(
     {
         "format",
@@ -314,6 +316,23 @@ def _media_item_cache_keys_for_request(
 def _omit_cached_visual_item_payloads_enabled() -> bool:
     value = os.getenv(_OMIT_CACHED_VISUAL_ITEM_PAYLOADS_ENV, "")
     return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _trace_cache_summary_for_request(metadata: dict[str, Any] | None) -> bool:
+    raw_enabled = os.getenv("SGLANG_OMNI_TRACE_PROCESSOR_CACHE")
+    if raw_enabled is None or raw_enabled.lower() in {"", "0", "false", "no", "off"}:
+        return False
+    scope = os.getenv(_TRACE_CACHE_SUMMARY_SCOPE_ENV, "actual").strip().lower()
+    if scope in {"", "0", "false", "none", "no", "off"}:
+        return False
+    if scope in {"1", "true", "all", "yes", "on"}:
+        return True
+    pre_run = bool(metadata.get("pre_run")) if isinstance(metadata, dict) else False
+    if scope in {"actual", "measured", "final"}:
+        return not pre_run
+    if scope in {"prefix", "prerun", "pre_run"}:
+        return pre_run
+    return not pre_run
 
 
 def _empty_like_first_dim(value: torch.Tensor) -> torch.Tensor:
@@ -706,6 +725,9 @@ class Qwen3OmniPreprocessor:
         inputs = payload.request.inputs
         request_metadata = getattr(payload.request, "metadata", None)
         media_cache_namespace = None
+        trace_cache_summary = _trace_cache_summary_for_request(
+            request_metadata if isinstance(request_metadata, dict) else None
+        )
         if isinstance(request_metadata, dict):
             namespace = request_metadata.get("media_cache_namespace")
             if isinstance(namespace, str) and namespace:
@@ -1148,6 +1170,12 @@ class Qwen3OmniPreprocessor:
                 processor_kwargs["_sglang_omni_profile_request_id"] = (
                     payload.request_id
                 )
+                processor_kwargs.setdefault("videos_kwargs", {})[
+                    _TRACE_CACHE_SUMMARY_PROCESSOR_KEY
+                ] = trace_cache_summary
+                processor_kwargs.setdefault("audio_kwargs", {})[
+                    _TRACE_CACHE_SUMMARY_PROCESSOR_KEY
+                ] = trace_cache_summary
             if video_item_cache_keys:
                 processor_kwargs.setdefault("videos_kwargs", {})[
                     "_sglang_omni_item_cache_keys"

@@ -34,6 +34,12 @@ TRACE_CACHE=1 FORCE_RESTART=1 \
   bash reports/run_sglang_qwen35_stable_server.sh
 ```
 
+`TRACE_CACHE=1` defaults to `TRACE_CACHE_SCOPE=actual`, so only measured
+requests emit cache summaries. This keeps prefix-extension requests off the
+hot logging path while still showing the final-chunk `39 hits + 1 miss`
+behavior. Use `TRACE_CACHE_SCOPE=all` only when you need the old full-prefix
+log stream.
+
 Use `TRACE_CACHE_DETAIL=1` only for detailed item-level cache debugging. It is
 noisy and should not be used for pure performance numbers.
 

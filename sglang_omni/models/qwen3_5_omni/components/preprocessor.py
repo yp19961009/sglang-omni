@@ -79,6 +79,7 @@ _AUDIO_REQUEST_INPUT_ALIASES = (
 _AUDIO_REQUEST_PARAM_INPUT_ALIASES = _AUDIO_REQUEST_INPUT_ALIASES[:-1]
 _PROCESSOR_ITEM_CACHE_KEYS = "_sglang_omni_item_cache_keys"
 _PROCESSOR_PROFILE_REQUEST_ID = "_sglang_omni_profile_request_id"
+_PROCESSOR_TRACE_CACHE_SUMMARY = "_sglang_omni_trace_cache_summary"
 _PROCESSOR_ITEM_CACHE_MAX_ENTRIES = 512
 _PLAIN_TEXT_TOKEN_CACHE_MAX_ENTRIES = 4096
 _OMIT_CACHED_VISUAL_ITEM_PAYLOADS_ENV = (
@@ -864,6 +865,9 @@ class _Qwen35ProcessorShim:
         if not isinstance(audio, list):
             audio = [audio]
         item_cache_keys = audio_kwargs.pop(_PROCESSOR_ITEM_CACHE_KEYS, None)
+        trace_cache_summary = bool(
+            audio_kwargs.pop(_PROCESSOR_TRACE_CACHE_SUMMARY, False)
+        )
         sampling_rate = int(audio_kwargs.get("sampling_rate", 16000))
         padded_audio = self._pad_audio_for_feature_extractor(audio, sampling_rate)
         if self._can_use_item_cache(item_cache_keys, len(padded_audio)):
@@ -871,6 +875,7 @@ class _Qwen35ProcessorShim:
                 padded_audio,
                 audio_kwargs,
                 item_cache_keys,
+                trace_cache_summary=trace_cache_summary,
                 downsample_times=downsample_times,
                 downsample_chunk_size=downsample_chunk_size,
             )
@@ -914,6 +919,7 @@ class _Qwen35ProcessorShim:
         audio_kwargs: dict[str, Any],
         item_cache_keys,
         *,
+        trace_cache_summary: bool,
         downsample_times: int,
         downsample_chunk_size: int,
     ) -> dict[str, Any]:
@@ -923,7 +929,9 @@ class _Qwen35ProcessorShim:
         cache_keys_by_index: list[Any | None] = []
         hit_count = 0
         no_key_count = 0
-        trace_detail = _trace_processor_cache_detail_enabled()
+        trace_detail = (
+            trace_cache_summary and _trace_processor_cache_detail_enabled()
+        )
         for index, sample in enumerate(padded_audio):
             del sample
             cache_key = self._processor_item_cache_key(
@@ -941,10 +949,11 @@ class _Qwen35ProcessorShim:
                 trace_detail=trace_detail,
             )
             if cached is not None:
-                hit_count += 1
+                if trace_cache_summary:
+                    hit_count += 1
                 entries[index] = cached
                 continue
-            if cache_key is None:
+            if trace_cache_summary and cache_key is None:
                 no_key_count += 1
             miss_indices.append(index)
             miss_audio.append(padded_audio[index])
@@ -964,18 +973,19 @@ class _Qwen35ProcessorShim:
                     index=index,
                     trace_detail=trace_detail,
                 )
-                if cache_keys_by_index[index] is not None:
+                if trace_cache_summary and cache_keys_by_index[index] is not None:
                     store_count += 1
 
-        _trace_processor_cache_summary(
-            "audio",
-            item_count=len(padded_audio),
-            hit_count=hit_count,
-            miss_count=len(miss_indices) - no_key_count,
-            store_count=store_count,
-            no_key_count=no_key_count,
-            cache_entries=len(self._audio_item_processor_cache),
-        )
+        if trace_cache_summary:
+            _trace_processor_cache_summary(
+                "audio",
+                item_count=len(padded_audio),
+                hit_count=hit_count,
+                miss_count=len(miss_indices) - no_key_count,
+                store_count=store_count,
+                no_key_count=no_key_count,
+                cache_entries=len(self._audio_item_processor_cache),
+            )
 
         return self._combine_audio_entries(
             [entry for entry in entries if entry is not None]
@@ -996,12 +1006,16 @@ class _Qwen35ProcessorShim:
         if video_kwargs.get("device") is None:
             video_kwargs["device"] = "cpu"
         item_cache_keys = video_kwargs.pop(_PROCESSOR_ITEM_CACHE_KEYS, None)
+        trace_cache_summary = bool(
+            video_kwargs.pop(_PROCESSOR_TRACE_CACHE_SUMMARY, False)
+        )
         use_audio_in_video = video_kwargs.pop("use_audio_in_video", [])
         if self._can_use_item_cache(item_cache_keys, len(videos)):
             video_inputs, video_metadata = self._process_videos_with_item_cache(
                 videos,
                 video_kwargs,
                 item_cache_keys,
+                trace_cache_summary=trace_cache_summary,
             )
         else:
             video_inputs = self.video_processor(videos=videos, **video_kwargs)
@@ -1015,6 +1029,8 @@ class _Qwen35ProcessorShim:
         videos,
         video_kwargs: dict[str, Any],
         item_cache_keys,
+        *,
+        trace_cache_summary: bool,
     ) -> tuple[dict[str, Any], list[Any]]:
         entries: list[tuple[dict[str, Any], Any] | None] = [None] * len(videos)
         miss_indices: list[int] = []
@@ -1026,7 +1042,9 @@ class _Qwen35ProcessorShim:
         keep_pixel_fallbacks = omit_cached_pixels and _cached_video_pixel_fallbacks_enabled()
         hit_count = 0
         no_key_count = 0
-        trace_detail = _trace_processor_cache_detail_enabled()
+        trace_detail = (
+            trace_cache_summary and _trace_processor_cache_detail_enabled()
+        )
         for index, video in enumerate(videos):
             per_item_kwargs = self._select_item_processor_kwargs(
                 video_kwargs,
@@ -1051,7 +1069,8 @@ class _Qwen35ProcessorShim:
                 trace_detail=trace_detail,
             )
             if cached is not None:
-                hit_count += 1
+                if trace_cache_summary:
+                    hit_count += 1
                 if omit_cached_pixels:
                     pixel_present.append(False)
                     if keep_pixel_fallbacks:
@@ -1061,7 +1080,7 @@ class _Qwen35ProcessorShim:
                     pixel_present.append(True)
                     entries[index] = cached
                 continue
-            if cache_key is None:
+            if trace_cache_summary and cache_key is None:
                 no_key_count += 1
             pixel_present.append(True)
             miss_indices.append(index)
@@ -1093,7 +1112,7 @@ class _Qwen35ProcessorShim:
                     index=index,
                     trace_detail=trace_detail,
                 )
-                if cache_keys_by_index[index] is not None:
+                if trace_cache_summary and cache_keys_by_index[index] is not None:
                     store_count += 1
 
         combined, metadata = self._combine_video_entries(
@@ -1103,19 +1122,20 @@ class _Qwen35ProcessorShim:
             combined["video_item_pixel_present"] = pixel_present
             if any(item is not None for item in pixel_fallbacks):
                 combined["video_item_pixel_fallbacks"] = pixel_fallbacks
-        _trace_processor_cache_summary(
-            "video",
-            item_count=len(videos),
-            hit_count=hit_count,
-            miss_count=len(miss_indices) - no_key_count,
-            store_count=store_count,
-            no_key_count=no_key_count,
-            cache_entries=len(self._video_item_processor_cache),
-            detail=(
-                f"omit_cached_pixels={int(omit_cached_pixels)} "
-                f"pixel_fallbacks={int(keep_pixel_fallbacks)}"
-            ),
-        )
+        if trace_cache_summary:
+            _trace_processor_cache_summary(
+                "video",
+                item_count=len(videos),
+                hit_count=hit_count,
+                miss_count=len(miss_indices) - no_key_count,
+                store_count=store_count,
+                no_key_count=no_key_count,
+                cache_entries=len(self._video_item_processor_cache),
+                detail=(
+                    f"omit_cached_pixels={int(omit_cached_pixels)} "
+                    f"pixel_fallbacks={int(keep_pixel_fallbacks)}"
+                ),
+            )
         return combined, metadata
 
     def _can_use_item_cache(self, item_cache_keys, item_count: int) -> bool:

@@ -57,6 +57,7 @@ _IMAGE_ENCODER_ITEM_BATCH_BUDGET_BYTES_ENV = (
 )
 _TRACE_ENCODER_CACHE_ENV = "SGLANG_OMNI_TRACE_ENCODER_CACHE"
 _TRACE_ENCODER_CACHE_DETAIL_ENV = "SGLANG_OMNI_TRACE_ENCODER_CACHE_DETAIL"
+_TRACE_CACHE_SUMMARY_SCOPE_ENV = "SGLANG_OMNI_TRACE_CACHE_SUMMARY_SCOPE"
 _VISUAL_ITEM_BATCH_STATS_ENV = "SGLANG_OMNI_VISUAL_ITEM_BATCH_STATS"
 _COMPACT_VISUAL_ENCODER_RESULTS_ENV = "SGLANG_OMNI_COMPACT_VISUAL_ENCODER_RESULTS"
 _COMPACT_AUDIO_ENCODER_RESULTS_ENV = "SGLANG_OMNI_COMPACT_AUDIO_ENCODER_RESULTS"
@@ -1076,11 +1077,12 @@ def _execute_visual_item_cache_plans(
         _copy_visual_item_results_to_duplicates(missing_items, duplicate_items)
 
     for plan in plans:
-        _trace_encoder_item_cache_summary(
-            IMAGE_STAGE,
-            plan.payload.request_id,
-            [*plan.image_items, *plan.video_items],
-        )
+        if _trace_cache_summary_for_payload(plan.payload):
+            _trace_encoder_item_cache_summary(
+                IMAGE_STAGE,
+                plan.payload.request_id,
+                [*plan.image_items, *plan.video_items],
+            )
         stage_result = _combine_visual_item_results(plan)
         if _store_item_plan_combined_encoder_cache_enabled():
             _store_cached_encoder_output(
@@ -1226,6 +1228,23 @@ def _encoder_cache_detail_enabled() -> bool:
         _TRACE_ENCODER_CACHE_DETAIL_ENV,
         default=False,
     )
+
+
+def _trace_cache_summary_for_payload(payload: StagePayload) -> bool:
+    if not _encoder_cache_trace_enabled():
+        return False
+    scope = os.getenv(_TRACE_CACHE_SUMMARY_SCOPE_ENV, "actual").strip().lower()
+    if scope in {"", "0", "false", "none", "no", "off"}:
+        return False
+    if scope in {"1", "true", "all", "yes", "on"}:
+        return True
+    metadata = getattr(getattr(payload, "request", None), "metadata", None)
+    pre_run = bool(metadata.get("pre_run")) if isinstance(metadata, dict) else False
+    if scope in {"actual", "measured", "final"}:
+        return not pre_run
+    if scope in {"prefix", "prerun", "pre_run"}:
+        return pre_run
+    return not pre_run
 
 
 def _store_item_plan_combined_encoder_cache_enabled() -> bool:
@@ -1891,11 +1910,12 @@ def _execute_audio_item_cache_plans(
                     )
 
     for plan in plans:
-        _trace_encoder_item_cache_summary(
-            AUDIO_STAGE,
-            plan.payload.request_id,
-            plan.items,
-        )
+        if _trace_cache_summary_for_payload(plan.payload):
+            _trace_encoder_item_cache_summary(
+                AUDIO_STAGE,
+                plan.payload.request_id,
+                plan.items,
+            )
         stage_result = _combine_audio_item_results(plan)
         if _store_item_plan_combined_encoder_cache_enabled():
             _store_cached_encoder_output(
