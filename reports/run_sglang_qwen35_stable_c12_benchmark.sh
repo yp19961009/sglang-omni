@@ -9,8 +9,8 @@ set -euo pipefail
 #     bash reports/run_sglang_qwen35_stable_c12_benchmark.sh
 #
 # This follows the vLLM run_rtc_profile concurrency shape by default: each
-# worker incrementally sends pre-run chunks 1..TRUNK_SIZE, then immediately
-# streams the measured actual request for the same TRUNK_SIZE. Set
+# worker incrementally sends pre-run chunks 1..TRUNK_SIZE-1, then immediately
+# streams the measured actual request for TRUNK_SIZE. Set
 # BARRIER_PREFIX=1 to use the older all-prefixes-first barrier shape. See
 # reports/README_qwen35_realtime_benchmark_20260701.md for reference numbers.
 # Request profiling is enabled by default so summaries include vLLM-style
@@ -82,7 +82,7 @@ echo "sil_offset=$SIL_OFFSET"
 echo "temperature=$TEMPERATURE"
 echo "voice=$VOICE"
 echo "barrier_prefix=$BARRIER_PREFIX"
-echo "realtime_shape=$RUN_SHAPE: per-worker prefix chunks 1..$TRUNK_SIZE, then measured actual chunk $TRUNK_SIZE"
+echo "realtime_shape=$RUN_SHAPE: per-worker prefix chunks 1..$((TRUNK_SIZE - 1)), then measured actual chunk $TRUNK_SIZE"
 echo "prefix_max_tokens=$PREFIX_MAX_TOKENS"
 echo "profile_requests=$PROFILE_REQUESTS"
 if [ -n "$PROFILE_RUN_ID" ]; then

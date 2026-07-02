@@ -4,9 +4,9 @@
 
 Each session feeds realtime prefix chunks incrementally, then measures the
 final streamed chunk. By default this mirrors the vLLM run_rtc_profile shape:
-each worker sends pre-run chunks 1..TRUNK_SIZE with max_tokens=2, then
-immediately streams the actual request for the same TRUNK_SIZE. Use
---prefix-max-tokens 0 for pure cache-extension pre-runs.
+each worker sends pre-run chunks 1..TRUNK_SIZE-1 with max_tokens=2, then
+immediately streams the actual request for TRUNK_SIZE. Use --prefix-max-tokens 0
+for pure cache-extension pre-runs.
 """
 
 from __future__ import annotations
@@ -470,7 +470,8 @@ async def _run_prefix_extensions(
     media_cache_namespace = context["media_cache_namespace"]
     offsets = context["offsets"]
     prefix_times: list[float] = []
-    for trunk in range(1, args.trunk_size + 1):
+    last_prompt_tokens: int | None = None
+    for trunk in range(1, args.trunk_size):
         messages = make_rtc_messages(
             test_dir=Path(args.rtc_test_dir),
             trunk_size=trunk,
@@ -502,8 +503,12 @@ async def _run_prefix_extensions(
         }
         _apply_video_request_options(payload, args)
         t0 = time.perf_counter()
-        await post_chat(session, api_url=api_url, payload=payload, stream=False)
+        metrics = await post_chat(session, api_url=api_url, payload=payload, stream=False)
         prefix_times.append((time.perf_counter() - t0) * 1000.0)
+        if metrics.prompt_tokens > 0:
+            last_prompt_tokens = metrics.prompt_tokens
+    if last_prompt_tokens is not None:
+        context["actual_prefix_cache_limit"] = last_prompt_tokens
     return prefix_times
 
 
@@ -534,6 +539,15 @@ async def _run_actual(
         question_idx=offsets["question_idx"],
         visual_mode=args.visual_mode,
     )
+    metadata = {
+        "request_id": request_id,
+        "media_cache_namespace": media_cache_namespace,
+        "trunk_size": args.trunk_size,
+        "pre_run": False,
+    }
+    actual_prefix_cache_limit = context.get("actual_prefix_cache_limit")
+    if actual_prefix_cache_limit is not None:
+        metadata["actual_prefix_cache_limit"] = int(actual_prefix_cache_limit)
     payload = {
         "model": args.model,
         "messages": messages,
@@ -542,12 +556,7 @@ async def _run_actual(
         "temperature": args.temperature,
         "stream": True,
         "video_fps": args.video_fps,
-        "metadata": {
-            "request_id": request_id,
-            "media_cache_namespace": media_cache_namespace,
-            "trunk_size": args.trunk_size,
-            "pre_run": False,
-        },
+        "metadata": metadata,
     }
     if not args.text_only:
         payload["audio"] = {"format": "wav", "voice": args.voice}
@@ -574,6 +583,7 @@ async def _run_actual(
         "sil_start_idx": offsets["sil_start_idx"],
         "video_start_idx": offsets["video_start_idx"],
         "question_idx": offsets["question_idx"],
+        "actual_prefix_cache_limit": context.get("actual_prefix_cache_limit"),
     }
     row["client_first_text_event_ms"] = row.get("first_text_event_ms")
     row["last_audio_ms"] = _last_audio_ms(row)
@@ -1007,7 +1017,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "serialize_prerun": bool(args.serialize_prerun),
         "barrier_prerun": bool(args.barrier_prerun),
         "skip_prerun": bool(args.skip_prerun),
-        "realtime_prefix_trunk_size": args.trunk_size,
+        "realtime_prefix_trunk_size": max(0, args.trunk_size - 1),
         "qps": completed / elapsed_s if elapsed_s > 0 else None,
         "concurrency_shape": (
             "serialized_prefix"

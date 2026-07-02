@@ -105,6 +105,10 @@ _QWEN35_TALKER_TEXT_FEEDBACK_STRIDE = _QWEN35_TALKER_NUM_OUTPUT_IN_CHUNK
 _QWEN35_RTC_DECODE_STREAM_TOKEN_BATCH_SIZE = 8
 _QWEN35_RTC_TEXT_FILLER_PER_CHUNK = 20
 _QWEN35_RTC_AUDIO_ROWS_PER_CHUNK = 14
+_QWEN35_IM_START_TOKEN_ID = 151644
+_QWEN35_SYSTEM_TOKEN_ID = 8948
+_QWEN35_USER_TOKEN_ID = 872
+_QWEN35_ASSISTANT_TOKEN_ID = 77091
 _VOICE_PARAM_KEYS = ("speaker", "voice", "voice_type")
 _OPENAI_AUDIO_VOICE_KEYS = ("voice_type", "voice", "speaker")
 _VOICE_STYLE_PATTERN = re.compile(
@@ -1802,6 +1806,75 @@ def _rtc_isolate_prerun_prefill_enabled() -> bool:
     return _env_flag_enabled(raw, default=True)
 
 
+def _rtc_limit_actual_prefix_to_complete_turn_enabled() -> bool:
+    raw = os.getenv("QWEN35_RTC_LIMIT_ACTUAL_PREFIX_TO_COMPLETE_TURN")
+    return _env_flag_enabled(raw, default=True)
+
+
+def _rtc_complete_turn_prefix_cache_limit(input_ids: list[int]) -> int | None:
+    if not input_ids:
+        return None
+    segments = segment_chat_template(
+        input_ids,
+        im_start_token_id=_QWEN35_IM_START_TOKEN_ID,
+        system_token_id=_QWEN35_SYSTEM_TOKEN_ID,
+        user_token_id=_QWEN35_USER_TOKEN_ID,
+        assistant_token_id=_QWEN35_ASSISTANT_TOKEN_ID,
+    )
+    assistant_ends = [
+        int(seg["end"]) for seg in segments if seg.get("role") == "assistant"
+    ]
+    if not assistant_ends:
+        return None
+    limit = assistant_ends[-1]
+    return limit if 0 < limit < len(input_ids) else None
+
+
+def _rtc_default_actual_prefix_cache_limit(input_ids: list[int]) -> int | None:
+    if not _rtc_limit_actual_prefix_to_complete_turn_enabled():
+        return None
+    return _rtc_complete_turn_prefix_cache_limit(input_ids)
+
+
+def _rtc_align_complete_turn_mamba_cache_enabled() -> bool:
+    raw = os.getenv("QWEN35_RTC_ALIGN_COMPLETE_TURN_MAMBA_CACHE")
+    return _env_flag_enabled(raw, default=True)
+
+
+def _rtc_align_mamba_cache_limit(cache_limit: int | None) -> int | None:
+    if cache_limit is None or cache_limit <= 0:
+        return None
+    if not _rtc_align_complete_turn_mamba_cache_enabled():
+        return int(cache_limit)
+    chunk_size = qwen3_request_builders._mamba_branching_chunk_size()
+    if chunk_size is None:
+        return int(cache_limit)
+    aligned = int(cache_limit) // int(chunk_size) * int(chunk_size)
+    return aligned if aligned > 0 else int(cache_limit)
+
+
+def _rtc_default_mamba_prefix_cache_limit(input_ids: list[int]) -> int | None:
+    cache_limit = _rtc_default_actual_prefix_cache_limit(input_ids)
+    return _rtc_align_mamba_cache_limit(cache_limit)
+
+
+def _rtc_apply_mamba_prefix_cache_limit(req: Any, cache_limit: int | None) -> int | None:
+    if cache_limit is None:
+        return None
+    try:
+        cache_limit = int(cache_limit)
+    except (TypeError, ValueError):
+        return None
+    if cache_limit <= 0:
+        return None
+    qwen3_request_builders._install_mamba_branching_hint_patch(req.__class__)
+    req._omni_mamba_prefix_cache_limit = cache_limit
+    req._omni_max_prefix_cache_len = cache_limit
+    req._omni_mamba_branching_seqlen = cache_limit
+    req._omni_rtc_complete_turn_prefix_cache_limit = cache_limit
+    return cache_limit
+
+
 def _rtc_actual_prefix_cache_limit() -> int | None:
     raw = os.getenv("QWEN35_RTC_ACTUAL_PREFIX_CACHE_LIMIT")
     if raw is None:
@@ -1810,6 +1883,20 @@ def _rtc_actual_prefix_cache_limit() -> int | None:
         value = int(raw)
     except (TypeError, ValueError):
         return 0 if _env_flag_enabled(raw, default=False) else None
+    return value if value > 0 else None
+
+
+def _rtc_metadata_actual_prefix_cache_limit(request: Any) -> int | None:
+    metadata = getattr(request, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    raw = metadata.get("actual_prefix_cache_limit")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
     return value if value > 0 else None
 
 
@@ -2188,13 +2275,14 @@ def make_thinker_scheduler_adapters(
             if rtc_namespace is not None:
                 req._omni_release_protected_prefix_cache_on_finish = True
             cache_limit = _rtc_actual_prefix_cache_limit()
-            if cache_limit is not None:
-                if cache_limit <= 1:
-                    cache_limit = getattr(req, "_omni_mamba_branching_seqlen", None)
-                if cache_limit is not None:
-                    cache_limit = int(cache_limit)
-                    req._omni_mamba_prefix_cache_limit = cache_limit
-                    req._omni_max_prefix_cache_len = cache_limit
+            if cache_limit is None:
+                cache_limit = _rtc_metadata_actual_prefix_cache_limit(payload.request)
+            if cache_limit is None:
+                origin_input_ids = list(getattr(req, "origin_input_ids", []) or [])
+                cache_limit = _rtc_default_actual_prefix_cache_limit(origin_input_ids)
+            if cache_limit is not None and cache_limit <= 1:
+                cache_limit = getattr(req, "_omni_mamba_branching_seqlen", None)
+            _rtc_apply_mamba_prefix_cache_limit(req, cache_limit)
         req_data.stage_payload = payload
         return req_data
 

@@ -4102,3 +4102,195 @@ def test_qwen35_talker_adapter_accepts_prefixed_sampling_params(monkeypatch):
     assert sub_sp.top_p == 0.85
     assert sub_sp.min_p == 0.02
     assert sub_sp.sampling_seed == 456
+
+
+def test_qwen35_rtc_complete_turn_prefix_cache_limit_uses_last_assistant_boundary(monkeypatch):
+    monkeypatch.delenv("QWEN35_RTC_LIMIT_ACTUAL_PREFIX_TO_COMPLETE_TURN", raising=False)
+    ids = [
+        151644, 8948, 101, 151645,
+        151644, 872, 201, 151645,
+        151644, 77091, 301, 151645,
+        151644, 872, 401, 402,
+    ]
+
+    assert request_builders._rtc_complete_turn_prefix_cache_limit(ids) == 12
+    assert request_builders._rtc_default_actual_prefix_cache_limit(ids) == 12
+
+
+def test_qwen35_rtc_complete_turn_prefix_cache_limit_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("QWEN35_RTC_LIMIT_ACTUAL_PREFIX_TO_COMPLETE_TURN", "0")
+    ids = [151644, 872, 201, 151645, 151644, 77091, 301, 151645, 151644, 872, 401]
+
+    assert request_builders._rtc_complete_turn_prefix_cache_limit(ids) == 8
+    assert request_builders._rtc_default_actual_prefix_cache_limit(ids) is None
+
+
+def test_qwen35_rtc_mamba_prefix_cache_limit_aligns_complete_turn(monkeypatch):
+    monkeypatch.delenv("QWEN35_RTC_LIMIT_ACTUAL_PREFIX_TO_COMPLETE_TURN", raising=False)
+    monkeypatch.delenv("QWEN35_RTC_ALIGN_COMPLETE_TURN_MAMBA_CACHE", raising=False)
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "_mamba_branching_chunk_size",
+        lambda: 8,
+    )
+    ids = [
+        151644, 8948, 101, 151645,
+        151644, 872, 201, 151645,
+        151644, 77091, 301, 151645,
+        151644, 872, 401, 402,
+    ]
+
+    assert request_builders._rtc_complete_turn_prefix_cache_limit(ids) == 12
+    assert request_builders._rtc_default_mamba_prefix_cache_limit(ids) == 8
+
+
+def test_qwen35_rtc_mamba_prefix_cache_limit_alignment_can_be_disabled(monkeypatch):
+    monkeypatch.delenv("QWEN35_RTC_LIMIT_ACTUAL_PREFIX_TO_COMPLETE_TURN", raising=False)
+    monkeypatch.setenv("QWEN35_RTC_ALIGN_COMPLETE_TURN_MAMBA_CACHE", "0")
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "_mamba_branching_chunk_size",
+        lambda: 8,
+    )
+    ids = [151644, 872, 201, 151645, 151644, 77091, 301, 151645, 151644, 872, 401]
+
+    assert request_builders._rtc_default_mamba_prefix_cache_limit(ids) == 8
+
+
+class _FakeThinkerReq:
+    def __init__(self, input_ids, *, max_new_tokens):
+        self.origin_input_ids = input_ids
+        self.extra_key = "media-cache:audio=rtc:req-0:audio|video=rtc:req-0:video"
+        self.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
+
+
+def test_qwen35_thinker_adapter_does_not_cap_rtc_prerun_mamba_prefix(monkeypatch):
+    ids = [151644, 872, 201, 151645, 151644, 77091, 301, 151645, 151644, 872, 401]
+    fake_req = _FakeThinkerReq(ids, max_new_tokens=0)
+
+    def _fake_build_sglang_thinker_request(*args, **kwargs):
+        del args, kwargs
+        return SimpleNamespace(req=fake_req, stage_payload=None)
+
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "build_sglang_thinker_request",
+        _fake_build_sglang_thinker_request,
+    )
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    payload = StagePayload(
+        request_id="req-prerun",
+        request=OmniRequest(
+            inputs={},
+            params={"max_tokens": 64},
+            metadata={"pre_run": True, "media_cache_namespace": "rtc:req-0"},
+        ),
+        data=Qwen3OmniPipelineState(prompt={"input_ids": torch.tensor(ids)}).to_dict(),
+    )
+
+    request_builder(payload)
+
+    assert not hasattr(fake_req, "_omni_mamba_prefix_cache_limit")
+    assert not hasattr(fake_req, "_omni_max_prefix_cache_len")
+    assert not hasattr(fake_req, "_omni_mamba_branching_seqlen")
+
+
+def test_qwen35_thinker_adapter_uses_metadata_prefix_limit_for_rtc_actual(monkeypatch):
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "_install_mamba_branching_hint_patch",
+        lambda req_cls: None,
+    )
+    ids = [151644, 872, 201, 151645, 151644, 77091, 301, 151645, 151644, 872, 401]
+    fake_req = _FakeThinkerReq(ids, max_new_tokens=64)
+
+    def _fake_build_sglang_thinker_request(*args, **kwargs):
+        del args, kwargs
+        return SimpleNamespace(req=fake_req, stage_payload=None)
+
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "build_sglang_thinker_request",
+        _fake_build_sglang_thinker_request,
+    )
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    payload = StagePayload(
+        request_id="req-actual",
+        request=OmniRequest(
+            inputs={},
+            params={"max_tokens": 64},
+            metadata={
+                "media_cache_namespace": "rtc:req-0",
+                "actual_prefix_cache_limit": 7,
+            },
+        ),
+        data=Qwen3OmniPipelineState(prompt={"input_ids": torch.tensor(ids)}).to_dict(),
+    )
+
+    request_builder(payload)
+
+    assert fake_req._omni_mamba_prefix_cache_limit == 7
+    assert fake_req._omni_max_prefix_cache_len == 7
+
+
+def test_qwen35_thinker_adapter_sets_safe_mamba_prefix_for_rtc_actual(monkeypatch):
+    monkeypatch.delenv("QWEN35_RTC_LIMIT_ACTUAL_PREFIX_TO_COMPLETE_TURN", raising=False)
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "_mamba_branching_chunk_size",
+        lambda: 8,
+    )
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "_install_mamba_branching_hint_patch",
+        lambda req_cls: None,
+    )
+    ids = [151644, 872, 201, 151645, 151644, 77091, 301, 151645, 151644, 872, 401]
+    fake_req = _FakeThinkerReq(ids, max_new_tokens=64)
+
+    def _fake_build_sglang_thinker_request(*args, **kwargs):
+        del args, kwargs
+        return SimpleNamespace(req=fake_req, stage_payload=None)
+
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "build_sglang_thinker_request",
+        _fake_build_sglang_thinker_request,
+    )
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    payload = StagePayload(
+        request_id="req-actual",
+        request=OmniRequest(
+            inputs={},
+            params={"max_tokens": 64},
+            metadata={"media_cache_namespace": "rtc:req-0"},
+        ),
+        data=Qwen3OmniPipelineState(prompt={"input_ids": torch.tensor(ids)}).to_dict(),
+    )
+
+    request_builder(payload)
+
+    assert fake_req._omni_mamba_prefix_cache_limit == 8
+    assert fake_req._omni_max_prefix_cache_len == 8
+    assert fake_req._omni_mamba_branching_seqlen == 8
+
+
+def test_qwen35_rtc_complete_turn_prefix_cache_limit_requires_trailing_user_turn():
+    assert request_builders._rtc_complete_turn_prefix_cache_limit(
+        [151644, 872, 201, 151645]
+    ) is None
+    assert request_builders._rtc_complete_turn_prefix_cache_limit(
+        [151644, 872, 201, 151645, 151644, 77091, 301, 151645]
+    ) is None

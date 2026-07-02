@@ -417,10 +417,17 @@ def _install_mamba_branching_hint_patch(Req: Any) -> None:
             result = original(self, tree_cache)
 
         current_before = getattr(self, "mamba_branching_seqlen", None)
+        try:
+            current_before_int = (
+                int(current_before) if current_before is not None else None
+            )
+        except (TypeError, ValueError):
+            current_before_int = None
         prefix_indices = getattr(self, "prefix_indices", None)
         prefix_len = len(prefix_indices) if prefix_indices is not None else 0
-        if hint is not None and current_before is None and hint > prefix_len:
-            self.mamba_branching_seqlen = hint
+        if hint is not None and hint > prefix_len:
+            if current_before_int is None or current_before_int > hint:
+                self.mamba_branching_seqlen = hint
         if debug_mamba_rtc and "rtc:" in str(getattr(self, "extra_key", "")):
             logger.info(
                 "qwen3_omni_mamba_hint rid=%s max_new_tokens=%s prefix_len=%s "
