@@ -55,6 +55,7 @@ class StageOutputCache:
         max_size: int | None = None,
         max_bytes: int | None = None,
         cache_device: torch.device | str | None = None,
+        clone_on_get: bool = True,
     ) -> None:
         if isinstance(cache_device, str):
             cache_device = torch.device(cache_device)
@@ -62,6 +63,7 @@ class StageOutputCache:
         self.max_size = max_size
         self.max_bytes = max_bytes
         self.cache_device = cache_device
+        self.clone_on_get = bool(clone_on_get)
         self.current_bytes = 0
 
     def get(self, key: str | None) -> Any | None:
@@ -72,7 +74,9 @@ class StageOutputCache:
         if entry is None:
             return None
         self._cache.move_to_end(key)
-        return _clone_cached_value(entry.data)
+        if self.clone_on_get:
+            return _clone_cached_value(entry.data)
+        return entry.data
 
     def contains(self, key: str | None) -> bool:
         if key is None:

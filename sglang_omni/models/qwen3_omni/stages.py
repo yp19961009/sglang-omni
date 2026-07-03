@@ -46,6 +46,8 @@ logger = logging.getLogger(__name__)
 
 _ENCODER_CACHE_MAX_BYTES_ENV = "SGLANG_OMNI_ENCODER_CACHE_MAX_BYTES"
 _ENCODER_CACHE_MAX_ENTRIES_ENV = "SGLANG_OMNI_ENCODER_CACHE_MAX_ENTRIES"
+_ENCODER_CACHE_DEVICE_ENV = "SGLANG_OMNI_ENCODER_CACHE_DEVICE"
+_ENCODER_CACHE_CLONE_ON_GET_ENV = "SGLANG_OMNI_ENCODER_CACHE_CLONE_ON_GET"
 _STORE_ITEM_PLAN_COMBINED_CACHE_ENV = (
     "SGLANG_OMNI_STORE_ITEM_PLAN_COMBINED_ENCODER_CACHE"
 )
@@ -97,6 +99,28 @@ QWEN3_IMAGE_ENCODER_ITEM_BATCH_BUDGET_BYTES = _env_int(
 # CPU LRU cap for repeated-media encoder outputs.
 QWEN3_ENCODER_CACHE_MAX_BYTES = _env_int(_ENCODER_CACHE_MAX_BYTES_ENV, 4 * 1024**3)
 QWEN3_ENCODER_CACHE_MAX_ENTRIES = _env_int(_ENCODER_CACHE_MAX_ENTRIES_ENV, 64)
+
+
+def qwen3_encoder_cache_device(default: str | None = "cpu") -> str | None:
+    value = os.getenv(_ENCODER_CACHE_DEVICE_ENV)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"", "none", "null", "off", "0"}:
+        return None
+    if normalized in {"cpu", "cuda"} or normalized.startswith("cuda:"):
+        return normalized
+    logger.warning(
+        "Invalid %s=%r; using default %r",
+        _ENCODER_CACHE_DEVICE_ENV,
+        value,
+        default,
+    )
+    return default
+
+
+def qwen3_encoder_cache_clone_on_get(default: bool = True) -> bool:
+    return _env_bool(_ENCODER_CACHE_CLONE_ON_GET_ENV, default=default)
 
 
 @dataclass(frozen=True)
@@ -1792,19 +1816,41 @@ def _prepare_audio_item_cache_plan(
         return None
 
     features, mask, lengths = _normalize_audio_request_tensors(request)
-    rows = int(lengths.shape[0])
+    available_rows = int(lengths.shape[0])
+    raw_feature_present = getattr(request, "item_feature_present", {}).get("audio")
+    if raw_feature_present is not None:
+        # Omitted cached audio rows keep their item keys but are not included in
+        # the tensors shipped to audio_encoder. Present rows remain packed in
+        # order, so the cursor below maps them back to full item order.
+        feature_present = [bool(item) for item in raw_feature_present]
+        rows = len(feature_present)
+        if sum(1 for item in feature_present if item) != available_rows:
+            return None
+    else:
+        feature_present = None
+        rows = available_rows
     item_keys = _audio_item_keys(request, rows)
     if item_keys is None or not any(key is not None for key in item_keys):
         return None
 
     items: list[dict[str, Any]] = []
+    feature_cursor = 0
     for row, cache_key in enumerate(item_keys):
-        length = lengths[row : row + 1]
+        has_features = True if feature_present is None else feature_present[row]
+        if has_features:
+            length = lengths[feature_cursor : feature_cursor + 1]
+            item_features = features[feature_cursor : feature_cursor + 1]
+            item_mask = mask[feature_cursor : feature_cursor + 1]
+            feature_cursor += 1
+        else:
+            length = None
+            item_features = None
+            item_mask = None
         item = {
             "modality": "audio",
             "cache_key": cache_key,
-            "features": features[row : row + 1],
-            "mask": mask[row : row + 1],
+            "features": item_features,
+            "mask": item_mask,
             "length": length,
             "result": None,
             "request_id": payload.request_id,
@@ -1814,6 +1860,13 @@ def _prepare_audio_item_cache_plan(
             request_id=payload.request_id,
             cache=cache,
         )
+        if item["result"] is None and not has_features:
+            raise RuntimeError(
+                "Audio item payload was omitted but encoder item cache missed "
+                f"for key={cache_key!r}. Disable "
+                "SGLANG_OMNI_OMIT_CACHED_AUDIO_ITEM_PAYLOADS or increase "
+                "the encoder cache capacity."
+            )
         items.append(item)
 
     return _AudioItemCachePlan(
@@ -2120,7 +2173,8 @@ def create_image_encoder_executor(
     cache = StageOutputCache(
         max_size=QWEN3_ENCODER_CACHE_MAX_ENTRIES,
         max_bytes=QWEN3_ENCODER_CACHE_MAX_BYTES,
-        cache_device="cpu",
+        cache_device=qwen3_encoder_cache_device(),
+        clone_on_get=qwen3_encoder_cache_clone_on_get(),
     )
 
     def _encode(payload: StagePayload) -> StagePayload:
@@ -2192,7 +2246,8 @@ def create_audio_encoder_executor(
     cache = StageOutputCache(
         max_size=QWEN3_ENCODER_CACHE_MAX_ENTRIES,
         max_bytes=QWEN3_ENCODER_CACHE_MAX_BYTES,
-        cache_device="cpu",
+        cache_device=qwen3_encoder_cache_device(),
+        clone_on_get=qwen3_encoder_cache_clone_on_get(),
     )
 
     def _encode(payload: StagePayload) -> StagePayload:

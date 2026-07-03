@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 import logging
 import os
 from pathlib import Path
@@ -38,6 +39,9 @@ logger = logging.getLogger(__name__)
 _OMIT_CACHED_VISUAL_ITEM_PAYLOADS_ENV = (
     "SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS"
 )
+_OMIT_CACHED_AUDIO_ITEM_PAYLOADS_ENV = (
+    "SGLANG_OMNI_OMIT_CACHED_AUDIO_ITEM_PAYLOADS"
+)
 _TRACE_CACHE_SUMMARY_SCOPE_ENV = "SGLANG_OMNI_TRACE_CACHE_SUMMARY_SCOPE"
 _TRACE_CACHE_SUMMARY_PROCESSOR_KEY = "_sglang_omni_trace_cache_summary"
 _OPENAI_AUDIO_OUTPUT_CONFIG_KEYS = frozenset(
@@ -70,6 +74,10 @@ _AUDIO_MEDIA_PAYLOAD_KEYS = frozenset(
         "samples",
         "url",
     }
+)
+_RTC_MEDIA_PREFIX_CACHE_ENABLED_ENV = "SGLANG_OMNI_RTC_MEDIA_PREFIX_CACHE"
+_RTC_MEDIA_PREFIX_CACHE_MAX_ENTRIES_ENV = (
+    "SGLANG_OMNI_RTC_MEDIA_PREFIX_CACHE_MAX_ENTRIES"
 )
 
 
@@ -295,6 +303,75 @@ def _media_items(value: Any) -> list[Any]:
     return list(value) if isinstance(value, list) else [value]
 
 
+def _rtc_media_prefix_cache_enabled() -> bool:
+    raw = os.getenv(_RTC_MEDIA_PREFIX_CACHE_ENABLED_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _rtc_media_prefix_cache_max_entries() -> int:
+    raw = os.getenv(_RTC_MEDIA_PREFIX_CACHE_MAX_ENTRIES_ENV)
+    if raw is None:
+        return 64
+    try:
+        return max(int(raw), 0)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid %s=%r; using default 64",
+            _RTC_MEDIA_PREFIX_CACHE_MAX_ENTRIES_ENV,
+            raw,
+        )
+        return 64
+
+
+def _rtc_media_item_signature(item: Any) -> Any | None:
+    if isinstance(item, (str, Path)):
+        return str(item)
+    if isinstance(item, (list, tuple)):
+        parts: list[str] = []
+        for part in item:
+            if not isinstance(part, (str, Path)):
+                return None
+            parts.append(str(part))
+        return tuple(parts)
+    return None
+
+
+def _rtc_media_sequence_signature(value: Any) -> tuple[Any, ...] | None:
+    sig: list[Any] = []
+    for item in _media_items(value):
+        item_sig = _rtc_media_item_signature(item)
+        if item_sig is None:
+            return None
+        sig.append(item_sig)
+    return tuple(sig)
+
+
+def _rtc_signature_has_prefix(
+    signature: tuple[Any, ...], prefix: tuple[Any, ...]
+) -> bool:
+    return len(prefix) <= len(signature) and signature[: len(prefix)] == prefix
+
+
+def _rtc_media_suffix(value: Any, start: int) -> list[Any]:
+    return _media_items(value)[max(0, int(start)) :]
+
+
+def _rtc_slice_extract_audio_flags(value: Any, start: int) -> Any:
+    if isinstance(value, (list, tuple)):
+        return list(value)[max(0, int(start)) :]
+    return value
+
+
+def _rtc_concat_optional_sequence(prefix: Any, suffix: Any) -> list[Any] | None:
+    prefix_items = [] if prefix is None else list(prefix)
+    suffix_items = [] if suffix is None else list(suffix)
+    if not prefix_items and not suffix_items:
+        return None
+    return prefix_items + suffix_items
+
+
 def _media_item_cache_keys_for_request(
     *,
     raw_value: Any,
@@ -318,6 +395,11 @@ def _omit_cached_visual_item_payloads_enabled() -> bool:
     return value.lower() not in ("", "0", "false", "no", "off")
 
 
+def _omit_cached_audio_item_payloads_enabled() -> bool:
+    value = os.getenv(_OMIT_CACHED_AUDIO_ITEM_PAYLOADS_ENV, "")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
 def _trace_cache_summary_for_request(metadata: dict[str, Any] | None) -> bool:
     raw_enabled = os.getenv("SGLANG_OMNI_TRACE_PROCESSOR_CACHE")
     if raw_enabled is None or raw_enabled.lower() in {"", "0", "false", "no", "off"}:
@@ -337,6 +419,61 @@ def _trace_cache_summary_for_request(metadata: dict[str, Any] | None) -> bool:
 
 def _empty_like_first_dim(value: torch.Tensor) -> torch.Tensor:
     return value.new_empty((0, *value.shape[1:]))
+
+
+def _select_first_dim(value: Any, indices: list[int]) -> Any:
+    if isinstance(value, torch.Tensor):
+        if indices:
+            return value[indices]
+        return _empty_like_first_dim(value)
+    if isinstance(value, list):
+        return [value[index] for index in indices]
+    return value
+
+
+def _trim_cached_audio_item_payloads(
+    audio_encoder_inputs: dict[str, Any],
+    *,
+    audio_item_cache_keys: list[str | None],
+    seen_item_keys: set[str],
+) -> None:
+    if not audio_item_cache_keys:
+        return
+    features = audio_encoder_inputs.get("input_features")
+    if not isinstance(features, torch.Tensor) or features.ndim < 3:
+        return
+    rows = len(audio_item_cache_keys)
+    if int(features.shape[0]) != rows:
+        return
+    existing_mask = audio_encoder_inputs.get("audio_item_feature_present")
+    if isinstance(existing_mask, list) and len(existing_mask) == rows:
+        for cache_key in audio_item_cache_keys:
+            if cache_key is not None:
+                seen_item_keys.add(cache_key)
+        return
+
+    seen_before = set(seen_item_keys)
+    feature_present: list[bool] = []
+    kept_indices: list[int] = []
+    for index, cache_key in enumerate(audio_item_cache_keys):
+        can_omit = cache_key is not None and cache_key in seen_before
+        feature_present.append(not can_omit)
+        if not can_omit:
+            kept_indices.append(index)
+        if cache_key is not None:
+            seen_item_keys.add(cache_key)
+
+    if all(feature_present):
+        return
+
+    audio_encoder_inputs["audio_item_feature_present"] = feature_present
+    audio_encoder_inputs["input_features"] = _select_first_dim(features, kept_indices)
+    for key in ("feature_attention_mask", "audio_feature_lengths"):
+        value = audio_encoder_inputs.get(key)
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and int(value.shape[0]) == rows:
+            audio_encoder_inputs[key] = _select_first_dim(value, kept_indices)
+        elif isinstance(value, list) and len(value) == rows:
+            audio_encoder_inputs[key] = _select_first_dim(value, kept_indices)
 
 
 def _trim_cached_video_item_payloads(
@@ -596,6 +733,7 @@ class Qwen3OmniPreprocessor:
             self.tokenizer, "chat_template", None
         ):
             self.processor.chat_template = self.tokenizer.chat_template
+        self._rtc_media_prefix_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
     def _processor_kwargs_for_request(
         self,
@@ -693,6 +831,312 @@ class Qwen3OmniPreprocessor:
 
     def _processor_use_audio_in_video_value(self, use_audio_in_video: Any) -> Any:
         return bool(use_audio_in_video)
+
+    def _rtc_media_prefix_cache_match(
+        self,
+        *,
+        media_cache_namespace: str | None,
+        video_signature: tuple[Any, ...],
+        audio_signature: tuple[Any, ...],
+        video_options: tuple[Any, ...],
+        audio_options: tuple[Any, ...],
+    ) -> dict[str, Any] | None:
+        if (
+            not _rtc_media_prefix_cache_enabled()
+            or not media_cache_namespace
+            or not media_cache_namespace.startswith("rtc:")
+        ):
+            return None
+        entry = self._rtc_media_prefix_cache.get(media_cache_namespace)
+        if entry is None:
+            return None
+        if entry.get("video_options") != video_options:
+            return None
+        if entry.get("audio_options") != audio_options:
+            return None
+        cached_video_sig = entry.get("video_signature") or ()
+        cached_audio_sig = entry.get("audio_signature") or ()
+        if not _rtc_signature_has_prefix(video_signature, cached_video_sig):
+            return None
+        if not _rtc_signature_has_prefix(audio_signature, cached_audio_sig):
+            return None
+        self._rtc_media_prefix_cache.move_to_end(media_cache_namespace)
+        return entry
+
+    def _rtc_media_prefix_cache_store(
+        self,
+        *,
+        media_cache_namespace: str | None,
+        video_signature: tuple[Any, ...],
+        audio_signature: tuple[Any, ...],
+        video_options: tuple[Any, ...],
+        audio_options: tuple[Any, ...],
+        videos: list[Any],
+        sampled_video_fps: list[float] | None,
+        extracted_audio_from_video: list[Any] | None,
+        audios: list[Any],
+    ) -> None:
+        if (
+            not _rtc_media_prefix_cache_enabled()
+            or not media_cache_namespace
+            or not media_cache_namespace.startswith("rtc:")
+        ):
+            return
+        max_entries = _rtc_media_prefix_cache_max_entries()
+        if max_entries <= 0:
+            return
+        self._rtc_media_prefix_cache[media_cache_namespace] = {
+            "video_signature": tuple(video_signature),
+            "audio_signature": tuple(audio_signature),
+            "video_options": video_options,
+            "audio_options": audio_options,
+            "videos": list(videos),
+            "sampled_video_fps": (
+                None if sampled_video_fps is None else list(sampled_video_fps)
+            ),
+            "extracted_audio_from_video": (
+                None
+                if extracted_audio_from_video is None
+                else list(extracted_audio_from_video)
+            ),
+            "audios": list(audios),
+        }
+        self._rtc_media_prefix_cache.move_to_end(media_cache_namespace)
+        while len(self._rtc_media_prefix_cache) > max_entries:
+            self._rtc_media_prefix_cache.popitem(last=False)
+
+    async def _load_media_inputs_uncached(
+        self,
+        *,
+        request_id: str,
+        raw_images: Any,
+        raw_videos: Any,
+        raw_audios: Any,
+        resolved_video_fps: float | None,
+        resolved_video_max_frames: int | None,
+        resolved_video_min_frames: int | None,
+        resolved_video_min_pixels: int | None,
+        resolved_video_max_pixels: int | None,
+        resolved_video_total_pixels: int | None,
+        resolved_video_override_max_pixels: bool,
+        extract_audio_from_video_flag: Any,
+        audio_target_sr: int,
+        media_metadata: dict[str, Any],
+    ) -> tuple[list[Any], tuple[list[Any], list[float] | None, list[Any] | None], list[Any]]:
+        return await asyncio.gather(
+            _profiled_preprocess_awaitable(
+                request_id,
+                "preprocess_image_load",
+                ensure_image_list_async(raw_images),
+                metadata={"has_images": media_metadata["has_images"]},
+            ),
+            _profiled_preprocess_awaitable(
+                request_id,
+                "preprocess_video_load",
+                ensure_video_list_async(
+                    raw_videos,
+                    fps=resolved_video_fps,
+                    max_frames=resolved_video_max_frames,
+                    min_frames=resolved_video_min_frames,
+                    min_pixels=resolved_video_min_pixels,
+                    max_pixels=resolved_video_max_pixels,
+                    total_pixels=resolved_video_total_pixels,
+                    override_max_pixels=resolved_video_override_max_pixels,
+                    extract_audio=extract_audio_from_video_flag,
+                    audio_target_sr=audio_target_sr,
+                ),
+                metadata={
+                    "has_videos": media_metadata["has_videos"],
+                    "extract_audio": media_metadata["extract_audio_from_video"],
+                },
+            ),
+            _profiled_preprocess_awaitable(
+                request_id,
+                "preprocess_audio_load",
+                ensure_audio_list_async(
+                    raw_audios,
+                    target_sr=audio_target_sr,
+                ),
+                metadata={"has_audios": media_metadata["has_audios"]},
+            ),
+        )
+
+    async def _load_media_inputs(
+        self,
+        *,
+        request_id: str,
+        raw_images: Any,
+        raw_videos: Any,
+        raw_audios: Any,
+        media_cache_namespace: str | None,
+        resolved_video_fps: float | None,
+        resolved_video_max_frames: int | None,
+        resolved_video_min_frames: int | None,
+        resolved_video_min_pixels: int | None,
+        resolved_video_max_pixels: int | None,
+        resolved_video_total_pixels: int | None,
+        resolved_video_override_max_pixels: bool,
+        extract_audio_from_video_flag: Any,
+        audio_target_sr: int,
+        media_metadata: dict[str, Any],
+    ) -> tuple[list[Any], tuple[list[Any], list[float] | None, list[Any] | None], list[Any]]:
+        use_rtc_cache = (
+            media_cache_namespace is not None
+            and not _media_value_is_present(raw_images)
+            and not isinstance(extract_audio_from_video_flag, (list, tuple))
+        )
+        video_signature = (
+            _rtc_media_sequence_signature(raw_videos) if use_rtc_cache else None
+        )
+        audio_signature = (
+            _rtc_media_sequence_signature(raw_audios) if use_rtc_cache else None
+        )
+        video_options = (
+            resolved_video_fps,
+            resolved_video_max_frames,
+            resolved_video_min_frames,
+            resolved_video_min_pixels,
+            resolved_video_max_pixels,
+            resolved_video_total_pixels,
+            bool(resolved_video_override_max_pixels),
+            bool(extract_audio_from_video_flag),
+            int(audio_target_sr),
+        )
+        audio_options = (int(audio_target_sr),)
+        entry = None
+        if video_signature is not None and audio_signature is not None:
+            entry = self._rtc_media_prefix_cache_match(
+                media_cache_namespace=media_cache_namespace,
+                video_signature=video_signature,
+                audio_signature=audio_signature,
+                video_options=video_options,
+                audio_options=audio_options,
+            )
+
+        if entry is None:
+            images, videos_result, audios = await self._load_media_inputs_uncached(
+                request_id=request_id,
+                raw_images=raw_images,
+                raw_videos=raw_videos,
+                raw_audios=raw_audios,
+                resolved_video_fps=resolved_video_fps,
+                resolved_video_max_frames=resolved_video_max_frames,
+                resolved_video_min_frames=resolved_video_min_frames,
+                resolved_video_min_pixels=resolved_video_min_pixels,
+                resolved_video_max_pixels=resolved_video_max_pixels,
+                resolved_video_total_pixels=resolved_video_total_pixels,
+                resolved_video_override_max_pixels=resolved_video_override_max_pixels,
+                extract_audio_from_video_flag=extract_audio_from_video_flag,
+                audio_target_sr=audio_target_sr,
+                media_metadata=media_metadata,
+            )
+            if video_signature is not None and audio_signature is not None:
+                videos, sampled_video_fps, extracted_audio = videos_result
+                self._rtc_media_prefix_cache_store(
+                    media_cache_namespace=media_cache_namespace,
+                    video_signature=video_signature,
+                    audio_signature=audio_signature,
+                    video_options=video_options,
+                    audio_options=audio_options,
+                    videos=list(videos),
+                    sampled_video_fps=sampled_video_fps,
+                    extracted_audio_from_video=extracted_audio,
+                    audios=list(audios),
+                )
+            return images, videos_result, audios
+
+        cached_video_signature = entry.get("video_signature") or ()
+        cached_audio_signature = entry.get("audio_signature") or ()
+        video_prefix_len = len(cached_video_signature)
+        audio_prefix_len = len(cached_audio_signature)
+        suffix_raw_videos = _rtc_media_suffix(raw_videos, video_prefix_len)
+        suffix_raw_audios = _rtc_media_suffix(raw_audios, audio_prefix_len)
+        suffix_extract_audio = _rtc_slice_extract_audio_flags(
+            extract_audio_from_video_flag,
+            video_prefix_len,
+        )
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name="preprocess_rtc_media_prefix_cache_hit",
+            metadata={
+                "video_prefix_items": video_prefix_len,
+                "video_suffix_items": len(suffix_raw_videos),
+                "audio_prefix_items": audio_prefix_len,
+                "audio_suffix_items": len(suffix_raw_audios),
+            },
+        )
+        images, suffix_videos_result, suffix_audios = await asyncio.gather(
+            _profiled_preprocess_awaitable(
+                request_id,
+                "preprocess_image_load",
+                ensure_image_list_async(raw_images),
+                metadata={
+                    "has_images": media_metadata["has_images"],
+                    "rtc_prefix_cache": "hit",
+                },
+            ),
+            _profiled_preprocess_awaitable(
+                request_id,
+                "preprocess_video_load",
+                ensure_video_list_async(
+                    suffix_raw_videos,
+                    fps=resolved_video_fps,
+                    max_frames=resolved_video_max_frames,
+                    min_frames=resolved_video_min_frames,
+                    min_pixels=resolved_video_min_pixels,
+                    max_pixels=resolved_video_max_pixels,
+                    total_pixels=resolved_video_total_pixels,
+                    override_max_pixels=resolved_video_override_max_pixels,
+                    extract_audio=suffix_extract_audio,
+                    audio_target_sr=audio_target_sr,
+                ),
+                metadata={
+                    "has_videos": bool(suffix_raw_videos),
+                    "extract_audio": media_metadata["extract_audio_from_video"],
+                    "rtc_prefix_cache": "hit",
+                    "prefix_items": video_prefix_len,
+                    "suffix_items": len(suffix_raw_videos),
+                },
+            ),
+            _profiled_preprocess_awaitable(
+                request_id,
+                "preprocess_audio_load",
+                ensure_audio_list_async(
+                    suffix_raw_audios,
+                    target_sr=audio_target_sr,
+                ),
+                metadata={
+                    "has_audios": bool(suffix_raw_audios),
+                    "rtc_prefix_cache": "hit",
+                    "prefix_items": audio_prefix_len,
+                    "suffix_items": len(suffix_raw_audios),
+                },
+            ),
+        )
+        suffix_videos, suffix_fps, suffix_extracted_audio = suffix_videos_result
+        videos = list(entry.get("videos") or []) + list(suffix_videos)
+        sampled_video_fps = _rtc_concat_optional_sequence(
+            entry.get("sampled_video_fps"), suffix_fps
+        )
+        extracted_audio = _rtc_concat_optional_sequence(
+            entry.get("extracted_audio_from_video"), suffix_extracted_audio
+        )
+        audios = list(entry.get("audios") or []) + list(suffix_audios)
+        videos_result = (videos, sampled_video_fps, extracted_audio)
+        if video_signature is not None and audio_signature is not None:
+            self._rtc_media_prefix_cache_store(
+                media_cache_namespace=media_cache_namespace,
+                video_signature=video_signature,
+                audio_signature=audio_signature,
+                video_options=video_options,
+                audio_options=audio_options,
+                videos=videos,
+                sampled_video_fps=sampled_video_fps,
+                extracted_audio_from_video=extracted_audio,
+                audios=audios,
+            )
+        return images, videos_result, audios
 
     def _media_cache_key_for_request(
         self,
@@ -891,42 +1335,22 @@ class Qwen3OmniPreprocessor:
                 metadata=media_metadata,
             )
             try:
-                images, videos_result, audios_result = await asyncio.gather(
-                    _profiled_preprocess_awaitable(
-                        payload.request_id,
-                        "preprocess_image_load",
-                        ensure_image_list_async(raw_images),
-                        metadata={"has_images": media_metadata["has_images"]},
-                    ),
-                    _profiled_preprocess_awaitable(
-                        payload.request_id,
-                        "preprocess_video_load",
-                        ensure_video_list_async(
-                            raw_videos,
-                            fps=resolved_video_fps,
-                            max_frames=resolved_video_max_frames,
-                            min_frames=resolved_video_min_frames,
-                            min_pixels=resolved_video_min_pixels,
-                            max_pixels=resolved_video_max_pixels,
-                            total_pixels=resolved_video_total_pixels,
-                            override_max_pixels=resolved_video_override_max_pixels,
-                            extract_audio=extract_audio_from_video_flag,
-                            audio_target_sr=audio_target_sr,
-                        ),
-                        metadata={
-                            "has_videos": media_metadata["has_videos"],
-                            "extract_audio": media_metadata["extract_audio_from_video"],
-                        },
-                    ),
-                    _profiled_preprocess_awaitable(
-                        payload.request_id,
-                        "preprocess_audio_load",
-                        ensure_audio_list_async(
-                            raw_audios,
-                            target_sr=audio_target_sr,
-                        ),
-                        metadata={"has_audios": media_metadata["has_audios"]},
-                    ),
+                images, videos_result, audios_result = await self._load_media_inputs(
+                    request_id=payload.request_id,
+                    raw_images=raw_images,
+                    raw_videos=raw_videos,
+                    raw_audios=raw_audios,
+                    media_cache_namespace=media_cache_namespace,
+                    resolved_video_fps=resolved_video_fps,
+                    resolved_video_max_frames=resolved_video_max_frames,
+                    resolved_video_min_frames=resolved_video_min_frames,
+                    resolved_video_min_pixels=resolved_video_min_pixels,
+                    resolved_video_max_pixels=resolved_video_max_pixels,
+                    resolved_video_total_pixels=resolved_video_total_pixels,
+                    resolved_video_override_max_pixels=resolved_video_override_max_pixels,
+                    extract_audio_from_video_flag=extract_audio_from_video_flag,
+                    audio_target_sr=audio_target_sr,
+                    media_metadata=media_metadata,
                 )
             finally:
                 _emit_event(
@@ -1323,6 +1747,23 @@ class Qwen3OmniPreprocessor:
             audio_encoder_inputs["cache_key"] = contextualized_audio_cache_key
         if audio_item_cache_keys:
             audio_encoder_inputs["audio_item_cache_keys"] = audio_item_cache_keys
+        if (
+            audio_item_cache_keys
+            and _omit_cached_audio_item_payloads_enabled()
+        ):
+            seen_item_keys = getattr(
+                self,
+                "_audio_item_payload_cache_keys",
+                None,
+            )
+            if seen_item_keys is None:
+                seen_item_keys = set()
+                self._audio_item_payload_cache_keys = seen_item_keys
+            _trim_cached_audio_item_payloads(
+                audio_encoder_inputs,
+                audio_item_cache_keys=audio_item_cache_keys,
+                seen_item_keys=seen_item_keys,
+            )
 
         encoder_inputs: dict[str, dict[str, Any]] = {}
         image_encoder_inputs = {

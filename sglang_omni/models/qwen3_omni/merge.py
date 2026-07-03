@@ -18,19 +18,32 @@ from sglang_omni.proto import StagePayload
 IMAGE_STAGE = "image_encoder"
 AUDIO_STAGE = "audio_encoder"
 logger = logging.getLogger(__name__)
+_TOKENIZER_UPPER_BOUND_CACHE_ATTR = "_sg_omni_decode_upper_bound"
 
 
 def _tokenizer_decode_upper_bound(tokenizer: Any) -> int | None:
+    cached = getattr(tokenizer, _TOKENIZER_UPPER_BOUND_CACHE_ATTR, None)
+    if cached is not None:
+        return int(cached)
+
     try:
-        return int(len(tokenizer))
+        upper_bound = int(len(tokenizer))
     except Exception:
         vocab_size = getattr(tokenizer, "vocab_size", None)
         if vocab_size is None:
-            return None
+            upper_bound = None
+        else:
+            try:
+                upper_bound = int(vocab_size)
+            except Exception:
+                upper_bound = None
+
+    if upper_bound is not None:
         try:
-            return int(vocab_size)
+            setattr(tokenizer, _TOKENIZER_UPPER_BOUND_CACHE_ATTR, upper_bound)
         except Exception:
-            return None
+            pass
+    return upper_bound
 
 
 def is_decodable_token_id(tokenizer: Any, token_id: int) -> bool:

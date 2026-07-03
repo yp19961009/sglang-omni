@@ -3,10 +3,13 @@
 """Run concurrent SGLang Qwen3.5-Omni RTC-style sessions.
 
 Each session feeds realtime prefix chunks incrementally, then measures the
-final streamed chunk. By default this mirrors the vLLM run_rtc_profile shape:
-each worker sends pre-run chunks 1..TRUNK_SIZE-1 with max_tokens=2, then
-immediately streams the actual request for TRUNK_SIZE. Use --prefix-max-tokens 0
-for pure cache-extension pre-runs.
+final streamed chunk. By default this mirrors the vLLM run_rtc_profile shape.
+``make_rtc_messages(trunk_size=T)`` contains ``T - 1`` historical audio/video
+chunks and, for the measured request, one final question chunk. Each worker
+therefore pre-runs message trunk sizes 1..TRUNK_SIZE; trunk 1 has no historical
+media, and trunk TRUNK_SIZE caches chunks 1..TRUNK_SIZE-1 before immediately
+streaming the measured TRUNK_SIZE request. Use
+--prefix-max-tokens 0 for pure cache-extension pre-runs.
 """
 
 from __future__ import annotations
@@ -182,9 +185,12 @@ def _extract_vllm_style_profile_rows(
     if not profile:
         return []
     timelines = profile.get("timelines") or {}
+    actual_request_ids = {str(request_id) for request_id in actual_request_ids}
     rows: list[dict[str, Any]] = []
     for request_id, raw_events in timelines.items():
-        if request_id.startswith(("__prefix__", "__pr__")):
+        if actual_request_ids and request_id not in actual_request_ids:
+            continue
+        if not actual_request_ids and request_id.startswith(("__prefix__", "__pr__")):
             continue
         events = sorted(raw_events, key=lambda event: float(event.get("t_rel_ms") or 0.0))
         if not events:
@@ -238,7 +244,12 @@ def _extract_vllm_style_profile_rows(
         profile_e2e_ms = (
             float(events[-1].get("t_rel_ms")) if events[-1].get("t_rel_ms") is not None else None
         )
-        if first_audio_sent_ms is None and first_audio_received_ms is None:
+        if (
+            thinker_first_emit_ms is None
+            and first_text_sent_ms is None
+            and first_audio_sent_ms is None
+            and first_audio_received_ms is None
+        ):
             continue
         code2wav_first_chunk_ms = (
             first_audio_sent_ms - first_code2wav_input_ms
@@ -326,7 +337,7 @@ def _vllm_style_profile_metrics(profile_rows: list[dict[str, Any]]) -> dict[str,
     metrics: dict[str, Any] = {
         "profile_num_requests": len(profile_rows),
         "profile_stats_source": "sglang_request_profiler_vllm_style",
-        "profile_actual_filter": "timeline has code2wav audio stream output",
+        "profile_actual_filter": "timeline has thinker first token or output stream",
         "profile_ttft_semantics": "request_admission->thinker.scheduler_first_emit",
         "profile_ttfa_semantics": (
             "request_admission->coordinator first audio chunk received from code2wav"
@@ -471,7 +482,9 @@ async def _run_prefix_extensions(
     offsets = context["offsets"]
     prefix_times: list[float] = []
     last_prompt_tokens: int | None = None
-    for trunk in range(1, args.trunk_size):
+    # Match vLLM's rtc_profile_client: prefix trunk T caches T - 1 historical
+    # chunks, and the measured trunk T adds the final question chunk.
+    for trunk in range(1, args.trunk_size + 1):
         messages = make_rtc_messages(
             test_dir=Path(args.rtc_test_dir),
             trunk_size=trunk,
@@ -491,6 +504,11 @@ async def _run_prefix_extensions(
             "modalities": ["text"],
             "max_tokens": args.prerun_max_tokens,
             "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "min_p": args.min_p,
+            "repetition_penalty": args.repetition_penalty,
+            "seed": args.seed,
             "stream": False,
             "video_fps": args.video_fps,
             "metadata": {
@@ -554,6 +572,11 @@ async def _run_actual(
         "modalities": ["text"] if args.text_only else ["text", "audio"],
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "min_p": args.min_p,
+        "repetition_penalty": args.repetition_penalty,
+        "seed": args.seed,
         "stream": True,
         "video_fps": args.video_fps,
         "metadata": metadata,
@@ -968,7 +991,12 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             check=True,
         )
         profile_json = json.loads(profile_actual_json.read_text(encoding="utf-8"))
-        profile_rows = _extract_vllm_style_profile_rows(profile_json, set())
+        profile_rows = _extract_vllm_style_profile_rows(
+            profile_json,
+            {str(row.get("profile_request_id") or row.get("request_id")) for row in rows},
+        )
+        if not profile_rows:
+            profile_rows = _extract_vllm_style_profile_rows(profile_json, set())
         profile_by_request_id = {
             str(row["profile_request_id"]): row for row in profile_rows
         }
@@ -1030,6 +1058,12 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "max_tokens": args.max_tokens,
         "prefix_max_tokens": args.prerun_max_tokens,
         "prerun_max_tokens": args.prerun_max_tokens,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "min_p": args.min_p,
+        "repetition_penalty": args.repetition_penalty,
+        "seed": args.seed,
         "bang_count": len(bang_sample_indices),
         "bang_sample_indices": bang_sample_indices,
         "ttft_semantics": ttft_semantics,
@@ -1181,7 +1215,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
     )
-    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=1e-6)
+    parser.add_argument("--top-p", type=float, default=0.8)
+    parser.add_argument("--top-k", type=int, default=1)
+    parser.add_argument("--min-p", type=float, default=0.0)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=3408)
     parser.add_argument("--talker-temperature", type=float, default=None)
     parser.add_argument("--talker-top-k", type=int, default=None)
     parser.add_argument("--talker-top-p", type=float, default=None)

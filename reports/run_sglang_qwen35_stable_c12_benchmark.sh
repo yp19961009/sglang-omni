@@ -16,18 +16,52 @@ set -euo pipefail
 # Request profiling is enabled by default so summaries include vLLM-style
 # profile_* metrics. Set PROFILE_REQUESTS=0 to skip request profiling.
 
-REPO="${REPO:-/myapp/sglang-omni}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+PYTHON_BIN="${PYTHON_BIN:-}"
+if [ -z "$PYTHON_BIN" ]; then
+  if command -v python >/dev/null 2>&1; then
+    PYTHON_BIN=python
+  else
+    PYTHON_BIN=python3
+  fi
+fi
 PORT="${PORT:-8162}"
-SIL_OFFSET="${SIL_OFFSET:-700}"
+SIL_OFFSET="${SIL_OFFSET:-0}"
 CONCURRENCY="${CONCURRENCY:-12}"
 TOTAL_SAMPLES="${TOTAL_SAMPLES:-$CONCURRENCY}"
 TRUNK_SIZE="${TRUNK_SIZE:-40}"
 STAGGER_MS="${STAGGER_MS:-0}"
-TEMPERATURE="${TEMPERATURE:-1.0}"
-VOICE="${VOICE:-m02}"
+TEMPERATURE="${TEMPERATURE:-0.000001}"
+TOP_P="${TOP_P:-0.8}"
+TOP_K="${TOP_K:-1}"
+MIN_P="${MIN_P:-0.0}"
+REPETITION_PENALTY="${REPETITION_PENALTY:-1.0}"
+SEED="${SEED:-3408}"
+TALKER_TEMPERATURE="${TALKER_TEMPERATURE:-0.9}"
+TALKER_TOP_K="${TALKER_TOP_K:-50}"
+TALKER_TOP_P="${TALKER_TOP_P:-1.0}"
+TALKER_REPETITION_PENALTY="${TALKER_REPETITION_PENALTY:-1.05}"
+TALKER_SEED="${TALKER_SEED:-3408}"
+SUBTALKER_TEMPERATURE="${SUBTALKER_TEMPERATURE:-0.1}"
+SUBTALKER_TOP_K="${SUBTALKER_TOP_K:-5}"
+SUBTALKER_TOP_P="${SUBTALKER_TOP_P:-1.0}"
+SUBTALKER_REPETITION_PENALTY="${SUBTALKER_REPETITION_PENALTY:-1.05}"
+SUBTALKER_SEED="${SUBTALKER_SEED:-3408}"
+VOICE="${VOICE:-f245}"
 BARRIER_PREFIX="${BARRIER_PREFIX:-${BARRIER_PRERUN:-0}}"
 PREFIX_MAX_TOKENS="${PREFIX_MAX_TOKENS:-${PRERUN_MAX_TOKENS:-2}}"
 PROFILE_REQUESTS="${PROFILE_REQUESTS:-1}"
+THINKER_ONLY="${THINKER_ONLY:-${SGLANG_OMNI_THINKER_ONLY:-0}}"
+TEXT_ONLY="${TEXT_ONLY:-0}"
+case "$THINKER_ONLY" in
+  1|true|TRUE|yes|YES) TEXT_ONLY=1 ;;
+  0|false|FALSE|no|NO) ;;
+  *)
+    echo "THINKER_ONLY must be 1/0, true/false, or yes/no; got: $THINKER_ONLY" >&2
+    exit 1
+    ;;
+esac
 RUN_LABEL="${RUN_LABEL:-c${CONCURRENCY}}"
 RUN_DIR="${RUN_DIR:-}"
 
@@ -57,8 +91,65 @@ case "$PROFILE_REQUESTS" in
     ;;
 esac
 
+case "$TEXT_ONLY" in
+  1|true|TRUE|yes|YES)
+    text_args=(--text-only)
+    if [ "$THINKER_ONLY" = "1" ] || [ "$THINKER_ONLY" = "true" ] || [ "$THINKER_ONLY" = "TRUE" ] || [ "$THINKER_ONLY" = "yes" ] || [ "$THINKER_ONLY" = "YES" ]; then
+      MODE_LABEL="thinkeronly"
+    else
+      MODE_LABEL="textonly"
+    fi
+    ;;
+  0|false|FALSE|no|NO)
+    text_args=(); MODE_LABEL="textaudio" ;;
+  *)
+    echo "TEXT_ONLY must be 1/0, true/false, or yes/no; got: $TEXT_ONLY" >&2
+    exit 1
+    ;;
+esac
+
 if [ -z "$RUN_DIR" ]; then
-  RUN_DIR="$(ls -td results/sg_realtime_stablefast_*_${PORT}_* results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimpartial_cache2048_64g_run12_c2w4_relay1024_cvd345_${PORT}_* results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimfix_cache2048_64g_run12_c2w4_profile_relay1024_cvd345_${PORT}_* results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimfix_cache2048_64g_run12_relay1024_cvd345_${PORT}_* 2>/dev/null | head -1)"
+  RUN_DIR="$($PYTHON_BIN - "$PORT" <<'PY'
+import glob
+import os
+import subprocess
+import sys
+
+port = sys.argv[1]
+patterns = [
+    f"results/sg_realtime_stablefast_*_{port}_*",
+    f"results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimpartial_cache2048_64g_run12_c2w4_relay1024_cvd345_{port}_*",
+    f"results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimfix_cache2048_64g_run12_c2w4_profile_relay1024_cvd345_{port}_*",
+    f"results/sg_realtime_c12_decodebatch8_ready_subset1_mem080_item256m_omitcached_trimfix_cache2048_64g_run12_relay1024_cvd345_{port}_*",
+]
+dirs = []
+for pattern in patterns:
+    dirs.extend(path for path in glob.glob(pattern) if os.path.isdir(path))
+active_pid = None
+try:
+    ps = subprocess.check_output(["ps", "-eo", "pid,args"], text=True)
+    for line in ps.splitlines():
+        if "sglang_omni.cli serve" in line and f"--port {port}" in line:
+            active_pid = line.strip().split(None, 1)[0]
+            break
+except Exception:
+    active_pid = None
+if active_pid:
+    pid_dirs = []
+    for path in dirs:
+        pid_path = os.path.join(path, "server.pid")
+        try:
+            if open(pid_path).read().strip() == active_pid:
+                pid_dirs.append(path)
+        except OSError:
+            pass
+    if pid_dirs:
+        print(max(pid_dirs, key=os.path.getmtime))
+        raise SystemExit(0)
+if dirs:
+    print(max(dirs, key=os.path.getmtime))
+PY
+)"
 fi
 if [ -z "$RUN_DIR" ]; then
   echo "No stable run directory found. Start the server script first." >&2
@@ -69,7 +160,7 @@ echo "Using RUN_DIR=$RUN_DIR"
 echo "Checking active $PORT service..."
 ps -eo pid,etimes,args | grep 'sglang_omni.cli serve' | grep -- "--port $PORT" | grep -v grep
 
-OUT_DIR="$RUN_DIR/client_c${CONCURRENCY}_rtcflow_${RUN_SHAPE}_sil${SIL_OFFSET}_trunk${TRUNK_SIZE}_samples${TOTAL_SAMPLES}_stagger${STAGGER_MS}_temp${TEMPERATURE}_prefixmt${PREFIX_MAX_TOKENS}_${RUN_LABEL}_$(date +%H%M%S)"
+OUT_DIR="$RUN_DIR/client_c${CONCURRENCY}_rtcflow_${RUN_SHAPE}_${MODE_LABEL}_sil${SIL_OFFSET}_trunk${TRUNK_SIZE}_samples${TOTAL_SAMPLES}_stagger${STAGGER_MS}_temp${TEMPERATURE}_topk${TOP_K}_topp${TOP_P}_prefixmt${PREFIX_MAX_TOKENS}_${RUN_LABEL}_$(date +%H%M%S)"
 echo "$OUT_DIR" > "$RUN_DIR/latest_validation_client_dir.txt"
 
 echo "--- benchmark config ---"
@@ -80,17 +171,34 @@ echo "trunk_size=$TRUNK_SIZE"
 echo "stagger_ms=$STAGGER_MS"
 echo "sil_offset=$SIL_OFFSET"
 echo "temperature=$TEMPERATURE"
+echo "top_p=$TOP_P"
+echo "top_k=$TOP_K"
+echo "min_p=$MIN_P"
+echo "repetition_penalty=$REPETITION_PENALTY"
+echo "seed=$SEED"
+echo "talker_temperature=$TALKER_TEMPERATURE"
+echo "talker_top_k=$TALKER_TOP_K"
+echo "talker_top_p=$TALKER_TOP_P"
+echo "talker_repetition_penalty=$TALKER_REPETITION_PENALTY"
+echo "talker_seed=$TALKER_SEED"
+echo "subtalker_temperature=$SUBTALKER_TEMPERATURE"
+echo "subtalker_top_k=$SUBTALKER_TOP_K"
+echo "subtalker_top_p=$SUBTALKER_TOP_P"
+echo "subtalker_repetition_penalty=$SUBTALKER_REPETITION_PENALTY"
+echo "subtalker_seed=$SUBTALKER_SEED"
 echo "voice=$VOICE"
 echo "barrier_prefix=$BARRIER_PREFIX"
 echo "realtime_shape=$RUN_SHAPE: per-worker prefix chunks 1..$((TRUNK_SIZE - 1)), then measured actual chunk $TRUNK_SIZE"
 echo "prefix_max_tokens=$PREFIX_MAX_TOKENS"
+echo "text_only=$TEXT_ONLY"
+echo "thinker_only=$THINKER_ONLY"
 echo "profile_requests=$PROFILE_REQUESTS"
 if [ -n "$PROFILE_RUN_ID" ]; then
   echo "profile_run_id=$PROFILE_RUN_ID"
 fi
 echo "out_dir=$OUT_DIR"
 
-PYTHONPATH=. python benchmarks/eval/qwen35_omni_sglang_rtc_concurrency.py \
+PYTHONPATH=. "$PYTHON_BIN" benchmarks/eval/qwen35_omni_sglang_rtc_concurrency.py \
   --base-url "http://127.0.0.1:${PORT}" \
   --model qwen3_5-omni \
   --output-dir "$OUT_DIR" \
@@ -100,19 +208,36 @@ PYTHONPATH=. python benchmarks/eval/qwen35_omni_sglang_rtc_concurrency.py \
   --stagger-ms "$STAGGER_MS" \
   --sil-offset "$SIL_OFFSET" \
   --temperature "$TEMPERATURE" \
+  --top-p "$TOP_P" \
+  --top-k "$TOP_K" \
+  --min-p "$MIN_P" \
+  --repetition-penalty "$REPETITION_PENALTY" \
+  --seed "$SEED" \
   --voice "$VOICE" \
+  --talker-temperature "$TALKER_TEMPERATURE" \
+  --talker-top-k "$TALKER_TOP_K" \
+  --talker-top-p "$TALKER_TOP_P" \
+  --talker-repetition-penalty "$TALKER_REPETITION_PENALTY" \
+  --talker-seed "$TALKER_SEED" \
+  --subtalker-temperature "$SUBTALKER_TEMPERATURE" \
+  --subtalker-top-k "$SUBTALKER_TOP_K" \
+  --subtalker-top-p "$SUBTALKER_TOP_P" \
+  --subtalker-repetition-penalty "$SUBTALKER_REPETITION_PENALTY" \
+  --subtalker-seed "$SUBTALKER_SEED" \
   --prefix-max-tokens "$PREFIX_MAX_TOKENS" \
+  "${text_args[@]}" \
   "${barrier_args[@]}" \
   "${profile_args[@]}"
 
 echo "--- metrics ---"
-python - <<PY
+"$PYTHON_BIN" - <<PY
 import json, glob, os
 out = "$OUT_DIR"
 m = json.load(open(os.path.join(out, "metrics.json")))
 for k in [
     "completed", "failed", "actual_elapsed_s",
-    "concurrency_shape", "prefix_max_tokens",
+    "concurrency_shape", "prefix_max_tokens", "mode",
+    "temperature", "top_p", "top_k", "min_p", "repetition_penalty", "seed",
     "ttft_semantics", "ttfa_semantics",
     "ttft_avg_ms", "ttft_p99_ms",
     "ttfa_avg_ms", "ttfa_p99_ms",

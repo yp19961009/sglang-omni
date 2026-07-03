@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import OrderedDict
+from functools import lru_cache
 from dataclasses import dataclass
 import logging
 import os
@@ -18,6 +19,7 @@ import av
 import librosa
 import torch
 from qwen_vl_utils import vision_process as qwen_vision
+from torchvision.io import ImageReadMode, read_image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as tv_f
 
@@ -272,6 +274,110 @@ def _local_video_preprocess_cache_key(
         f"{cache_key}|backend={backend}|image_mode={image_mode}"
         f"|extract_audio={bool(extract_audio)}|audio_target_sr={int(audio_target_sr)}"
     )
+
+
+@lru_cache(maxsize=8192)
+def _local_frame_path_tuple_exists(frame_paths: tuple[str, ...]) -> bool:
+    return all(Path(frame).is_file() for frame in frame_paths)
+
+
+def _local_frame_path_tuple(video_item: Any) -> tuple[str, ...] | None:
+    if not isinstance(video_item, (list, tuple)) or not video_item:
+        return None
+    frame_paths: list[str] = []
+    for frame in video_item:
+        if not isinstance(frame, (str, Path)):
+            return None
+        if _is_url(frame):
+            return None
+        frame_paths.append(str(frame))
+    return tuple(frame_paths)
+
+
+@lru_cache(maxsize=8192)
+def _cached_local_frame_list_preprocess_cache_key(
+    frame_paths: tuple[str, ...],
+    fps: float | None,
+    max_frames: int | None,
+    min_frames: int | None,
+    min_pixels: int | None,
+    max_pixels: int | None,
+    total_pixels: int | None,
+    override_max_pixels: bool,
+    extract_audio: bool,
+    audio_target_sr: int,
+    image_mode: str,
+) -> str | None:
+    cache_key = compute_video_cache_key(
+        list(frame_paths),
+        fps=fps,
+        max_frames=max_frames,
+        min_frames=min_frames,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+        total_pixels=total_pixels,
+        override_max_pixels=override_max_pixels,
+    )
+    if cache_key is None:
+        return None
+    return (
+        f"{cache_key}|frame_list_loader=torchvision_io"
+        f"|image_mode={image_mode}|extract_audio={bool(extract_audio)}"
+        f"|audio_target_sr={int(audio_target_sr)}"
+    )
+
+
+def _local_frame_list_preprocess_cache_key(
+    frame_paths: list[str | Path],
+    *,
+    fps: float | None,
+    max_frames: int | None,
+    min_frames: int | None,
+    min_pixels: int | None,
+    max_pixels: int | None,
+    total_pixels: int | None,
+    override_max_pixels: bool,
+    extract_audio: bool,
+    audio_target_sr: int,
+    image_mode: str,
+) -> str | None:
+    frame_path_tuple = tuple(str(frame) for frame in frame_paths)
+    return _cached_local_frame_list_preprocess_cache_key(
+        frame_path_tuple,
+        fps,
+        max_frames,
+        min_frames,
+        min_pixels,
+        max_pixels,
+        total_pixels,
+        bool(override_max_pixels),
+        bool(extract_audio),
+        int(audio_target_sr),
+        image_mode,
+    )
+
+
+def _is_local_frame_path_list(video_item: Any) -> bool:
+    frame_paths = _local_frame_path_tuple(video_item)
+    return frame_paths is not None and _local_frame_path_tuple_exists(frame_paths)
+
+
+def load_video_frame_paths(
+    frame_paths: list[str | Path],
+    *,
+    image_mode: str = "RGB",
+) -> torch.Tensor:
+    """Load a list of local frames as a raw uint8 video tensor.
+
+    The Qwen video processor still handles resize, normalization, and patch
+    packing. Caching this raw decode mirrors vLLM's image-loader cache and
+    keeps repeated RTC frame-list chunks out of the hot processor path.
+    """
+
+    if image_mode.upper() != "RGB":
+        logger.debug("frame-list video loader only supports RGB; got %s", image_mode)
+    frames = [read_image(str(path), mode=ImageReadMode.RGB) for path in frame_paths]
+    return torch.stack(frames, dim=0)
 
 
 class VideoDecodeError(RuntimeError):
@@ -547,6 +653,110 @@ async def _load_local_video_with_cache(
     return result
 
 
+async def _load_local_frame_list_uncached(
+    frame_paths: list[str | Path],
+    *,
+    fps: float | None,
+    image_mode: str,
+    extract_audio: bool,
+    audio_target_sr: int,
+) -> tuple[Any, float, Any | None]:
+    del extract_audio, audio_target_sr
+    loop = asyncio.get_running_loop()
+    video = await loop.run_in_executor(
+        global_thread_pool,
+        load_video_frame_paths,
+        list(frame_paths),
+    )
+    return video, float(fps) if fps is not None else 2.0, None
+
+
+async def _load_local_frame_list_with_cache(
+    frame_paths: list[str | Path],
+    *,
+    fps: float | None,
+    max_frames: int | None,
+    min_frames: int | None,
+    min_pixels: int | None,
+    max_pixels: int | None,
+    total_pixels: int | None,
+    override_max_pixels: bool,
+    image_mode: str,
+    extract_audio: bool,
+    audio_target_sr: int,
+) -> tuple[Any, float, Any | None]:
+    cache_key = _local_frame_list_preprocess_cache_key(
+        frame_paths,
+        fps=fps,
+        max_frames=max_frames,
+        min_frames=min_frames,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+        total_pixels=total_pixels,
+        override_max_pixels=override_max_pixels,
+        extract_audio=extract_audio,
+        audio_target_sr=audio_target_sr,
+        image_mode=image_mode,
+    )
+    if cache_key is None:
+        return await _load_local_frame_list_uncached(
+            frame_paths,
+            fps=fps,
+            image_mode=image_mode,
+            extract_audio=extract_audio,
+            audio_target_sr=audio_target_sr,
+        )
+
+    cached = _video_preprocess_cache_get(cache_key)
+    trace_path = f"frame_list:{len(frame_paths)}"
+    if cached is not None:
+        _trace_video_preprocess_cache(
+            "return_hit", cache_key=cache_key, path=trace_path
+        )
+        return cached
+
+    loop = asyncio.get_running_loop()
+    is_leader = False
+    with _VIDEO_PREPROCESS_CACHE_LOCK:
+        inflight = _VIDEO_PREPROCESS_INFLIGHT.get(cache_key)
+        if inflight is not None and inflight[0] is loop and not inflight[1].done():
+            task = inflight[1]
+            _trace_video_preprocess_cache(
+                "wait_inflight", cache_key=cache_key, path=trace_path
+            )
+        else:
+            task = loop.create_task(
+                _load_local_frame_list_uncached(
+                    frame_paths,
+                    fps=fps,
+                    image_mode=image_mode,
+                    extract_audio=extract_audio,
+                    audio_target_sr=audio_target_sr,
+                )
+            )
+            _VIDEO_PREPROCESS_INFLIGHT[cache_key] = (loop, task)
+            is_leader = True
+            _trace_video_preprocess_cache(
+                "decode_start", cache_key=cache_key, path=trace_path
+            )
+
+    try:
+        result = await asyncio.shield(task)
+    except Exception:
+        if is_leader:
+            with _VIDEO_PREPROCESS_CACHE_LOCK:
+                if _VIDEO_PREPROCESS_INFLIGHT.get(cache_key) == (loop, task):
+                    _VIDEO_PREPROCESS_INFLIGHT.pop(cache_key, None)
+        raise
+
+    if is_leader:
+        _video_preprocess_cache_put(cache_key, result)
+        with _VIDEO_PREPROCESS_CACHE_LOCK:
+            if _VIDEO_PREPROCESS_INFLIGHT.get(cache_key) == (loop, task):
+                _VIDEO_PREPROCESS_INFLIGHT.pop(cache_key, None)
+    return result
+
+
 async def ensure_video_list_async(
     videos: Any,
     *,
@@ -649,7 +859,31 @@ async def ensure_video_list_async(
     # First pass: identify items that need loading
     for idx, video_item in enumerate(items):
         extract_audio_for_item = extract_audio_flags[idx]
-        if isinstance(video_item, (str, Path)):
+        if _is_local_frame_path_list(video_item):
+            # RTC tests send each video chunk as a list of JPEG frames. Treat
+            # that list as one video item and cache the raw decoded tensor,
+            # matching vLLM's image-loader cache behavior.
+            coro = _load_local_frame_list_with_cache(
+                list(video_item),
+                fps=fps,
+                max_frames=max_frames,
+                min_frames=min_frames,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+                total_pixels=total_pixels,
+                override_max_pixels=override_max_pixels,
+                image_mode=image_mode,
+                extract_audio=extract_audio_for_item,
+                audio_target_sr=audio_target_sr,
+            )
+            task = asyncio.create_task(coro)
+            coroutines.append(task)
+            url_indices.append(idx)
+            normalized.append(None)  # Placeholder for video
+            sample_fps_list.append(0.0)  # Placeholder for fps
+            if should_return_audio:
+                extracted_audios.append(None)  # Placeholder for audio
+        elif isinstance(video_item, (str, Path)):
             if _is_url(video_item):
                 # Create coroutine for async URL fetching with optional audio extraction
                 coro = _load_video_with_audio(

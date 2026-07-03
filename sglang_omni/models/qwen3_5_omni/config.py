@@ -65,6 +65,8 @@ _MM_AGGREGATE_RELAY_GPU_ENV = "SGLANG_OMNI_MM_AGGREGATE_RELAY_ON_THINKER_GPU"
 _MM_AGGREGATE_RELAY_TALKER_GPU_ENV = (
     "SGLANG_OMNI_MM_AGGREGATE_RELAY_ON_TALKER_GPU"
 )
+_IMAGE_ENCODER_GPU_ENV = "SGLANG_OMNI_IMAGE_ENCODER_GPU"
+_AUDIO_ENCODER_GPU_ENV = "SGLANG_OMNI_AUDIO_ENCODER_GPU"
 
 # Keep architecture names aligned with the reference registry. The root model
 # uses the root architecture, while thinker-only and thinker-MTP names are
@@ -93,6 +95,17 @@ def normalize_qwen35_omni_model_name(model_name: str | None) -> str | None:
         # point so /v1/models, result JSON, and benchmark labels stay stable.
         return QWEN3_5_OMNI_MODEL_NAME
     return model_name
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed >= 0 else default
 
 
 def _qwen35_ar_server_args_overrides() -> dict[str, int]:
@@ -367,10 +380,22 @@ def _code2wav_stage(*, gpu: int, process: str) -> StageConfig:
 
 
 def _text_stages() -> list[StageConfig]:
+    image_encoder_gpu = _env_int(_IMAGE_ENCODER_GPU_ENV, 0)
+    audio_encoder_gpu = _env_int(_AUDIO_ENCODER_GPU_ENV, 0)
+    image_encoder_process = (
+        "pipeline" if image_encoder_gpu == 0 else "image_encoder"
+    )
+    audio_encoder_process = (
+        "pipeline" if audio_encoder_gpu == 0 else "audio_encoder"
+    )
     return [
         _preprocessing_stage(process="pipeline"),
-        _image_encoder_stage(gpu=0, process="pipeline"),
-        _audio_encoder_stage(gpu=0, process="pipeline"),
+        _image_encoder_stage(
+            gpu=image_encoder_gpu, process=image_encoder_process
+        ),
+        _audio_encoder_stage(
+            gpu=audio_encoder_gpu, process=audio_encoder_process
+        ),
         _aggregate_stage(process="pipeline", speech_enabled=False),
         _thinker_stage(gpu=0, speech_enabled=False, process="pipeline"),
         _decode_stage(process="pipeline"),
@@ -393,14 +418,16 @@ def _speech_stages(
         if _env_enabled(_MM_AGGREGATE_RELAY_TALKER_GPU_ENV)
         else None
     )
+    image_encoder_gpu = _env_int(_IMAGE_ENCODER_GPU_ENV, thinker_gpu)
+    audio_encoder_gpu = _env_int(_AUDIO_ENCODER_GPU_ENV, thinker_gpu)
     return [
         _preprocessing_stage(process=process_by_stage["preprocessing"]),
         _image_encoder_stage(
-            gpu=thinker_gpu,
+            gpu=image_encoder_gpu,
             process=process_by_stage["image_encoder"],
         ),
         _audio_encoder_stage(
-            gpu=thinker_gpu,
+            gpu=audio_encoder_gpu,
             process=process_by_stage["audio_encoder"],
         ),
         _aggregate_stage(

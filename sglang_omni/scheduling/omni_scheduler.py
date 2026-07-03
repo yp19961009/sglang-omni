@@ -56,6 +56,9 @@ _PRIORITY_PREFILL_BATCH_WAIT_MS_ENV = (
 _DEFER_PREFILL_DURING_PRIORITY_DECODE_ENV = (
     "SGLANG_OMNI_DEFER_PREFILL_DURING_PRIORITY_DECODE"
 )
+_PRIORITY_DECODE_WARMUP_CHUNKS_ENV = (
+    "SGLANG_OMNI_PRIORITY_DECODE_WARMUP_CHUNKS"
+)
 _DEBUG_MAMBA_RTC_ENV = "SGLANG_OMNI_DEBUG_MAMBA_RTC"
 _RTC_DISABLE_ACTUAL_MAMBA_TRACK_ENV = "QWEN35_RTC_DISABLE_ACTUAL_MAMBA_TRACK"
 _RTC_PROTECTED_PREFIX_DEPTH_ENV = "QWEN35_RTC_PROTECT_PRERUN_PREFIX_CACHE_DEPTH"
@@ -219,6 +222,21 @@ def _defer_prefill_during_priority_decode_enabled() -> bool:
     if raw is None or raw == "":
         return False
     return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _priority_decode_warmup_chunks() -> int:
+    raw = os.getenv(_PRIORITY_DECODE_WARMUP_CHUNKS_ENV)
+    if raw is None or raw == "":
+        return 0
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; disabling priority decode warmup",
+            _PRIORITY_DECODE_WARMUP_CHUNKS_ENV,
+            raw,
+        )
+        return 0
 
 
 class _NoOpSender:
@@ -526,7 +544,9 @@ class OmniScheduler:
         self._defer_prefill_during_priority_decode = (
             _defer_prefill_during_priority_decode_enabled()
         )
+        self._priority_decode_warmup_chunks = _priority_decode_warmup_chunks()
         self._priority_prefill_rids: set[str] = set()
+        self._priority_stream_emit_counts: dict[str, int] = {}
         self._omni_protected_prefix_nodes: dict[str, list[Any]] = {}
 
     def _init_upstream_compat_flags(self, server_args: Any) -> None:
@@ -886,6 +906,9 @@ class OmniScheduler:
     def get_new_batch_prefill(self):
         """Keep RTC actual prefill ahead of background pre-run cache writes."""
 
+        if self.waiting_queue and self._priority_decode_warmup_pending():
+            return None
+
         if (
             self._isolate_prefill_only_batches
             and self.chunked_req is not None
@@ -1062,6 +1085,33 @@ class OmniScheduler:
             if rid is not None:
                 priority_rids.add(rid)
 
+    def _is_priority_prefill_req(self, req: Any) -> bool:
+        rid = getattr(req, "rid", None)
+        priority_rids = self.__dict__.setdefault("_priority_prefill_rids", set())
+        return bool(getattr(req, _PRIORITIZE_PREFILL_ATTR, False)) or rid in priority_rids
+
+    def _priority_decode_warmup_pending(self) -> bool:
+        target_chunks = int(getattr(self, "_priority_decode_warmup_chunks", 0) or 0)
+        if target_chunks <= 0 or self.running_batch is None:
+            return False
+
+        emit_counts = self.__dict__.setdefault("_priority_stream_emit_counts", {})
+        first_emit_done = self.__dict__.setdefault("_first_emit_done", set())
+        for req in getattr(self.running_batch, "reqs", []):
+            if not self._is_priority_prefill_req(req):
+                continue
+            rid = getattr(req, "rid", None)
+            if rid is None or rid not in first_emit_done:
+                continue
+            try:
+                if req.finished():
+                    continue
+            except Exception:
+                pass
+            if int(emit_counts.get(rid, 0) or 0) < target_chunks:
+                return True
+        return False
+
     def _coalesce_priority_prefill_reqs(self) -> None:
         wait_s = float(getattr(self, "_priority_prefill_batch_wait_s", 0.0) or 0.0)
         if wait_s <= 0 or not self._prioritize_stream_prefill:
@@ -1080,14 +1130,13 @@ class OmniScheduler:
 
     def _forget_priority_prefill_rid(self, rid: str) -> None:
         self.__dict__.setdefault("_priority_prefill_rids", set()).discard(rid)
+        self.__dict__.setdefault("_priority_stream_emit_counts", {}).pop(rid, None)
 
     def _running_batch_has_priority_prefill_req(self) -> bool:
         if self.running_batch is None:
             return False
-        priority_rids = self.__dict__.setdefault("_priority_prefill_rids", set())
         return any(
-            bool(getattr(req, _PRIORITIZE_PREFILL_ATTR, False))
-            or getattr(req, "rid", None) in priority_rids
+            self._is_priority_prefill_req(req)
             for req in getattr(self.running_batch, "reqs", [])
         )
 
@@ -1394,6 +1443,14 @@ class OmniScheduler:
             emitted_any = False
             prioritize_first_emit_batch = rid not in self._first_emit_done
             for msg in self._stream_output_builder(rid, sched_req.data, req_output):
+                if (
+                    getattr(msg, "target", None) == "talker_ar"
+                    and rid in self._priority_prefill_rids
+                ):
+                    emit_counts = self.__dict__.setdefault(
+                        "_priority_stream_emit_counts", {}
+                    )
+                    emit_counts[rid] = int(emit_counts.get(rid, 0) or 0) + 1
                 first_stream_for_request = False
                 if prioritize_first_emit_batch:
                     setattr(msg, _PRIORITY_MARKER_ATTR, True)

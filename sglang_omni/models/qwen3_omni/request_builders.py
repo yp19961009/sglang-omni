@@ -715,6 +715,7 @@ class EncoderRequestData:
     skip_result: dict[str, Any] | None = None
     item_cache_keys: dict[str, tuple[str | None, ...]] = field(default_factory=dict)
     item_pixel_present: dict[str, tuple[bool, ...]] = field(default_factory=dict)
+    item_feature_present: dict[str, tuple[bool, ...]] = field(default_factory=dict)
     item_pixel_fallbacks: dict[str, tuple[Any | None, ...]] = field(
         default_factory=dict
     )
@@ -735,6 +736,7 @@ def build_encoder_request(
     cache_key = inputs.get("cache_key")
     item_cache_keys: dict[str, tuple[str | None, ...]] = {}
     item_pixel_present: dict[str, tuple[bool, ...]] = {}
+    item_feature_present: dict[str, tuple[bool, ...]] = {}
     item_pixel_fallbacks: dict[str, tuple[Any | None, ...]] = {}
     for modality, key_name in (
         ("image", "image_item_cache_keys"),
@@ -753,6 +755,11 @@ def build_encoder_request(
         raw_mask = inputs.get(key_name)
         if isinstance(raw_mask, (list, tuple)):
             item_pixel_present[modality] = tuple(bool(item) for item in raw_mask)
+    raw_audio_feature_mask = inputs.get("audio_item_feature_present")
+    if isinstance(raw_audio_feature_mask, (list, tuple)):
+        item_feature_present["audio"] = tuple(
+            bool(item) for item in raw_audio_feature_mask
+        )
     for modality, key_name in (
         ("image", "image_item_pixel_fallbacks"),
         ("video", "video_item_pixel_fallbacks"),
@@ -772,6 +779,7 @@ def build_encoder_request(
             "audio_item_cache_keys",
             "image_item_pixel_present",
             "video_item_pixel_present",
+            "audio_item_feature_present",
             "image_item_pixel_fallbacks",
             "video_item_pixel_fallbacks",
         )
@@ -781,6 +789,7 @@ def build_encoder_request(
         cache_key=str(cache_key) if cache_key is not None else None,
         item_cache_keys=item_cache_keys,
         item_pixel_present=item_pixel_present,
+        item_feature_present=item_feature_present,
         item_pixel_fallbacks=item_pixel_fallbacks,
     )
 

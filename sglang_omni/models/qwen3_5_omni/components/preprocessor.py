@@ -80,7 +80,12 @@ _AUDIO_REQUEST_PARAM_INPUT_ALIASES = _AUDIO_REQUEST_INPUT_ALIASES[:-1]
 _PROCESSOR_ITEM_CACHE_KEYS = "_sglang_omni_item_cache_keys"
 _PROCESSOR_PROFILE_REQUEST_ID = "_sglang_omni_profile_request_id"
 _PROCESSOR_TRACE_CACHE_SUMMARY = "_sglang_omni_trace_cache_summary"
-_PROCESSOR_ITEM_CACHE_MAX_ENTRIES = 512
+_PROCESSOR_ITEM_CACHE_MAX_ENTRIES_ENV = (
+    "SGLANG_OMNI_PROCESSOR_ITEM_CACHE_MAX_ENTRIES"
+)
+_PROCESSOR_ITEM_CACHE_MAX_ENTRIES = max(
+    int(os.getenv(_PROCESSOR_ITEM_CACHE_MAX_ENTRIES_ENV, "512")), 1
+)
 _PLAIN_TEXT_TOKEN_CACHE_MAX_ENTRIES = 4096
 _OMIT_CACHED_VISUAL_ITEM_PAYLOADS_ENV = (
     "SGLANG_OMNI_OMIT_CACHED_VISUAL_ITEM_PAYLOADS"
@@ -88,6 +93,10 @@ _OMIT_CACHED_VISUAL_ITEM_PAYLOADS_ENV = (
 _VIDEO_PROCESSOR_CACHE_CLONE_ON_HIT_ENV = (
     "SGLANG_OMNI_VIDEO_PROCESSOR_CACHE_CLONE_ON_HIT"
 )
+_PROCESSOR_CACHE_CLONE_ON_SET_ENV = (
+    "SGLANG_OMNI_PROCESSOR_CACHE_CLONE_ON_SET"
+)
+_QWEN35_RTC_PROMPT_STYLE_ENV = "SGLANG_OMNI_QWEN35_RTC_PROMPT_STYLE"
 _TRACE_PROCESSOR_CACHE_ENV = "SGLANG_OMNI_TRACE_PROCESSOR_CACHE"
 _TRACE_PROCESSOR_CACHE_DETAIL_ENV = "SGLANG_OMNI_TRACE_PROCESSOR_CACHE_DETAIL"
 _IMAGE_REQUEST_INPUT_ALIASES = (
@@ -374,6 +383,18 @@ def _video_processor_cache_clone_on_hit_enabled() -> bool:
     return value.lower() not in ("0", "false", "no", "off")
 
 
+def _processor_cache_clone_on_set_enabled() -> bool:
+    value = os.getenv(_PROCESSOR_CACHE_CLONE_ON_SET_ENV)
+    if value is None or value == "":
+        return True
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def _qwen35_rtc_prompt_style_enabled() -> bool:
+    value = os.getenv(_QWEN35_RTC_PROMPT_STYLE_ENV, "")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
 def _cached_video_pixel_fallbacks_enabled() -> bool:
     value = os.getenv("SGLANG_OMNI_CACHED_VIDEO_PIXEL_FALLBACKS")
     if value is None or value == "":
@@ -454,6 +475,8 @@ class _Qwen35ProcessorShim:
         self.vision_eos_token = tokenizer.vision_eos_token
         self.audio_bos_token = tokenizer.audio_bos_token
         self.audio_eos_token = tokenizer.audio_eos_token
+        self.im_start_token = getattr(tokenizer, "im_start_token", "<|im_start|>")
+        self.im_end_token = getattr(tokenizer, "im_end_token", "<|im_end|>")
         self.video_token_block = (
             self.vision_bos_token + self.video_token + self.vision_eos_token
         )
@@ -1202,7 +1225,10 @@ class _Qwen35ProcessorShim:
                     modality, "skip_store_no_key", cache_key=cache_key, index=index
                 )
             return
-        cache[cache_key] = _clone_processor_cache_value(value)
+        if _processor_cache_clone_on_set_enabled():
+            cache[cache_key] = _clone_processor_cache_value(value)
+        else:
+            cache[cache_key] = value
         cache.move_to_end(cache_key)
         if trace_detail:
             _trace_processor_cache(
@@ -1333,13 +1359,26 @@ class _Qwen35ProcessorShim:
         merge_length_image = self.image_processor.merge_size**2
         processed_text = []
         for sample in text:
+            rtc_metadata = (
+                self._rtc_prompt_style_metadata(sample)
+                if _qwen35_rtc_prompt_style_enabled()
+                else None
+            )
+            rtc_audio_metadata = iter((rtc_metadata or {}).get("audio", ()))
+            rtc_video_metadata = iter((rtc_metadata or {}).get("video", ()))
+
             def _replace_special_token(match: re.Match[str]) -> str:
                 special_token = match.group(0)
                 if special_token == self.audio_token:
-                    return self._get_audio_tokens(
+                    token_text = self._get_audio_tokens(
                         next(audio_lengths),
                         audio_tokens_per_second,
                         audio_timestamp_interval,
+                    )
+                    return self._apply_rtc_audio_prompt_style(
+                        token_text,
+                        next(rtc_audio_metadata, None),
+                        timestamp_interval=audio_timestamp_interval,
                     )
                 if special_token == self.image_token:
                     image_seq_length = next(image_grid_thw).prod() // merge_length_image
@@ -1348,13 +1387,17 @@ class _Qwen35ProcessorShim:
                     metadata = next(video_metadata)
                     use_audio = next(use_audio_in_video)
                     metadata_fps = getattr(metadata, "fps", None) or 24
-                    return self._get_video_tokens(
+                    token_text = self._get_video_tokens(
                         metadata.frames_indices,
                         metadata_fps,
                         next(video_grid_thw),
                         self.image_processor.merge_size,
                         audio_tokens_per_second if use_audio else None,
                         next(audio_lengths) if use_audio else None,
+                    )
+                    return self._apply_rtc_video_prompt_style(
+                        token_text,
+                        next(rtc_video_metadata, None),
                     )
                 return special_token
 
@@ -1365,6 +1408,152 @@ class _Qwen35ProcessorShim:
                 sample = sample.replace("<|video_placeholder|>", self.video_token)
             processed_text.append(sample)
         return processed_text
+
+    def _rtc_prompt_style_metadata(self, sample: str) -> dict[str, list[dict[str, Any]]]:
+        audio_metadata: list[dict[str, Any]] = []
+        video_metadata: list[dict[str, Any]] = []
+        for segment in self._iter_chat_template_segments(sample):
+            media_items = self._segment_media_items(segment)
+            if media_items:
+                self._append_rtc_segment_metadata(
+                    media_items,
+                    audio_metadata=audio_metadata,
+                    video_metadata=video_metadata,
+                )
+        return {"audio": audio_metadata, "video": video_metadata}
+
+    def _iter_chat_template_segments(self, sample: str):
+        start_token = self.im_start_token or "<|im_start|>"
+        end_token = self.im_end_token or "<|im_end|>"
+        cursor = 0
+        emitted = False
+        while True:
+            start = sample.find(start_token, cursor)
+            if start < 0:
+                break
+            content_start = start + len(start_token)
+            end = sample.find(end_token, content_start)
+            if end < 0:
+                break
+            emitted = True
+            yield sample[content_start:end]
+            cursor = end + len(end_token)
+        if not emitted:
+            yield sample
+
+    def _segment_media_items(self, segment: str) -> list[str]:
+        items: list[str] = []
+        for match in self.mm_token_pattern.finditer(segment):
+            token = match.group(0)
+            if token == self.audio_token:
+                items.append("audio")
+            elif token in (self.video_token_block, self.video_token):
+                items.append("video")
+            elif token == self.image_token:
+                items.append("image")
+        return items
+
+    @staticmethod
+    def _append_rtc_segment_metadata(
+        media_items: list[str],
+        *,
+        audio_metadata: list[dict[str, Any]],
+        video_metadata: list[dict[str, Any]],
+    ) -> None:
+        groups: list[list[str]] = []
+        index = 0
+        while index < len(media_items):
+            current = media_items[index]
+            if (
+                current == "video"
+                and index + 1 < len(media_items)
+                and media_items[index + 1] == "audio"
+            ):
+                groups.append(["video", "audio"])
+                index += 2
+                continue
+            if current == "audio":
+                group = ["audio"]
+                index += 1
+                while index < len(media_items) and media_items[index] == "audio":
+                    group.append("audio")
+                    index += 1
+                groups.append(group)
+                continue
+            groups.append([current])
+            index += 1
+
+        chunk_seconds = 2
+        for group_index, group in enumerate(groups):
+            group_set = set(group)
+            if "video" in group_set and "audio" in group_set:
+                prev_group = groups[group_index - 1] if group_index > 0 else []
+                next_group = groups[group_index + 1] if group_index + 1 < len(groups) else []
+                is_start = group_index == 0 or all(item == "audio" for item in prev_group)
+                is_end = group_index == len(groups) - 1 or all(
+                    item == "audio" for item in next_group
+                )
+                video_metadata.append(
+                    {
+                        "video_backend": "rtc_first_frame" if is_start else "rtc_streaming",
+                        "is_start": is_start,
+                        "is_end": is_end,
+                    }
+                )
+                audio_metadata.append(
+                    {"audio_only": False, "is_start": is_start, "is_end": is_end}
+                )
+            elif group and all(item == "audio" for item in group):
+                for audio_index, _ in enumerate(group):
+                    audio_metadata.append(
+                        {
+                            "audio_only": True,
+                            "start_second": float(audio_index * chunk_seconds),
+                            "last_accumulate_second": audio_index * chunk_seconds,
+                            "is_start": audio_index == 0,
+                            "is_end": audio_index == len(group) - 1,
+                        }
+                    )
+            else:
+                for item in group:
+                    if item == "video":
+                        video_metadata.append({"video_backend": "generic"})
+
+    def _apply_rtc_audio_prompt_style(
+        self,
+        token_text: str,
+        metadata: dict[str, Any] | None,
+        *,
+        timestamp_interval: int,
+    ) -> str:
+        if not metadata:
+            return token_text
+        if metadata.get("audio_only"):
+            if metadata.get("is_start"):
+                return token_text.replace(
+                    "<0.0 seconds>",
+                    f"<{float(metadata.get('start_second', 0.0)):.1f} seconds>",
+                    1,
+                )
+            last_accumulate = int(metadata.get("last_accumulate_second") or 0)
+            if timestamp_interval and last_accumulate % int(timestamp_interval) == 0:
+                return token_text.replace(
+                    "<0.0 seconds>", f"<{float(last_accumulate):.1f} seconds>", 1
+                )
+            return token_text.replace("<0.0 seconds>", "", 1)
+        token_text = token_text.replace("<0.0 seconds>", "", 1)
+        if metadata.get("is_end"):
+            token_text += self.audio_eos_token
+        return token_text
+
+    def _apply_rtc_video_prompt_style(
+        self,
+        token_text: str,
+        metadata: dict[str, Any] | None,
+    ) -> str:
+        if metadata and metadata.get("video_backend") == "rtc_first_frame":
+            return self.audio_bos_token + token_text
+        return token_text
 
     def _get_audio_tokens(
         self,

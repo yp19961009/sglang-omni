@@ -3170,6 +3170,17 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
         prev_token = int(prompt_ids[start - 1].item()) if start > 0 else None
         next_token = int(prompt_ids[end].item()) if end < prompt_ids.numel() else None
 
+        for modality, token_id in (
+            ("audio", self._audio_token_id),
+            ("image", self._image_token_id),
+            ("video", self._video_token_id),
+        ):
+            if modality not in candidate_modalities or token_id is None:
+                continue
+            token_id = int(token_id)
+            if prev_token == token_id or next_token == token_id:
+                return modality
+
         vision_start = self._thinker_token_id("vision_start_token_id")
         vision_end = self._thinker_token_id("vision_end_token_id", "video_end_token_id")
         if (
@@ -3362,6 +3373,67 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
         if sum(length for _, length in sequence) != prompt_len:
             return None
         return sequence
+
+    def _canonicalize_rtc_media_prompt_by_slots(
+        self,
+        prompt_ids: torch.Tensor,
+        prompt_model_inputs: dict[str, Any],
+    ) -> torch.Tensor | None:
+        rows_by_modality = self._feature_rows_by_modality(prompt_model_inputs)
+        token_ids = {
+            "audio": self._audio_token_id,
+            "video": self._video_token_id,
+        }
+        token_by_modality = {
+            modality: int(token_ids[modality])
+            for modality in ("audio", "video")
+            if rows_by_modality.get(modality, 0) > 0
+            and token_ids.get(modality) is not None
+        }
+        if set(token_by_modality) != {"audio", "video"}:
+            return None
+
+        sequence = self._rtc_media_slot_sequence(
+            prompt_len=int(prompt_ids.numel()),
+            prompt_model_inputs=prompt_model_inputs,
+            token_by_modality=token_by_modality,
+        )
+        if sequence is None:
+            return None
+
+        original_prompt_ids = self._matching_original_prompt_ids(
+            prompt_model_inputs,
+            prompt_ids,
+        )
+        canonical = (
+            original_prompt_ids.clone()
+            if original_prompt_ids is not None
+            else prompt_ids.clone()
+        )
+        fallback_token_id = self._fallback_prompt_text_token_id()
+        fallback_modality = "__text_fallback__"
+        cursor = 0
+        for modality, length in sequence:
+            if length <= 0:
+                continue
+            end = cursor + int(length)
+            segment = canonical[cursor:end]
+            if modality == fallback_modality:
+                invalid_segment = self._invalid_prompt_id_mask(segment)
+                if invalid_segment.any():
+                    segment[invalid_segment] = fallback_token_id
+            else:
+                canonical[cursor:end] = token_by_modality[modality]
+            cursor = end
+
+        if self._invalid_prompt_id_mask(canonical).any():
+            return None
+        if not self._media_token_counts_match_feature_rows(
+            canonical,
+            prompt_model_inputs,
+        ):
+            return None
+        return canonical
 
     def _canonicalize_partial_rtc_media_prompt(
         self,
@@ -3702,10 +3774,21 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
             canonical,
             prompt_model_inputs,
         )
-        return self._canonicalize_video_frame_placeholders(
+        canonical = self._canonicalize_video_frame_placeholders(
             canonical,
             prompt_model_inputs,
         )
+        if not self._media_token_counts_match_feature_rows(
+            canonical,
+            prompt_model_inputs,
+        ):
+            slot_canonical = self._canonicalize_rtc_media_prompt_by_slots(
+                canonical,
+                prompt_model_inputs,
+            )
+            if slot_canonical is not None:
+                canonical = slot_canonical
+        return canonical
 
     def _reconstruct_prompt_states(
         self, state: Qwen3OmniPipelineState
@@ -3746,6 +3829,14 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
             mask = prompt_ids == int(token_id)
             if not mask.any():
                 continue
+            mask_rows = int(mask.sum().item())
+            feature_rows = int(feature_tensor.shape[0])
+            if feature_rows != mask_rows:
+                raise ValueError(
+                    "Qwen3.5 talker prompt media feature/token mismatch after "
+                    f"canonicalization: {modality_key} rows={feature_rows}, "
+                    f"token_count={mask_rows}, prompt_len={prompt_ids.numel()}"
+                )
             prompt_hidden[mask] = feature_tensor.to(
                 device=prompt_hidden.device,
                 dtype=prompt_hidden.dtype,

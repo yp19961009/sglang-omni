@@ -32,6 +32,8 @@ from sglang_omni.models.qwen3_omni.stages import (
     QWEN3_ENCODER_CACHE_MAX_BYTES,
     QWEN3_ENCODER_CACHE_MAX_ENTRIES,
     QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES,
+    qwen3_encoder_cache_clone_on_get,
+    qwen3_encoder_cache_device,
 )
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import build_sglang_server_args
@@ -280,7 +282,8 @@ def _create_encoder_executor(stage_name: str, model: Any):
     cache = StageOutputCache(
         max_size=QWEN3_ENCODER_CACHE_MAX_ENTRIES,
         max_bytes=QWEN3_ENCODER_CACHE_MAX_BYTES,
-        cache_device="cpu",
+        cache_device=qwen3_encoder_cache_device(),
+        clone_on_get=qwen3_encoder_cache_clone_on_get(),
     )
 
     def _encode(payload: StagePayload) -> StagePayload:
@@ -314,7 +317,8 @@ def _create_batched_encoder_executor(stage_name: str, model: Any):
     cache = StageOutputCache(
         max_size=QWEN3_ENCODER_CACHE_MAX_ENTRIES,
         max_bytes=QWEN3_ENCODER_CACHE_MAX_BYTES,
-        cache_device="cpu",
+        cache_device=qwen3_encoder_cache_device(),
+        clone_on_get=qwen3_encoder_cache_clone_on_get(),
     )
     modality = stage_name.split("_", 1)[0]
     batch_fn = (
