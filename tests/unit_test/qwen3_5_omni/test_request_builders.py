@@ -4294,3 +4294,54 @@ def test_qwen35_rtc_complete_turn_prefix_cache_limit_requires_trailing_user_turn
     assert request_builders._rtc_complete_turn_prefix_cache_limit(
         [151644, 872, 201, 151645, 151644, 77091, 301, 151645]
     ) is None
+
+
+def test_qwen35_thinker_adapter_isolates_direct_full_prefill(monkeypatch):
+    fake_req = SimpleNamespace(
+        extra_key="media-cache:video=direct-steady:req-0:video",
+        sampling_params=SimpleNamespace(max_new_tokens=64),
+        origin_input_ids=[151644, 872, 1, 151645],
+    )
+
+    def _fake_build_sglang_thinker_request(*args, **kwargs):
+        del args, kwargs
+        return SimpleNamespace(req=fake_req, stage_payload=None)
+
+    monkeypatch.delenv("QWEN35_DIRECT_FULL_ISOLATE_PREFILL", raising=False)
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "build_sglang_thinker_request",
+        _fake_build_sglang_thinker_request,
+    )
+
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    state = Qwen3OmniPipelineState(prompt={"input_ids": torch.tensor([1])})
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(inputs={}, metadata={"direct_full": True}),
+        data=state.to_dict(),
+    )
+
+    request_builder(payload)
+
+    assert fake_req._omni_isolate_prefill_batch is True
+    assert not hasattr(fake_req, "_omni_skip_finished_mamba_cache_insert")
+
+def test_qwen35_rtc_slot_inference_allows_uneven_text_filler():
+    lengths = Qwen35TalkerPrefillBuilder._infer_rtc_media_slot_lengths(
+        prompt_len=36334,
+        missing_by_modality={"audio": 560, "video": 35200},
+    )
+
+    assert lengths is not None
+    assert lengths["audio"] == [14] * 40
+    assert lengths["video"] == [880] * 40
+    extras = Qwen35TalkerPrefillBuilder._distribute_prompt_extra(574, 40)
+    assert sum(extras) == 574
+    assert extras[:14] == [15] * 14
+    assert extras[14:] == [14] * 26
+

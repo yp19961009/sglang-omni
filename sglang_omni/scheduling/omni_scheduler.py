@@ -13,21 +13,34 @@ inheriting from ``SGLangScheduler``.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue as _queue_mod
 import time
 import types
 from collections import deque
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import torch
 from sglang.srt.environ import envs
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, RadixKey, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    RadixKey,
+    RequestStage,
+    ScheduleBatch,
+)
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler as _Upstream
+from sglang.srt.managers.scheduler import (
+    TEST_RETRACT,
+    TEST_RETRACT_NO_PREFILL_BS,
+)
 from sglang.srt.managers.scheduler import validate_input_length
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.tracing.trace import trace_event_batch
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj
 
 from sglang_omni.profiler.event_recorder import emit as _emit_event
@@ -50,6 +63,7 @@ _ISOLATED_PREFILL_MAX_BATCH_SIZE_ENV = (
 _PRIORITIZE_PREFILL_ATTR = "_omni_prioritize_prefill"
 _PRIORITIZE_PREFILL_ENV = "SGLANG_OMNI_PRIORITIZE_STREAM_PREFILL"
 _PRIORITY_PREFILL_MAX_BATCH_SIZE_ENV = "SGLANG_OMNI_PRIORITY_PREFILL_MAX_BATCH_SIZE"
+_PRIORITY_PREFILL_MAX_TOKENS_ENV = "SGLANG_OMNI_PRIORITY_PREFILL_MAX_TOKENS"
 _PRIORITY_PREFILL_BATCH_WAIT_MS_ENV = (
     "SGLANG_OMNI_PRIORITY_PREFILL_BATCH_WAIT_MS"
 )
@@ -62,6 +76,24 @@ _PRIORITY_DECODE_WARMUP_CHUNKS_ENV = (
 _DEBUG_MAMBA_RTC_ENV = "SGLANG_OMNI_DEBUG_MAMBA_RTC"
 _RTC_DISABLE_ACTUAL_MAMBA_TRACK_ENV = "QWEN35_RTC_DISABLE_ACTUAL_MAMBA_TRACK"
 _RTC_PROTECTED_PREFIX_DEPTH_ENV = "QWEN35_RTC_PROTECT_PRERUN_PREFIX_CACHE_DEPTH"
+_PER_CHUNK_METRICS_JSONL_ENV = "SGLANG_OMNI_PER_CHUNK_METRICS_JSONL"
+_MULTI_CHUNKED_PREFILL_ENV = "SGLANG_OMNI_MULTI_CHUNKED_PREFILL"
+_MULTI_CHUNKED_PREFILL_CHUNK_SIZE_ENV = (
+    "SGLANG_OMNI_MULTI_CHUNKED_PREFILL_CHUNK_SIZE"
+)
+_MULTI_CHUNKED_PREFILL_MIN_EXTEND_LEN_ENV = (
+    "SGLANG_OMNI_MULTI_CHUNKED_PREFILL_MIN_EXTEND_LEN"
+)
+_MULTI_CHUNKED_PREFILL_BATCH_TOKENS_ENV = (
+    "SGLANG_OMNI_MULTI_CHUNKED_PREFILL_BATCH_TOKENS"
+)
+_MULTI_CHUNKED_PREFILL_LONG_EXTEND_LEN_ENV = (
+    "SGLANG_OMNI_MULTI_CHUNKED_PREFILL_LONG_EXTEND_LEN"
+)
+_MULTI_CHUNKED_PREFILL_LONG_CHUNK_SIZE_ENV = (
+    "SGLANG_OMNI_MULTI_CHUNKED_PREFILL_LONG_CHUNK_SIZE"
+)
+
 
 
 class _PriorityFirstStreamQueue:
@@ -202,6 +234,21 @@ def _priority_prefill_max_batch_size() -> int:
         return 0
 
 
+def _priority_prefill_max_tokens() -> int:
+    raw = os.getenv(_PRIORITY_PREFILL_MAX_TOKENS_ENV)
+    if raw is None or raw == "":
+        return 0
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; disabling priority prefill token override",
+            _PRIORITY_PREFILL_MAX_TOKENS_ENV,
+            raw,
+        )
+        return 0
+
+
 def _priority_prefill_batch_wait_seconds() -> float:
     raw = os.getenv(_PRIORITY_PREFILL_BATCH_WAIT_MS_ENV)
     if raw is None or raw == "":
@@ -237,6 +284,44 @@ def _priority_decode_warmup_chunks() -> int:
             raw,
         )
         return 0
+
+
+def _multi_chunked_prefill_enabled() -> bool:
+    raw = os.getenv(_MULTI_CHUNKED_PREFILL_ENV)
+    if raw is None or raw == "":
+        return False
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _read_nonnegative_int_env(name: str, default: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d", name, raw, default)
+        return default
+
+
+def _multi_chunked_prefill_chunk_size() -> int:
+    return _read_nonnegative_int_env(_MULTI_CHUNKED_PREFILL_CHUNK_SIZE_ENV)
+
+
+def _multi_chunked_prefill_min_extend_len() -> int:
+    return _read_nonnegative_int_env(_MULTI_CHUNKED_PREFILL_MIN_EXTEND_LEN_ENV)
+
+
+def _multi_chunked_prefill_batch_tokens() -> int:
+    return _read_nonnegative_int_env(_MULTI_CHUNKED_PREFILL_BATCH_TOKENS_ENV)
+
+
+def _multi_chunked_prefill_long_extend_len() -> int:
+    return _read_nonnegative_int_env(_MULTI_CHUNKED_PREFILL_LONG_EXTEND_LEN_ENV)
+
+
+def _multi_chunked_prefill_long_chunk_size() -> int:
+    return _read_nonnegative_int_env(_MULTI_CHUNKED_PREFILL_LONG_CHUNK_SIZE_ENV)
 
 
 class _NoOpSender:
@@ -540,11 +625,34 @@ class OmniScheduler:
         self._isolated_prefill_max_batch_size = _isolated_prefill_max_batch_size()
         self._prioritize_stream_prefill = _prioritize_stream_prefill_enabled()
         self._priority_prefill_max_batch_size = _priority_prefill_max_batch_size()
+        self._priority_prefill_max_tokens = _priority_prefill_max_tokens()
         self._priority_prefill_batch_wait_s = _priority_prefill_batch_wait_seconds()
         self._defer_prefill_during_priority_decode = (
             _defer_prefill_during_priority_decode_enabled()
         )
         self._priority_decode_warmup_chunks = _priority_decode_warmup_chunks()
+        self._multi_chunked_prefill = _multi_chunked_prefill_enabled()
+        self._multi_chunked_prefill_chunk_size = (
+            _multi_chunked_prefill_chunk_size()
+        )
+        self._multi_chunked_prefill_min_extend_len = (
+            _multi_chunked_prefill_min_extend_len()
+        )
+        self._multi_chunked_prefill_batch_tokens = (
+            _multi_chunked_prefill_batch_tokens()
+        )
+        self._multi_chunked_prefill_long_extend_len = (
+            _multi_chunked_prefill_long_extend_len()
+        )
+        self._multi_chunked_prefill_long_chunk_size = (
+            _multi_chunked_prefill_long_chunk_size()
+        )
+        # Chunked requests scheduled in the previous batch still need their
+        # newly-produced KV/SSM state committed into the prefix cache before
+        # their next chunk can be scheduled. Requests in _omni_cached_chunked_reqs
+        # have already been committed and are only waiting for budget.
+        self._omni_chunked_reqs: list[Any] = []
+        self._omni_cached_chunked_reqs: list[Any] = []
         self._priority_prefill_rids: set[str] = set()
         self._priority_stream_emit_counts: dict[str, int] = {}
         self._omni_protected_prefix_nodes: dict[str, list[Any]] = {}
@@ -691,6 +799,114 @@ class OmniScheduler:
                 break
         return recv_msgs
 
+    @staticmethod
+    def _request_metadata_from_req_data(req_data: Any) -> dict[str, Any]:
+        stage_payload = getattr(req_data, "stage_payload", None)
+        request = getattr(stage_payload, "request", None)
+        metadata = getattr(request, "metadata", None)
+        if isinstance(metadata, dict):
+            return metadata
+        return {}
+
+    @staticmethod
+    def _float_or_none(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _int_or_none(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _emit_per_chunk_metric(
+        self,
+        *,
+        event_name: str,
+        request_id: str,
+        metadata: dict[str, Any],
+        end_perf: float,
+        queue_enter_perf: float | None = None,
+    ) -> None:
+        path = os.getenv(_PER_CHUNK_METRICS_JSONL_ENV)
+        if not path:
+            return
+
+        admission_perf = self._float_or_none(metadata.get("__omni_admission_perf"))
+        trunk_size = self._int_or_none(metadata.get("trunk_size"))
+        pre_run = bool(metadata.get("pre_run"))
+        elapsed_ms = (
+            (end_perf - admission_perf) * 1000.0
+            if admission_perf is not None
+            else None
+        )
+        queue_elapsed_ms = (
+            (end_perf - queue_enter_perf) * 1000.0
+            if queue_enter_perf is not None
+            else None
+        )
+        row: dict[str, Any] = {
+            "time_ns": time.time_ns(),
+            "pid": os.getpid(),
+            "event": event_name,
+            "request_id": request_id,
+            "metadata_request_id": metadata.get("request_id"),
+            "phase": "prefix" if pre_run else "actual",
+            "pre_run": pre_run,
+            "realtime_prefix": bool(metadata.get("realtime_prefix")),
+            "trunk_size": trunk_size,
+            "history_chunks": trunk_size - 1 if trunk_size is not None else None,
+            "media_cache_namespace": metadata.get("media_cache_namespace"),
+            "elapsed_ms": elapsed_ms,
+            "queue_enter_elapsed_ms": queue_elapsed_ms,
+            "admission_stage": metadata.get("__omni_admission_stage"),
+            "actual_prefix_cache_limit": metadata.get("actual_prefix_cache_limit"),
+        }
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fout:
+                fout.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+                fout.write("\n")
+        except Exception:
+            if not getattr(self, "_per_chunk_metrics_warning_emitted", False):
+                logger.exception("Failed to write per-chunk metrics to %s", path)
+                self._per_chunk_metrics_warning_emitted = True
+
+    def _emit_per_chunk_metric_for_req(
+        self, req: Any, event_name: str, end_perf: float
+    ) -> None:
+        req_data = getattr(req, "_omni_data", None)
+        metadata = dict(getattr(req, "_omni_request_metadata", {}) or {})
+        if not metadata and req_data is not None:
+            metadata = dict(self._request_metadata_from_req_data(req_data))
+        self._emit_per_chunk_metric(
+            event_name=event_name,
+            request_id=str(getattr(req, "rid", "")),
+            metadata=metadata,
+            end_perf=end_perf,
+            queue_enter_perf=getattr(req, "_omni_scheduler_queue_enter_perf", None),
+        )
+
+    def _emit_per_chunk_metric_for_req_data(
+        self, request_id: str, req_data: Any, event_name: str, end_perf: float
+    ) -> None:
+        metadata = dict(self._request_metadata_from_req_data(req_data))
+        self._emit_per_chunk_metric(
+            event_name=event_name,
+            request_id=request_id,
+            metadata=metadata,
+            end_perf=end_perf,
+        )
+
     def process_input_requests(self, recv_reqs):
         """Convert incoming payloads to SGLang Reqs and enqueue."""
         for payload in recv_reqs:
@@ -727,6 +943,8 @@ class OmniScheduler:
             self._deferred_request_payloads.pop(req_id, None)
             req = req_data.req
             req._omni_data = req_data
+            req._omni_request_metadata = dict(self._request_metadata_from_req_data(req_data))
+            req._omni_scheduler_queue_enter_perf = time.perf_counter()
             req_id = req.rid
             _emit_event(
                 request_id=req_id,
@@ -903,11 +1121,441 @@ class OmniScheduler:
             len(nodes),
         )
 
+
+    def get_next_batch_to_run(self):
+        if not self._multi_chunked_prefill:
+            return _Upstream.get_next_batch_to_run(self)
+        chunked_req_is_multi = (
+            self.chunked_req is not None
+            and bool(getattr(self.chunked_req, "_omni_multi_chunked_prefill", False))
+        )
+        if self.chunked_req is not None and not chunked_req_is_multi:
+            return _Upstream.get_next_batch_to_run(self)
+        has_multi_state = bool(
+            getattr(self, "_omni_chunked_reqs", [])
+            or getattr(self, "_omni_cached_chunked_reqs", [])
+            or chunked_req_is_multi
+        )
+        if not has_multi_state and not self._multi_chunked_prefill_should_handle(
+            self.waiting_queue
+        ):
+            return _Upstream.get_next_batch_to_run(self)
+
+        if self.dllm_config is not None:
+            pending_chunked = self._pending_multi_chunked_reqs()
+            pending_chunked = [req for req in pending_chunked if not req.finished()]
+            self._set_multi_chunked_reqs(pending_chunked)
+
+        chunked_req_to_exclude = set()
+        pending_chunked_reqs = self._pending_multi_chunked_reqs()
+        for req in pending_chunked_reqs:
+            chunked_req_to_exclude.add(req)
+            self.tree_cache.cache_unfinished_req(req, chunked=True)
+            if self.tp_worker.model_runner.mambaish_config is not None:
+                self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=False)
+            else:
+                self.req_to_token_pool.free(req.req_pool_idx)
+        self._omni_cached_chunked_reqs = self._dedupe_reqs([
+            *getattr(self, "_omni_cached_chunked_reqs", []),
+            *pending_chunked_reqs,
+        ])
+        self._set_multi_chunked_reqs([])
+
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            if self.last_batch.chunked_req is not None:
+                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+            for req in getattr(self.last_batch, "_omni_chunked_reqs", []) or []:
+                chunked_req_to_exclude.add(req)
+
+            last_bs = self.last_batch.batch_size()
+            self.last_batch.filter_batch(
+                chunked_req_to_exclude=list(chunked_req_to_exclude)
+            )
+            if self.last_batch.batch_size() < last_bs:
+                self.running_batch.batch_is_full = False
+
+            if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
+                if self.running_batch.is_empty():
+                    self.running_batch = self.last_batch
+                else:
+                    self.running_batch.merge_batch(self.last_batch)
+
+        new_batch = self.get_new_batch_prefill()
+
+        need_mlp_sync = self.require_mlp_sync
+        if need_mlp_sync and not self.spec_algorithm.is_none():
+            new_batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(
+                new_batch, log_stats=False
+            )
+            need_mlp_sync = new_batch is None
+
+        if new_batch is not None:
+            ret = new_batch
+        else:
+            if not self.running_batch.is_empty():
+                self.running_batch = self.update_running_batch(self.running_batch)
+                ret = self.running_batch if not self.running_batch.is_empty() else None
+            else:
+                ret = None
+
+        ret = self.maybe_prepare_mlp_sync_batch_and_log_stats(
+            ret, need_sync=need_mlp_sync
+        )
+
+        if ret:
+            trace_event_batch("schedule", ret.reqs)
+
+        return ret
+
+    def _pending_multi_chunked_reqs(self) -> list[Any]:
+        reqs = list(getattr(self, "_omni_chunked_reqs", []) or [])
+        if (
+            self.chunked_req is not None
+            and self.chunked_req not in reqs
+            and bool(getattr(self.chunked_req, "_omni_multi_chunked_prefill", False))
+        ):
+            reqs.insert(0, self.chunked_req)
+        return self._dedupe_reqs(reqs)
+
+    def _active_multi_chunked_reqs(self) -> list[Any]:
+        return self._dedupe_reqs([
+            *getattr(self, "_omni_cached_chunked_reqs", []),
+            *self._pending_multi_chunked_reqs(),
+        ])
+
+    @staticmethod
+    def _dedupe_reqs(reqs: list[Any]) -> list[Any]:
+        deduped: list[Any] = []
+        seen: set[int] = set()
+        for req in reqs:
+            ident = id(req)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            deduped.append(req)
+        return deduped
+
+    def _set_multi_chunked_reqs(self, reqs: list[Any]) -> None:
+        deduped = self._dedupe_reqs(reqs)
+        self._omni_chunked_reqs = deduped
+        self.chunked_req = deduped[0] if deduped else None
+
+    def _chunk_cap_for_multi_prefill(self) -> int:
+        if not self._multi_chunked_prefill:
+            return 0
+        cap = int(getattr(self, "_multi_chunked_prefill_chunk_size", 0) or 0)
+        if cap > 0:
+            return cap
+        return 0
+
+    @staticmethod
+    def _multi_chunked_prefill_estimated_input_len(req: Any) -> int:
+        """Estimate request length before init_next_round_input populates extend_input_len."""
+        for attr in ("origin_input_ids", "origin_input_ids_unpadded", "fill_ids"):
+            value = getattr(req, attr, None)
+            if value is None:
+                continue
+            try:
+                length = len(value)
+            except Exception:
+                continue
+            if length > 0:
+                return int(length)
+        try:
+            value = int(getattr(req, "extend_input_len", 0) or 0)
+        except Exception:
+            value = 0
+        if value > 0:
+            return value
+        return 0
+
+    def _chunk_cap_for_multi_prefill_req(self, req: Any) -> int:
+        base_cap = self._chunk_cap_for_multi_prefill()
+        long_threshold = int(
+            getattr(self, "_multi_chunked_prefill_long_extend_len", 0) or 0
+        )
+        long_cap = int(
+            getattr(self, "_multi_chunked_prefill_long_chunk_size", 0) or 0
+        )
+        if (
+            long_threshold > 0
+            and long_cap > 0
+            and self._multi_chunked_prefill_estimated_input_len(req) >= long_threshold
+        ):
+            return long_cap
+        return base_cap
+
+    def _multi_chunked_prefill_should_handle(self, reqs: list[Any]) -> bool:
+        if not self._multi_chunked_prefill:
+            return False
+        threshold = int(
+            getattr(self, "_multi_chunked_prefill_min_extend_len", 0) or 0
+        )
+        if threshold <= 0:
+            return True
+        for req in reqs:
+            if bool(getattr(req, "_omni_multi_chunked_prefill", False)):
+                return True
+            if self._multi_chunked_prefill_estimated_input_len(req) >= threshold:
+                return True
+        return False
+
+    def _multi_chunked_prefill_batch_token_budget(self) -> int:
+        value = int(getattr(self, "_multi_chunked_prefill_batch_tokens", 0) or 0)
+        return value if value > 0 else int(self.max_prefill_tokens)
+
+    @staticmethod
+    def _run_with_chunk_cap(adder: PrefillAdder, cap: int, fn: Callable[[], Any]):
+        if cap <= 0 or adder.rem_chunk_tokens is None:
+            return fn()
+        saved_rem_chunk_tokens = adder.rem_chunk_tokens
+        adder.rem_chunk_tokens = min(saved_rem_chunk_tokens, cap)
+        before = adder.rem_chunk_tokens
+        try:
+            return fn()
+        finally:
+            after = adder.rem_chunk_tokens
+            consumed = max(before - after, 0)
+            adder.rem_chunk_tokens = max(saved_rem_chunk_tokens - consumed, 0)
+
+    def _get_new_batch_prefill_raw(
+        self, prefill_delayer_single_pass: Optional[Any]
+    ) -> Optional[ScheduleBatch]:
+        if not self._multi_chunked_prefill:
+            return _Upstream._get_new_batch_prefill_raw(
+                self,
+                prefill_delayer_single_pass=prefill_delayer_single_pass,
+            )
+
+        if self.grammar_queue:
+            self.move_ready_grammar_requests()
+
+        if self.try_preemption:
+            self.running_batch.batch_is_full = False
+
+        active_chunked_reqs = self._active_multi_chunked_reqs()
+        if not active_chunked_reqs and not self._multi_chunked_prefill_should_handle(
+            self.waiting_queue
+        ):
+            return _Upstream._get_new_batch_prefill_raw(
+                self,
+                prefill_delayer_single_pass=prefill_delayer_single_pass,
+            )
+        self._omni_cached_chunked_reqs = []
+        if (
+            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
+        ) and not active_chunked_reqs:
+            return None
+
+        running_bs = len(self.running_batch.reqs)
+        if (
+            self.get_num_allocatable_reqs(running_bs) <= 0
+            and not active_chunked_reqs
+            and not self.try_preemption
+        ):
+            self.running_batch.batch_is_full = True
+            return None
+
+        if self.enable_hierarchical_cache:
+            self.tree_cache.check_hicache_events()
+
+        self.policy.calc_priority(self.waiting_queue)
+
+        if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
+            return None
+
+        chunked_prefill_size = self._multi_chunked_prefill_batch_token_budget()
+
+        adder = PrefillAdder(
+            self.page_size,
+            self.tree_cache,
+            self.token_to_kv_pool_allocator,
+            self.running_batch,
+            self.new_token_ratio,
+            max(int(self.max_prefill_tokens), int(chunked_prefill_size)),
+            chunked_prefill_size,
+            running_bs if self.is_mixed_chunk else 0,
+            self.priority_scheduling_preemption_threshold,
+            prefill_max_requests=self.server_args.prefill_max_requests,
+            prefill_delayer_single_pass=prefill_delayer_single_pass,
+        )
+
+        max_new_reqs = self.get_num_allocatable_reqs(running_bs)
+        next_chunked_reqs: list[Any] = []
+        unscheduled_active: list[Any] = []
+
+        for req in active_chunked_reqs:
+            if len(adder.can_run_list) >= max_new_reqs:
+                unscheduled_active.append(req)
+                continue
+            if adder.budget_state() == AddReqResult.NO_TOKEN:
+                unscheduled_active.append(req)
+                continue
+            req.init_next_round_input()
+            req_cap = self._chunk_cap_for_multi_prefill_req(req)
+            remaining = self._run_with_chunk_cap(
+                adder,
+                req_cap,
+                lambda req=req: adder.add_chunked_req(req),
+            )
+            if remaining is not None:
+                next_chunked_reqs.append(remaining)
+
+        if self.enable_lora:
+            lora_set = set([req.lora_id for req in self.running_batch.reqs])
+
+        for req in self.waiting_queue:
+            running_bs = len(self.running_batch.reqs)
+            max_new_reqs = self.get_num_allocatable_reqs(running_bs)
+            if len(adder.can_run_list) >= max_new_reqs:
+                self.running_batch.batch_is_full = True
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                    self.running_batch.batch_is_full = True
+
+            if self.running_batch.batch_is_full:
+                if not self.try_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
+                ):
+                    break
+
+            if self.enable_lora:
+                new_lora_set = (
+                    lora_set
+                    | set([r.lora_id for r in adder.can_run_list])
+                    | set([req.lora_id])
+                )
+                if not self.tp_worker.can_run_lora_batch(new_lora_set):
+                    if req.lora_id is not None:
+                        continue
+
+            if self.enable_hicache_storage:
+                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                if not prefetch_done:
+                    continue
+
+            req.init_next_round_input(self.tree_cache)
+            before_chunked = adder.new_chunked_req
+            req_cap = self._chunk_cap_for_multi_prefill_req(req)
+            res = self._run_with_chunk_cap(
+                adder,
+                req_cap,
+                lambda req=req: adder.add_one_req(
+                    req,
+                    has_chunked_req=bool(next_chunked_reqs or unscheduled_active),
+                    truncation_align_size=self.truncation_align_size,
+                ),
+            )
+            if adder.new_chunked_req is not None and adder.new_chunked_req is not before_chunked:
+                next_chunked_reqs.append(adder.new_chunked_req)
+                adder.new_chunked_req = before_chunked
+
+            if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.NO_TOKEN:
+                    if self.enable_hierarchical_cache:
+                        self.running_batch.batch_is_full = len(
+                            adder.can_run_list
+                        ) > 0 or (not self.running_batch.is_empty())
+                    else:
+                        self.running_batch.batch_is_full = True
+                    break
+                if (
+                    req_cap <= 0
+                    or adder.rem_chunk_tokens is None
+                    or adder.rem_chunk_tokens <= 0
+                ):
+                    break
+
+        can_run_list: list[Any] = adder.can_run_list
+        if len(can_run_list) == 0:
+            self._omni_cached_chunked_reqs = self._dedupe_reqs(unscheduled_active)
+            self._set_multi_chunked_reqs(next_chunked_reqs)
+            return None
+
+        if self.enable_metrics:
+            for req in can_run_list:
+                req.add_latency(RequestStage.PREFILL_WAITING)
+
+        can_run_set = set(can_run_list)
+        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        if adder.preempt_list:
+            for req in adder.preempt_list:
+                self._add_request_to_queue(req)
+
+        self._omni_cached_chunked_reqs = self._dedupe_reqs(unscheduled_active)
+        self._set_multi_chunked_reqs(next_chunked_reqs)
+        for req in next_chunked_reqs:
+            req._omni_multi_chunked_prefill = True
+            req.is_chunked += 1
+
+        if self.current_scheduler_metrics_enabled:
+            self.log_prefill_stats(
+                adder,
+                can_run_list,
+                running_bs=len(self.running_batch.reqs),
+                running_bs_offline_batch=0,
+            )
+
+        for req in can_run_list:
+            if req.time_stats.forward_entry_time == 0:
+                req.time_stats.forward_entry_time = time.perf_counter()
+                if self.enable_metrics:
+                    self.metrics_collector.observe_queue_time(
+                        req.time_stats.get_queueing_time(),
+                    )
+
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+            chunked_req=self.chunked_req,
+            dllm_config=self.dllm_config,
+        )
+        new_batch._omni_chunked_reqs = list(next_chunked_reqs)
+        if self.enable_hierarchical_cache:
+            new_batch.hicache_consumer_index = (
+                self.tree_cache.ready_to_load_host_cache()
+            )
+
+        new_batch.prepare_for_extend()
+
+        if (
+            self.is_mixed_chunk
+            and not self.running_batch.is_empty()
+            and not (new_batch.return_logprob or self.running_batch.return_logprob)
+        ):
+            self.running_batch.filter_batch(v1_spec_info_filtered=True)
+            if not self.running_batch.is_empty():
+                self.running_batch.prepare_for_decode()
+                new_batch.mix_with_running(self.running_batch)
+                new_batch.decoding_reqs = self.running_batch.reqs
+            self.running_batch = ScheduleBatch(
+                reqs=[], batch_is_full=self.running_batch.batch_is_full
+            )
+        else:
+            new_batch.decoding_reqs = None
+
+        return new_batch
+
     def get_new_batch_prefill(self):
         """Keep RTC actual prefill ahead of background pre-run cache writes."""
 
         if self.waiting_queue and self._priority_decode_warmup_pending():
             return None
+
+        if (
+            self._prioritize_stream_prefill
+            and self._priority_prefill_max_tokens > 0
+            and self.chunked_req is not None
+            and self._is_priority_prefill_req(self.chunked_req)
+        ):
+            return self._run_with_priority_prefill_token_budget(
+                lambda: _Upstream.get_new_batch_prefill(self)
+            )
 
         if (
             self._isolate_prefill_only_batches
@@ -949,7 +1597,9 @@ class OmniScheduler:
                     self.waiting_queue = selected_priority_reqs
                     self._remember_priority_prefill_reqs(selected_priority_reqs)
                     try:
-                        return _Upstream.get_new_batch_prefill(self)
+                        return self._run_with_priority_prefill_token_budget(
+                            lambda: _Upstream.get_new_batch_prefill(self)
+                        )
                     finally:
                         if self.chunked_req is None:
                             self.chunked_req = paused_chunked_req
@@ -1025,7 +1675,9 @@ class OmniScheduler:
             self.waiting_queue = selected_priority_reqs
             self._remember_priority_prefill_reqs(selected_priority_reqs)
             try:
-                return _Upstream.get_new_batch_prefill(self)
+                return self._run_with_priority_prefill_token_budget(
+                    lambda: _Upstream.get_new_batch_prefill(self)
+                )
             finally:
                 self.waiting_queue = [
                     *self.waiting_queue,
@@ -1084,6 +1736,20 @@ class OmniScheduler:
             rid = getattr(req, "rid", None)
             if rid is not None:
                 priority_rids.add(rid)
+
+    def _run_with_priority_prefill_token_budget(self, fn: Callable[[], Any]):
+        budget = int(getattr(self, "_priority_prefill_max_tokens", 0) or 0)
+        if budget <= 0:
+            return fn()
+        old_budget = self.max_prefill_tokens
+        try:
+            self.max_prefill_tokens = max(int(old_budget), budget)
+        except (TypeError, ValueError):
+            self.max_prefill_tokens = budget
+        try:
+            return fn()
+        finally:
+            self.max_prefill_tokens = old_budget
 
     def _is_priority_prefill_req(self, req: Any) -> bool:
         rid = getattr(req, "rid", None)
@@ -1261,13 +1927,15 @@ class OmniScheduler:
                 ):
                     time_stats.prefill_finished_ts = time.time()
 
+                done_perf = time.perf_counter()
                 req.check_finished(new_accepted_len=0)
                 if req.finished():
                     self.maybe_collect_routed_experts(req)
                     release_kv_cache(req, self.tree_cache)
                     self._protect_omni_latest_prefix_cache(req)
                     if time_stats is not None:
-                        time_stats.completion_time = time.perf_counter()
+                        time_stats.completion_time = done_perf
+                    self._emit_per_chunk_metric_for_req(req, "prefix_prefill_done", done_perf)
                 elif (
                     not getattr(batch, "decoding_reqs", None)
                     or req not in batch.decoding_reqs
@@ -1458,6 +2126,12 @@ class OmniScheduler:
                     if prioritize_first_emit_batch:
                         self._first_emit_done.add(rid)
                         first_stream_for_request = True
+                        self._emit_per_chunk_metric_for_req_data(
+                            rid,
+                            sched_req.data,
+                            "scheduler_first_emit",
+                            time.perf_counter(),
+                        )
                         _emit_event(
                             request_id=rid,
                             stage=None,
@@ -1584,6 +2258,9 @@ class OmniScheduler:
                 stream_flush = getattr(self._stream_output_builder, "flush", None)
                 if callable(stream_flush):
                     flush_messages = list(stream_flush(rid, data) or [])
+                runner_flush = getattr(self._model_runner, "flush_stream_outputs", None)
+                if callable(runner_flush):
+                    flush_messages.extend(runner_flush(rid, data) or [])
             except Exception as exc:
                 logger.exception(
                     "OmniScheduler result adapter failed for request %s", rid

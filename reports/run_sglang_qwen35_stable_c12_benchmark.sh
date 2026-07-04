@@ -8,10 +8,12 @@ set -euo pipefail
 #   CONCURRENCY=12 TOTAL_SAMPLES=12 RUN_LABEL=c12 \
 #     bash reports/run_sglang_qwen35_stable_c12_benchmark.sh
 #
-# This follows the vLLM run_rtc_profile concurrency shape by default: each
-# worker incrementally sends pre-run chunks 1..TRUNK_SIZE-1, then immediately
-# streams the measured actual request for TRUNK_SIZE. Set
-# BARRIER_PREFIX=1 to use the older all-prefixes-first barrier shape. See
+# This follows the vLLM run_rtc_profile concurrency shape by default: all
+# sessions submit pre_run trunk T together, wait, then advance to trunk T+1;
+# pre_run(T) caches T-1 historical chunks, then measured actual requests stream
+# TRUNK_SIZE. Set PREFIX_DISPATCH_SHAPE=per_worker for the older worker-local
+# 1..TRUNK_SIZE shape. Set BARRIER_PREFIX=1 to use the all-prefixes-first
+# barrier shape. See
 # reports/README_qwen35_realtime_benchmark_20260701.md for reference numbers.
 # Request profiling is enabled by default so summaries include vLLM-style
 # profile_* metrics. Set PROFILE_REQUESTS=0 to skip request profiling.
@@ -28,6 +30,7 @@ if [ -z "$PYTHON_BIN" ]; then
 fi
 PORT="${PORT:-8162}"
 SIL_OFFSET="${SIL_OFFSET:-0}"
+QUESTION_OFFSET="${QUESTION_OFFSET:-0}"
 CONCURRENCY="${CONCURRENCY:-12}"
 TOTAL_SAMPLES="${TOTAL_SAMPLES:-$CONCURRENCY}"
 TRUNK_SIZE="${TRUNK_SIZE:-40}"
@@ -50,6 +53,7 @@ SUBTALKER_REPETITION_PENALTY="${SUBTALKER_REPETITION_PENALTY:-1.05}"
 SUBTALKER_SEED="${SUBTALKER_SEED:-3408}"
 VOICE="${VOICE:-f245}"
 BARRIER_PREFIX="${BARRIER_PREFIX:-${BARRIER_PRERUN:-0}}"
+PREFIX_DISPATCH_SHAPE="${PREFIX_DISPATCH_SHAPE:-lockstep}"
 PREFIX_MAX_TOKENS="${PREFIX_MAX_TOKENS:-${PRERUN_MAX_TOKENS:-2}}"
 PROFILE_REQUESTS="${PROFILE_REQUESTS:-1}"
 THINKER_ONLY="${THINKER_ONLY:-${SGLANG_OMNI_THINKER_ONLY:-0}}"
@@ -71,9 +75,18 @@ case "$BARRIER_PREFIX" in
   1|true|TRUE|yes|YES)
     barrier_args=(--barrier-prefix); RUN_SHAPE="barrier_prefix" ;;
   0|false|FALSE|no|NO)
-    barrier_args=(); RUN_SHAPE="vllm_pipeline" ;;
+    barrier_args=(); RUN_SHAPE="vllm_${PREFIX_DISPATCH_SHAPE}_prefix" ;;
   *)
     echo "BARRIER_PREFIX must be 1/0, true/false, or yes/no; got: $BARRIER_PREFIX" >&2
+    exit 1
+    ;;
+esac
+
+case "$PREFIX_DISPATCH_SHAPE" in
+  lockstep|per_worker)
+    prefix_dispatch_args=(--prefix-dispatch-shape "$PREFIX_DISPATCH_SHAPE") ;;
+  *)
+    echo "PREFIX_DISPATCH_SHAPE must be lockstep or per_worker; got: $PREFIX_DISPATCH_SHAPE" >&2
     exit 1
     ;;
 esac
@@ -170,6 +183,7 @@ echo "total_samples=$TOTAL_SAMPLES"
 echo "trunk_size=$TRUNK_SIZE"
 echo "stagger_ms=$STAGGER_MS"
 echo "sil_offset=$SIL_OFFSET"
+echo "question_offset=$QUESTION_OFFSET"
 echo "temperature=$TEMPERATURE"
 echo "top_p=$TOP_P"
 echo "top_k=$TOP_K"
@@ -188,7 +202,8 @@ echo "subtalker_repetition_penalty=$SUBTALKER_REPETITION_PENALTY"
 echo "subtalker_seed=$SUBTALKER_SEED"
 echo "voice=$VOICE"
 echo "barrier_prefix=$BARRIER_PREFIX"
-echo "realtime_shape=$RUN_SHAPE: per-worker prefix chunks 1..$((TRUNK_SIZE - 1)), then measured actual chunk $TRUNK_SIZE"
+echo "prefix_dispatch_shape=$PREFIX_DISPATCH_SHAPE"
+echo "realtime_shape=$RUN_SHAPE: pre_run trunk 1..${TRUNK_SIZE}; pre_run($TRUNK_SIZE) caches $((TRUNK_SIZE - 1)) historical chunks, then measured actual trunk $TRUNK_SIZE"
 echo "prefix_max_tokens=$PREFIX_MAX_TOKENS"
 echo "text_only=$TEXT_ONLY"
 echo "thinker_only=$THINKER_ONLY"
@@ -207,6 +222,7 @@ PYTHONPATH=. "$PYTHON_BIN" benchmarks/eval/qwen35_omni_sglang_rtc_concurrency.py
   --total-samples "$TOTAL_SAMPLES" \
   --stagger-ms "$STAGGER_MS" \
   --sil-offset "$SIL_OFFSET" \
+  --question-offset "$QUESTION_OFFSET" \
   --temperature "$TEMPERATURE" \
   --top-p "$TOP_P" \
   --top-k "$TOP_K" \
@@ -225,6 +241,7 @@ PYTHONPATH=. "$PYTHON_BIN" benchmarks/eval/qwen35_omni_sglang_rtc_concurrency.py
   --subtalker-repetition-penalty "$SUBTALKER_REPETITION_PENALTY" \
   --subtalker-seed "$SUBTALKER_SEED" \
   --prefix-max-tokens "$PREFIX_MAX_TOKENS" \
+  "${prefix_dispatch_args[@]}" \
   "${text_args[@]}" \
   "${barrier_args[@]}" \
   "${profile_args[@]}"
@@ -236,7 +253,7 @@ out = "$OUT_DIR"
 m = json.load(open(os.path.join(out, "metrics.json")))
 for k in [
     "completed", "failed", "actual_elapsed_s",
-    "concurrency_shape", "prefix_max_tokens", "mode",
+    "concurrency_shape", "prefix_dispatch_shape", "prefix_max_tokens", "mode",
     "temperature", "top_p", "top_k", "min_p", "repetition_penalty", "seed",
     "ttft_semantics", "ttfa_semantics",
     "ttft_avg_ms", "ttft_p99_ms",
@@ -256,6 +273,13 @@ for k in [
     "last_audio_avg_ms", "last_audio_p99_ms",
     "e2e_avg_ms", "e2e_p99_ms",
     "audio_duration_avg_s", "bang_count", "errors",
+    "prefix_request_count_avg",
+    "prefix_total_avg_ms", "prefix_total_p99_ms",
+    "stream_prefix_before_last_client_avg_ms",
+    "stream_last_chunk_client_elapsed_avg_ms",
+    "actual_after_prefix_e2e_ttft_avg_ms",
+    "actual_after_prefix_e2e_ttfa_avg_ms",
+    "actual_after_prefix_e2e_total_avg_ms",
 ]:
     print(f"{k}={m.get(k)}")
 print("wav_count=", len(glob.glob(os.path.join(out, "sample_*", "*.wav"))))

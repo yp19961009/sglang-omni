@@ -803,6 +803,7 @@ def apply_ar_server_args_cli_overrides(
     talker_dtype: str | None = None,
     mamba_ssm_dtype: str | None = None,
     max_prefill_tokens: int | None = None,
+    chunked_prefill_size: int | None = None,
     max_mamba_cache_size: int | None = None,
     thinker_max_mamba_cache_size: int | None = None,
     talker_max_mamba_cache_size: int | None = None,
@@ -818,9 +819,16 @@ def apply_ar_server_args_cli_overrides(
         "--max-prefill-tokens",
         max_prefill_tokens,
     )
+    chunked_prefill_size = _validate_positive_int(
+        "--chunked-prefill-size",
+        chunked_prefill_size,
+    )
     if max_prefill_tokens is not None:
         shared_updates["max_prefill_tokens"] = max_prefill_tokens
-        shared_updates["chunked_prefill_size"] = max_prefill_tokens
+        if chunked_prefill_size is None:
+            shared_updates["chunked_prefill_size"] = max_prefill_tokens
+    if chunked_prefill_size is not None:
+        shared_updates["chunked_prefill_size"] = chunked_prefill_size
     if chunked_mode != "default":
         if not _is_qwen35_config(pipeline_config):
             raise typer.BadParameter(
@@ -831,7 +839,9 @@ def apply_ar_server_args_cli_overrides(
         )
 
         shared_updates["chunked_prefill_size"] = (
-            max_prefill_tokens or QWEN3_5_OMNI_CHUNKED_PREFILL_SIZE
+            chunked_prefill_size
+            or max_prefill_tokens
+            or QWEN3_5_OMNI_CHUNKED_PREFILL_SIZE
             if chunked_mode == "on"
             else None
         )
@@ -2072,8 +2082,19 @@ def serve(
             "--max-prefill-tokens",
             "--max_prefill_tokens",
             help=(
-                "Set SGLang max_prefill_tokens and chunked_prefill_size for "
-                "supported AR stages."
+                "Set SGLang max_prefill_tokens for supported AR stages. When "
+                "--chunked-prefill-size is omitted, it also sets chunked_prefill_size."
+            ),
+        ),
+    ] = None,
+    chunked_prefill_size: Annotated[
+        int | None,
+        typer.Option(
+            "--chunked-prefill-size",
+            "--chunked_prefill_size",
+            help=(
+                "Set SGLang chunked_prefill_size independently from "
+                "max_prefill_tokens for supported AR stages."
             ),
         ),
     ] = None,
@@ -2984,6 +3005,7 @@ def serve(
         talker_dtype=talker_dtype,
         mamba_ssm_dtype=mamba_ssm_dtype,
         max_prefill_tokens=max_prefill_tokens,
+        chunked_prefill_size=chunked_prefill_size,
         max_mamba_cache_size=max_mamba_cache_size,
         thinker_max_mamba_cache_size=thinker_max_mamba_cache_size,
         talker_max_mamba_cache_size=talker_max_mamba_cache_size,

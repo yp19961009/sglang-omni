@@ -129,6 +129,9 @@ def merge_for_thinker(payloads: dict[str, StagePayload]) -> StagePayload:
 
     for stage_name, payload in payloads.items():
         stage_state = Qwen3OmniPipelineState.from_dict(payload.data)
+        if stage_state.encoder_outs:
+            encoder_outs.update(stage_state.encoder_outs)
+            continue
         if stage_name in stage_state.encoder_outs:
             encoder_outs[stage_name] = stage_state.encoder_outs[stage_name]
             continue

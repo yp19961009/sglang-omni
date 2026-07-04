@@ -123,6 +123,13 @@ def _optional_config_dict(config: Any, name: str) -> dict[str, Any]:
 def _maybe_enable_subtalker_torch_compile(model: Any, server_args: Any) -> bool:
     if not bool(getattr(server_args, "enable_torch_compile", False)):
         return False
+    if not _env_flag("SGLANG_OMNI_QWEN35_SUBTALKER_TORCH_COMPILE", default=True):
+        logger.info(
+            "Qwen3.5 residual code predictor torch.compile disabled by "
+            "SGLANG_OMNI_QWEN35_SUBTALKER_TORCH_COMPILE"
+        )
+        server_args.enable_torch_compile = False
+        return False
 
     hook = getattr(model, "enable_subtalker_torch_compile", None)
     if hook is None:

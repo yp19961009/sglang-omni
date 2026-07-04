@@ -2041,6 +2041,121 @@ def test_projected_prefill_reads_tensor_from_data() -> None:
     assert torch.equal(result._embeds, embeds)
 
 
+def test_talker_codec_stream_uses_cpu_inline_hint() -> None:
+    class _Outbox:
+        def __init__(self) -> None:
+            self.items = []
+
+        def put(self, item) -> None:
+            self.items.append(item)
+
+    outbox = _Outbox()
+    runner = object.__new__(QwenTalkerModelRunner)
+    runner.model = SimpleNamespace(
+        _output_codes=torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+        _output_embeds=torch.tensor([[0.5, 1.5]], dtype=torch.float32),
+    )
+    runner._outbox = outbox
+    runner._code2wav_target = "code2wav"
+    runner._codec_stream_inline_cpu = True
+    runner._emit_batch_profile_event = lambda *args, **kwargs: None
+    sched_data = SimpleNamespace(
+        last_talker_decode_should_emit=True,
+        stage_payload=SimpleNamespace(request=SimpleNamespace(params={"stream": True})),
+        pending_feedback_queue=deque(),
+    )
+    sched_req = SimpleNamespace(data=sched_data)
+    schedule_batch = SimpleNamespace(reqs=[SimpleNamespace(rid="req-0")])
+
+    runner._emit_code_chunks_and_feedback(
+        schedule_batch=schedule_batch,
+        requests=[sched_req],
+    )
+
+    assert len(outbox.items) == 1
+    msg = outbox.items[0]
+    assert msg.request_id == "req-0"
+    assert msg.target == "code2wav"
+    assert msg.data.device.type == "cpu"
+    assert msg.data.dtype == torch.long
+    assert msg.data.tolist() == [1, 2, 3, 4]
+    assert msg.metadata["_prefer_inline_cpu_stream_chunk"] is True
+    assert msg.metadata["stream"] is True
+    assert len(sched_data.pending_feedback_queue) == 1
+    assert torch.equal(sched_data.pending_feedback_queue[0], torch.tensor([0.5, 1.5]))
+
+
+
+
+def test_talker_codec_stream_groups_rows_and_flushes_tail() -> None:
+    class _Outbox:
+        def __init__(self) -> None:
+            self.items = []
+
+        def put(self, item) -> None:
+            self.items.append(item)
+
+    outbox = _Outbox()
+    runner = object.__new__(QwenTalkerModelRunner)
+    runner.model = SimpleNamespace(
+        _output_codes=torch.tensor([[0, 0, 0, 0]], dtype=torch.long),
+        _output_embeds=torch.tensor([[0.0, 0.0]], dtype=torch.float32),
+    )
+    runner._outbox = outbox
+    runner._code2wav_target = "code2wav"
+    runner._codec_stream_inline_cpu = True
+    runner._codec_stream_group_size = 4
+    runner._codec_stream_buffers = {}
+    runner._codec_stream_first_emit_ns = {}
+    runner._emit_batch_profile_event = lambda *args, **kwargs: None
+    sched_data = SimpleNamespace(
+        last_talker_decode_should_emit=True,
+        stage_payload=SimpleNamespace(request=SimpleNamespace(params={"stream": True})),
+        pending_feedback_queue=deque(),
+    )
+    sched_req = SimpleNamespace(data=sched_data)
+    schedule_batch = SimpleNamespace(reqs=[SimpleNamespace(rid="req-0")])
+
+    for value in range(1, 4):
+        runner.model._output_codes = torch.tensor(
+            [[value, value + 10, value + 20, value + 30]], dtype=torch.long
+        )
+        runner._emit_code_chunks_and_feedback(
+            schedule_batch=schedule_batch,
+            requests=[sched_req],
+        )
+    assert outbox.items == []
+
+    runner.model._output_codes = torch.tensor([[4, 14, 24, 34]], dtype=torch.long)
+    runner._emit_code_chunks_and_feedback(
+        schedule_batch=schedule_batch,
+        requests=[sched_req],
+    )
+
+    assert len(outbox.items) == 1
+    grouped = outbox.items[0]
+    assert grouped.data.shape == (4, 4)
+    assert grouped.data.tolist()[0] == [1, 11, 21, 31]
+    assert grouped.data.tolist()[-1] == [4, 14, 24, 34]
+    assert grouped.metadata["stream"] is True
+    assert grouped.metadata["_prefer_inline_cpu_stream_chunk"] is True
+
+    for value in (5, 6):
+        runner.model._output_codes = torch.tensor(
+            [[value, value + 10, value + 20, value + 30]], dtype=torch.long
+        )
+        runner._emit_code_chunks_and_feedback(
+            schedule_batch=schedule_batch,
+            requests=[sched_req],
+        )
+    assert len(outbox.items) == 1
+
+    tail = runner.flush_stream_outputs("req-0", sched_data)
+    assert len(tail) == 1
+    assert tail[0].data.shape == (2, 4)
+    assert tail[0].data.tolist() == [[5, 15, 25, 35], [6, 16, 26, 36]]
+
+
 def test_projected_prefill_slices_tensor_by_prefix_indices() -> None:
     """Tensor path slices by prefix_indices, matching the list fallback."""
     full_embeds = torch.randn(10, 64)

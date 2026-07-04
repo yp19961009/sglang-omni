@@ -66,6 +66,7 @@ _MM_AGGREGATE_RELAY_TALKER_GPU_ENV = (
     "SGLANG_OMNI_MM_AGGREGATE_RELAY_ON_TALKER_GPU"
 )
 _IMAGE_ENCODER_GPU_ENV = "SGLANG_OMNI_IMAGE_ENCODER_GPU"
+_IMAGE_ENCODER_GPUS_ENV = "SGLANG_OMNI_IMAGE_ENCODER_GPUS"
 _AUDIO_ENCODER_GPU_ENV = "SGLANG_OMNI_AUDIO_ENCODER_GPU"
 
 # Keep architecture names aligned with the reference registry. The root model
@@ -108,6 +109,25 @@ def _env_int(name: str, default: int) -> int:
     return parsed if parsed >= 0 else default
 
 
+def _env_int_list(name: str, default: list[int]) -> list[int]:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return list(default)
+    parsed: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            item = int(part)
+        except ValueError:
+            return list(default)
+        if item < 0:
+            return list(default)
+        parsed.append(item)
+    return parsed or list(default)
+
+
 def _qwen35_ar_server_args_overrides() -> dict[str, int]:
     return {
         "max_prefill_tokens": QWEN3_5_OMNI_MAX_PREFILL_TOKENS,
@@ -123,7 +143,16 @@ def _qwen35_ar_runtime() -> StageRuntimeConfig:
     )
 
 
-def _preprocessing_stage(*, process: str) -> StageConfig:
+def _preprocessing_stage(
+    *,
+    process: str,
+    image_stage_names: list[str] | None = None,
+) -> StageConfig:
+    image_stage_names = image_stage_names or ["image_encoder"]
+    image_project_payload = {
+        name: f"{_PKG}.request_builders.project_preprocessing_to_image_encoder"
+        for name in image_stage_names
+    }
     return StageConfig(
         name="preprocessing",
         process=process,
@@ -165,12 +194,10 @@ def _preprocessing_stage(*, process: str) -> StageConfig:
             "audio_downsample_chunk_size": "audio_downsample_chunk_size",
             "downsample_chunk_size": "audio_downsample_chunk_size",
         },
-        next=["image_encoder", "audio_encoder", "mm_aggregate"],
+        next=[*image_stage_names, "audio_encoder", "mm_aggregate"],
         route_fn=f"{_PKG}.request_builders.resolve_preprocessing_next_stages",
         project_payload={
-            "image_encoder": (
-                f"{_PKG}.request_builders.project_preprocessing_to_image_encoder"
-            ),
+            **image_project_payload,
             "audio_encoder": (
                 f"{_PKG}.request_builders.project_preprocessing_to_audio_encoder"
             ),
@@ -181,9 +208,14 @@ def _preprocessing_stage(*, process: str) -> StageConfig:
     )
 
 
-def _image_encoder_stage(*, gpu: int, process: str) -> StageConfig:
+def _image_encoder_stage(
+    *,
+    gpu: int,
+    process: str,
+    name: str = "image_encoder",
+) -> StageConfig:
     return StageConfig(
-        name="image_encoder",
+        name=name,
         process=process,
         factory=f"{_PKG}.stages.create_image_encoder_executor",
         factory_args={"device": "cuda", "dtype": None},
@@ -215,7 +247,10 @@ def _aggregate_stage(
     speech_enabled: bool = False,
     gpu: int | None = None,
     relay_device: str | None = None,
+    image_stage_names: list[str] | None = None,
 ) -> StageConfig:
+    image_stage_names = image_stage_names or ["image_encoder"]
+    wait_for = ["preprocessing", *image_stage_names, "audio_encoder"]
     relay = RelayConfig(device=relay_device) if relay_device is not None else None
     if speech_enabled:
         return StageConfig(
@@ -224,7 +259,7 @@ def _aggregate_stage(
             factory=f"{_PKG}.stages.create_aggregate_executor",
             gpu=gpu,
             relay=relay,
-            wait_for=["preprocessing", "image_encoder", "audio_encoder"],
+            wait_for=wait_for,
             wait_for_fn=f"{_PKG}.request_builders.resolve_mm_aggregate_wait_sources",
             merge_fn=f"{_PKG}.merge.merge_for_thinker",
             next=["thinker", "talker_ar"],
@@ -244,7 +279,7 @@ def _aggregate_stage(
         factory=f"{_PKG}.stages.create_aggregate_executor",
         gpu=gpu,
         relay=relay,
-        wait_for=["preprocessing", "image_encoder", "audio_encoder"],
+        wait_for=wait_for,
         wait_for_fn=f"{_PKG}.request_builders.resolve_mm_aggregate_wait_sources",
         merge_fn=f"{_PKG}.merge.merge_for_thinker",
         next="thinker",
@@ -380,23 +415,48 @@ def _code2wav_stage(*, gpu: int, process: str) -> StageConfig:
 
 
 def _text_stages() -> list[StageConfig]:
-    image_encoder_gpu = _env_int(_IMAGE_ENCODER_GPU_ENV, 0)
-    audio_encoder_gpu = _env_int(_AUDIO_ENCODER_GPU_ENV, 0)
-    image_encoder_process = (
-        "pipeline" if image_encoder_gpu == 0 else "image_encoder"
+    image_encoder_gpus = _env_int_list(
+        _IMAGE_ENCODER_GPUS_ENV,
+        [_env_int(_IMAGE_ENCODER_GPU_ENV, 0)],
     )
+    audio_encoder_gpu = _env_int(_AUDIO_ENCODER_GPU_ENV, 0)
+    image_stage_names = [
+        "image_encoder" if idx == 0 else f"image_encoder_{idx}"
+        for idx in range(len(image_encoder_gpus))
+    ]
     audio_encoder_process = (
         "pipeline" if audio_encoder_gpu == 0 else "audio_encoder"
     )
+    image_stages = []
+    for stage_name, image_encoder_gpu in zip(
+        image_stage_names, image_encoder_gpus, strict=True
+    ):
+        image_encoder_process = (
+            "pipeline"
+            if image_encoder_gpu == 0 and len(image_encoder_gpus) == 1
+            else stage_name
+        )
+        image_stages.append(
+            _image_encoder_stage(
+                name=stage_name,
+                gpu=image_encoder_gpu,
+                process=image_encoder_process,
+            )
+        )
     return [
-        _preprocessing_stage(process="pipeline"),
-        _image_encoder_stage(
-            gpu=image_encoder_gpu, process=image_encoder_process
+        _preprocessing_stage(
+            process="pipeline",
+            image_stage_names=image_stage_names,
         ),
+        *image_stages,
         _audio_encoder_stage(
             gpu=audio_encoder_gpu, process=audio_encoder_process
         ),
-        _aggregate_stage(process="pipeline", speech_enabled=False),
+        _aggregate_stage(
+            process="pipeline",
+            speech_enabled=False,
+            image_stage_names=image_stage_names,
+        ),
         _thinker_stage(gpu=0, speech_enabled=False, process="pipeline"),
         _decode_stage(process="pipeline"),
     ]

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -34,6 +35,86 @@ from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 
 logger = logging.getLogger(__name__)
+
+_IMAGE_ENCODER_GPUS_ENV = "SGLANG_OMNI_IMAGE_ENCODER_GPUS"
+
+
+def _qwen35_image_encoder_stage_names() -> list[str]:
+    value = os.getenv(_IMAGE_ENCODER_GPUS_ENV)
+    if value is None or value.strip() == "":
+        return [IMAGE_STAGE]
+    count = len([part for part in value.split(",") if part.strip()])
+    if count <= 1:
+        return [IMAGE_STAGE]
+    return [IMAGE_STAGE, *[f"{IMAGE_STAGE}_{idx}" for idx in range(1, count)]]
+
+
+def _qwen35_select_image_encoder_stage(request_id: str) -> str:
+    names = _qwen35_image_encoder_stage_names()
+    if len(names) == 1:
+        return names[0]
+    digest = hashlib.blake2s(request_id.encode("utf-8"), digest_size=4).digest()
+    return names[int.from_bytes(digest, "big") % len(names)]
+
+
+def _qwen35_route_encoder_stages(
+    request_id: str,
+    encoder_inputs: dict[str, Any],
+) -> list[str]:
+    return _qwen35_map_image_encoder_stage(
+        request_id,
+        qwen3_request_builders._encoder_stages_with_model_inputs(encoder_inputs),
+    )
+
+
+def _qwen35_wait_encoder_stages(
+    request_id: str,
+    encoder_inputs: dict[str, Any],
+) -> list[str]:
+    return _qwen35_map_image_encoder_stage(
+        request_id,
+        qwen3_request_builders._active_encoder_stages(encoder_inputs),
+    )
+
+
+def _qwen35_map_image_encoder_stage(
+    request_id: str,
+    stages: list[str],
+) -> list[str]:
+    mapped: list[str] = []
+    for stage_name in stages:
+        if stage_name == IMAGE_STAGE:
+            mapped.append(_qwen35_select_image_encoder_stage(request_id))
+        else:
+            mapped.append(stage_name)
+    return mapped
+
+
+def resolve_preprocessing_next_stages(
+    request_id: str, output: StagePayload
+) -> list[str]:
+    """Route visual requests across optional Qwen3.5 image-encoder replicas."""
+
+    state = Qwen3OmniPipelineState.from_dict(output.data)
+    return [
+        *_qwen35_route_encoder_stages(request_id, state.encoder_inputs),
+        MM_AGGREGATE_STAGE,
+    ]
+
+
+def resolve_mm_aggregate_wait_sources(
+    request_id: str,
+    from_stage: str,
+    payload: StagePayload,
+) -> list[str] | None:
+    if from_stage != "preprocessing":
+        return None
+    state = Qwen3OmniPipelineState.from_dict(payload.data)
+    return [
+        "preprocessing",
+        *_qwen35_wait_encoder_stages(request_id, state.encoder_inputs),
+    ]
+
 
 _VOICE_TO_SPK_MAPPING = {
     # Common user-facing voice aliases used by Qwen3.5-Omni.
@@ -1806,6 +1887,11 @@ def _rtc_isolate_prerun_prefill_enabled() -> bool:
     return _env_flag_enabled(raw, default=True)
 
 
+def _direct_full_isolate_prefill_enabled() -> bool:
+    raw = os.getenv("QWEN35_DIRECT_FULL_ISOLATE_PREFILL")
+    return _env_flag_enabled(raw, default=True)
+
+
 def _rtc_limit_actual_prefix_to_complete_turn_enabled() -> bool:
     raw = os.getenv("QWEN35_RTC_LIMIT_ACTUAL_PREFIX_TO_COMPLETE_TURN")
     return _env_flag_enabled(raw, default=True)
@@ -1917,6 +2003,15 @@ def _rtc_prerun_thinker_terminal_enabled() -> bool:
 def _is_qwen35_rtc_prerun(request: Any) -> bool:
     metadata = getattr(request, "metadata", None)
     return isinstance(metadata, dict) and bool(metadata.get("pre_run"))
+
+
+def _is_qwen35_direct_full_actual(request: Any) -> bool:
+    metadata = getattr(request, "metadata", None)
+    return (
+        isinstance(metadata, dict)
+        and bool(metadata.get("direct_full"))
+        and not bool(metadata.get("pre_run"))
+    )
 
 
 def _is_qwen35_rtc_prefill_only_prerun(request: Any) -> bool:
@@ -2262,6 +2357,10 @@ def make_thinker_scheduler_adapters(
         )
         if req is not None and rtc_namespace is not None:
             req._omni_rtc_cache_namespace = rtc_namespace
+        if req is not None and _is_qwen35_direct_full_actual(payload.request):
+            req._omni_direct_full_actual = True
+            if _direct_full_isolate_prefill_enabled():
+                req._omni_isolate_prefill_batch = True
         if req is not None and _is_qwen35_rtc_prerun(payload.request):
             if _rtc_isolate_prerun_prefill_enabled():
                 req._omni_isolate_prefill_batch = True
@@ -2805,8 +2904,9 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
         def add_candidate(priority: int, slot_count: int) -> None:
             if slot_count <= 0:
                 return
-            if extra_total and extra_total % slot_count != 0:
-                return
+            # Text/prompt filler can be uneven across RTC chunks. The sequence
+            # builder below already distributes the remainder per slot, so only
+            # media rows need to divide evenly by the inferred slot count.
             if not cls._slot_lengths_from_slot_count(
                 missing_by_modality,
                 slot_count,

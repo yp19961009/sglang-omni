@@ -73,6 +73,23 @@ class _TestStreamingScheduler(StreamingSimpleScheduler):
         return payloads
 
 
+
+
+class _BatchingStreamingScheduler(_TestStreamingScheduler):
+    def __init__(self) -> None:
+        self.stream_batches: list[list[str]] = []
+        super().__init__()
+
+    def max_stream_chunk_batch_size(self) -> int:
+        return 3
+
+    def on_stream_chunk_batch(
+        self, batch: list[tuple[str, StreamItem]]
+    ) -> list[OutgoingMessage]:
+        self.stream_batches.append([request_id for request_id, _ in batch])
+        return super().on_stream_chunk_batch(batch)
+
+
 def _drain_results(scheduler: StreamingSimpleScheduler) -> list[OutgoingMessage]:
     messages: list[OutgoingMessage] = []
     while True:
@@ -163,3 +180,36 @@ def test_streaming_simple_scheduler_keeps_queued_control_message_out_of_batch() 
     assert next_msg.request_id == "stream"
     assert next_msg.type == "stream_chunk"
     assert scheduler._next_message().request_id == "b"
+
+
+def test_streaming_simple_scheduler_batches_stream_chunks_until_control_message() -> None:
+    scheduler = _BatchingStreamingScheduler()
+    first = IncomingMessage(
+        "a",
+        "stream_chunk",
+        StreamItem(chunk_id=0, data="a0", from_stage="source"),
+    )
+    scheduler.inbox.put(
+        IncomingMessage(
+            "b",
+            "stream_chunk",
+            StreamItem(chunk_id=0, data="b0", from_stage="source"),
+        )
+    )
+    scheduler.inbox.put(IncomingMessage("ctrl", "new_request", _payload("ctrl")))
+    scheduler.inbox.put(
+        IncomingMessage(
+            "c",
+            "stream_chunk",
+            StreamItem(chunk_id=0, data="c0", from_stage="source"),
+        )
+    )
+
+    batch = scheduler._collect_stream_chunk_batch(first)
+    scheduler._handle_stream_chunk_batch(batch)
+
+    assert [msg.request_id for msg in batch] == ["a", "b"]
+    assert scheduler.stream_batches == [["a", "b"]]
+    assert [msg.request_id for msg in _drain_results(scheduler)] == ["a", "b"]
+    assert scheduler._next_message().request_id == "ctrl"
+    assert scheduler._next_message().request_id == "c"

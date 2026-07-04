@@ -11,6 +11,7 @@ def _make_scheduler(*, waiting_queue, running_batch):
     scheduler._defer_prefill_during_priority_decode = True
     scheduler._prioritize_stream_prefill = True
     scheduler._priority_prefill_max_batch_size = 0
+    scheduler._priority_prefill_max_tokens = 0
     scheduler._priority_prefill_batch_wait_s = 0.0
     scheduler._isolate_prefill_only_batches = True
     scheduler._isolated_prefill_max_batch_size = 0
@@ -23,6 +24,7 @@ def _make_scheduler(*, waiting_queue, running_batch):
     scheduler._async_pending = None
     scheduler.tree_cache = SimpleNamespace()
     scheduler.chunked_prefill_size = 32768
+    scheduler.max_prefill_tokens = 4096
     return scheduler
 
 
@@ -190,6 +192,95 @@ def test_get_new_batch_prefill_prioritizes_waiting_stream_prefill(monkeypatch):
 
     assert scheduler.get_new_batch_prefill() == "prefill"
     assert seen["waiting_queue"] == [priority_req]
+    assert scheduler.waiting_queue == [hidden_req]
+    assert scheduler._priority_prefill_rids == {"priority"}
+
+
+def test_get_new_batch_prefill_uses_priority_token_budget_for_chunked_req(monkeypatch):
+    chunked_req = SimpleNamespace(rid="priority", _omni_prioritize_prefill=True)
+    scheduler = _make_scheduler(
+        waiting_queue=[],
+        running_batch=None,
+    )
+    scheduler.chunked_req = chunked_req
+    scheduler._priority_prefill_max_tokens = 8192
+    seen = {}
+
+    def fake_upstream_prefill(self):
+        seen["max_prefill_tokens"] = self.max_prefill_tokens
+        return "prefill"
+
+    monkeypatch.setattr(
+        omni_scheduler._Upstream, "get_new_batch_prefill", fake_upstream_prefill
+    )
+
+    assert scheduler.get_new_batch_prefill() == "prefill"
+    assert seen["max_prefill_tokens"] == 8192
+    assert scheduler.max_prefill_tokens == 4096
+
+
+def test_get_new_batch_prefill_uses_priority_token_budget(monkeypatch):
+    priority_req = SimpleNamespace(rid="priority", _omni_prioritize_prefill=True)
+    scheduler = _make_scheduler(
+        waiting_queue=[priority_req],
+        running_batch=None,
+    )
+    scheduler._priority_prefill_max_tokens = 8192
+    seen = {}
+
+    def fake_upstream_prefill(self):
+        seen["max_prefill_tokens"] = self.max_prefill_tokens
+        self.waiting_queue = []
+        return "prefill"
+
+    monkeypatch.setattr(
+        omni_scheduler._Upstream, "get_new_batch_prefill", fake_upstream_prefill
+    )
+
+    assert scheduler.get_new_batch_prefill() == "prefill"
+    assert seen["max_prefill_tokens"] == 8192
+    assert scheduler.max_prefill_tokens == 4096
+
+
+def test_get_new_batch_prefill_preempts_priority_chunked_when_token_override_off(
+    monkeypatch,
+):
+    hidden_req = SimpleNamespace()
+    priority_req = SimpleNamespace(
+        rid="priority",
+        _omni_prioritize_prefill=True,
+        extend_input_len=83,
+    )
+    priority_req.init_next_round_input = lambda tree_cache: None
+    chunked_req = SimpleNamespace(
+        rid="chunked",
+        _omni_prioritize_prefill=True,
+        _omni_isolate_prefill_batch=True,
+    )
+    scheduler = _make_scheduler(
+        waiting_queue=[hidden_req, priority_req],
+        running_batch=None,
+    )
+    scheduler.chunked_req = chunked_req
+    scheduler._priority_prefill_max_tokens = 0
+    seen = {}
+
+    def fake_upstream_prefill(self):
+        seen["chunked_req"] = self.chunked_req
+        seen["waiting_queue"] = list(self.waiting_queue)
+        seen["max_prefill_tokens"] = self.max_prefill_tokens
+        self.waiting_queue = []
+        return "prefill"
+
+    monkeypatch.setattr(
+        omni_scheduler._Upstream, "get_new_batch_prefill", fake_upstream_prefill
+    )
+
+    assert scheduler.get_new_batch_prefill() == "prefill"
+    assert seen["chunked_req"] is None
+    assert seen["waiting_queue"] == [priority_req]
+    assert seen["max_prefill_tokens"] == 4096
+    assert scheduler.chunked_req is chunked_req
     assert scheduler.waiting_queue == [hidden_req]
     assert scheduler._priority_prefill_rids == {"priority"}
 

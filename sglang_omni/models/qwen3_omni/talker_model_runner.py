@@ -49,6 +49,9 @@ _QWEN35_PARTIAL_TEXT_CHUNK_WAIT_SKIPS = max(
 )
 _STREAM_TIMING_STATS_ENV = "SGLANG_OMNI_STREAM_TIMING_STATS"
 _READINESS_STATS_ENV = "SGLANG_OMNI_TALKER_READINESS_STATS"
+_CODEC_STREAM_INLINE_CPU_ENV = "SGLANG_OMNI_TALKER_CODEC_STREAM_INLINE_CPU"
+_CODEC_STREAM_GROUP_SIZE_ENV = "SGLANG_OMNI_TALKER_CODEC_STREAM_GROUP_SIZE"
+_PREFER_INLINE_CPU_STREAM_CHUNK_METADATA_KEY = "_prefer_inline_cpu_stream_chunk"
 
 
 def _stream_timing_stats_enabled() -> bool:
@@ -63,6 +66,19 @@ def _talker_readiness_stats_enabled() -> bool:
     if raw is None or raw == "":
         return _stream_timing_stats_enabled()
     return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _codec_stream_inline_cpu_enabled() -> bool:
+    raw = os.getenv(_CODEC_STREAM_INLINE_CPU_ENV)
+    if raw is None or raw == "":
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _codec_stream_group_size() -> int:
+    # Grouping codec rows is opt-in: it reduces tiny stream messages but can
+    # hurt overlap between talker generation and code2wav ingestion.
+    return max(1, _env_int(_CODEC_STREAM_GROUP_SIZE_ENV, 1))
 
 
 def _queue_len(value: Any) -> int:
@@ -92,6 +108,10 @@ class QwenTalkerModelRunner(ModelRunner):
         self._code_predictor_accepts_requests: bool | None = None
         self._decode_readiness_stats: dict[str, Any] = self._new_readiness_stats()
         self._decode_readiness_last_log_ns = 0
+        self._codec_stream_inline_cpu = _codec_stream_inline_cpu_enabled()
+        self._codec_stream_group_size = _codec_stream_group_size()
+        self._codec_stream_buffers: dict[str, list[torch.Tensor]] = {}
+        self._codec_stream_first_emit_ns: dict[str, int] = {}
 
     def execute(self, scheduler_output: Any):
         return super().execute(scheduler_output)
@@ -280,6 +300,106 @@ class QwenTalkerModelRunner(ModelRunner):
             requests=requests,
         )
 
+    def _build_codec_stream_message(
+        self,
+        *,
+        request_id: str,
+        rows: list[torch.Tensor],
+        is_streaming: bool,
+        batch_size: int,
+        first_emit_ns: int | None,
+    ) -> OutgoingMessage | None:
+        if not rows:
+            return None
+        data = rows[0] if len(rows) == 1 else torch.stack(rows, dim=0)
+        metadata = {"stream": is_streaming}
+        if self._codec_stream_inline_cpu:
+            metadata[_PREFER_INLINE_CPU_STREAM_CHUNK_METADATA_KEY] = True
+        if _stream_timing_stats_enabled():
+            metadata["talker_emit_ns"] = first_emit_ns or time.monotonic_ns()
+            metadata["talker_batch_size"] = batch_size
+            metadata["codec_rows"] = len(rows)
+        return OutgoingMessage(
+            request_id=request_id,
+            type="stream",
+            data=data,
+            target=self._code2wav_target,
+            metadata=metadata,
+        )
+
+    def _queue_codec_stream_row(
+        self,
+        *,
+        request_id: str,
+        code_chunk: torch.Tensor,
+        is_streaming: bool,
+        batch_size: int,
+    ) -> int:
+        configured_group_size = getattr(self, "_codec_stream_group_size", 1)
+        group_size = configured_group_size if self._codec_stream_inline_cpu else 1
+        emit_ns = time.monotonic_ns() if _stream_timing_stats_enabled() else None
+        if group_size <= 1:
+            msg = self._build_codec_stream_message(
+                request_id=request_id,
+                rows=[code_chunk],
+                is_streaming=is_streaming,
+                batch_size=batch_size,
+                first_emit_ns=emit_ns,
+            )
+            if msg is not None:
+                self._outbox.put(msg)
+            return 1
+
+        buffers = self.__dict__.setdefault("_codec_stream_buffers", {})
+        first_emit_by_request = self.__dict__.setdefault(
+            "_codec_stream_first_emit_ns", {}
+        )
+        rows = buffers.setdefault(request_id, [])
+        if not rows and emit_ns is not None:
+            first_emit_by_request[request_id] = emit_ns
+        rows.append(code_chunk.detach().clone())
+        if len(rows) < group_size:
+            return 0
+        grouped_rows = list(rows)
+        rows.clear()
+        first_emit_ns = first_emit_by_request.pop(request_id, emit_ns)
+        msg = self._build_codec_stream_message(
+            request_id=request_id,
+            rows=grouped_rows,
+            is_streaming=is_streaming,
+            batch_size=batch_size,
+            first_emit_ns=first_emit_ns,
+        )
+        if msg is not None:
+            self._outbox.put(msg)
+        return 1
+
+    def flush_stream_outputs(
+        self, request_id: str, data: Any
+    ) -> list[OutgoingMessage]:
+        buffers = self.__dict__.setdefault("_codec_stream_buffers", {})
+        first_emit_by_request = self.__dict__.setdefault(
+            "_codec_stream_first_emit_ns", {}
+        )
+        rows = buffers.pop(request_id, [])
+        if not rows:
+            first_emit_by_request.pop(request_id, None)
+            return []
+        stage_payload = getattr(data, "stage_payload", None)
+        is_streaming = bool(
+            stage_payload is not None
+            and (stage_payload.request.params or {}).get("stream", False)
+        )
+        first_emit_ns = first_emit_by_request.pop(request_id, None)
+        msg = self._build_codec_stream_message(
+            request_id=request_id,
+            rows=rows,
+            is_streaming=is_streaming,
+            batch_size=1,
+            first_emit_ns=first_emit_ns,
+        )
+        return [msg] if msg is not None else []
+
     def _emit_code_chunks_and_feedback(
         self,
         *,
@@ -288,6 +408,7 @@ class QwenTalkerModelRunner(ModelRunner):
     ) -> None:
         emitted = 0
         skipped = 0
+        stream_messages = 0
         self._emit_batch_profile_event(
             requests,
             "talker_emit_chunk_start",
@@ -295,7 +416,13 @@ class QwenTalkerModelRunner(ModelRunner):
         )
         try:
             batch_size = len(requests)
-            code_chunks = self.model._output_codes[:batch_size].detach().clone()
+            output_codes = self.model._output_codes[:batch_size].detach()
+            if self._codec_stream_inline_cpu:
+                # Codec rows are tiny. Sending them through CPU-inline avoids CUDA
+                # relay lifetime hazards while code2wav still moves them to GPU.
+                code_chunks = output_codes.to(device="cpu", dtype=torch.long, copy=True)
+            else:
+                code_chunks = output_codes.clone()
             feedback_rows = self.model._output_embeds[:batch_size].detach().clone()
             for idx, sched_req in enumerate(requests):
                 req = schedule_batch.reqs[idx]
@@ -312,18 +439,11 @@ class QwenTalkerModelRunner(ModelRunner):
                 )
                 if should_emit:
                     emitted += 1
-                    metadata = {"stream": is_streaming}
-                    if _stream_timing_stats_enabled():
-                        metadata["talker_emit_ns"] = time.monotonic_ns()
-                        metadata["talker_batch_size"] = batch_size
-                    self._outbox.put(
-                        OutgoingMessage(
-                            request_id=req.rid,
-                            type="stream",
-                            data=code_chunk,
-                            target=self._code2wav_target,
-                            metadata=metadata,
-                        )
+                    stream_messages += self._queue_codec_stream_row(
+                        request_id=req.rid,
+                        code_chunk=code_chunk,
+                        is_streaming=is_streaming,
+                        batch_size=batch_size,
                     )
                 else:
                     skipped += 1
@@ -335,6 +455,8 @@ class QwenTalkerModelRunner(ModelRunner):
                 batch_size=len(requests),
                 emitted=emitted,
                 skipped=skipped,
+                stream_messages=stream_messages,
+                codec_group_size=getattr(self, "_codec_stream_group_size", 1),
             )
 
     def sample_before_post_prefill(

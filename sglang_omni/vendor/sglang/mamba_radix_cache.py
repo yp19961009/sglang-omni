@@ -38,8 +38,18 @@ def _is_rtc_req(req: Any) -> bool:
     return "rtc:" in str(getattr(req, "extra_key", ""))
 
 
-def _is_rtc_actual_req(req: Any) -> bool:
-    if not _is_rtc_req(req):
+def _is_direct_full_req(req: Any) -> bool:
+    if bool(getattr(req, "_omni_direct_full_actual", False)):
+        return True
+    return "direct-steady:" in str(getattr(req, "extra_key", ""))
+
+
+def _is_guarded_req(req: Any) -> bool:
+    return _is_rtc_req(req) or _is_direct_full_req(req)
+
+
+def _is_guarded_actual_req(req: Any) -> bool:
+    if not _is_guarded_req(req):
         return False
     sampling_params = getattr(req, "sampling_params", None)
     max_new_tokens = getattr(sampling_params, "max_new_tokens", None)
@@ -53,14 +63,14 @@ def _should_skip_nonfinite_mamba_cache(req: Any) -> bool:
     return _env_flag_enabled(
         _SKIP_NONFINITE_MAMBA_CACHE_ENV,
         default=True,
-    ) and _is_rtc_req(req)
+    ) and _is_guarded_req(req)
 
 
 def _should_skip_rtc_actual_mamba_cache_insert(req: Any) -> bool:
     return _env_flag_enabled(
         _SKIP_RTC_ACTUAL_MAMBA_CACHE_INSERT_ENV,
         default=True,
-    ) and _is_rtc_actual_req(req)
+    ) and _is_guarded_actual_req(req)
 
 
 def _mamba_value_is_nonfinite(cache: Any, mamba_value: torch.Tensor | None) -> bool:

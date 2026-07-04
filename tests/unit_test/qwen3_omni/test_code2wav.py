@@ -57,6 +57,37 @@ def test_qwen_code2wav_streams_incrementally_and_abort_clears_state() -> None:
     assert "req-2" not in scheduler._pending_done
 
 
+
+
+def test_qwen_code2wav_accepts_grouped_codec_rows() -> None:
+    model = FakeCode2WavModel(total_upsample=2)
+    scheduler = Code2WavScheduler(
+        model,
+        device="cpu",
+        stream_chunk_size=4,
+        left_context_size=0,
+        sample_rate=24000,
+    )
+
+    messages = scheduler.on_stream_chunk(
+        "req-1",
+        StreamItem(
+            0,
+            torch.tensor(
+                [[1, 10], [2, 20], [3, 30], [4, 40]],
+                dtype=torch.long,
+            ),
+            "talker",
+            metadata={"stream": True},
+        ),
+    )
+
+    assert model.calls == [(1, 2, 4)]
+    assert len(messages) == 1
+    assert messages[0].request_id == "req-1"
+    audio = np.frombuffer(messages[0].data["audio_waveform"], dtype=np.float32)
+    assert audio.shape == (8,)
+
 def test_qwen_code2wav_profile_events_cover_collect_decode_and_finalize(
     monkeypatch,
 ) -> None:

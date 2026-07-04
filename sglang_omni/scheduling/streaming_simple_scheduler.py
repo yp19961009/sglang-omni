@@ -92,6 +92,17 @@ class StreamingSimpleScheduler:
         del request_id, item
         return []
 
+    def max_stream_chunk_batch_size(self) -> int:
+        return 1
+
+    def on_stream_chunk_batch(
+        self, batch: list[tuple[str, StreamItem]]
+    ) -> list[OutgoingMessage]:
+        messages: list[OutgoingMessage] = []
+        for request_id, item in batch:
+            messages.extend(self.on_stream_chunk(request_id, item))
+        return messages
+
     def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
         del request_id
         return []
@@ -141,7 +152,7 @@ class StreamingSimpleScheduler:
             self._handle_new_request_batch(self._collect_new_request_batch(msg), loop)
             return
         if msg.type == "stream_chunk":
-            self._on_chunk(msg.request_id, msg.data)
+            self._handle_stream_chunk_batch(self._collect_stream_chunk_batch(msg))
             return
         if msg.type == "stream_done":
             self._on_done(msg.request_id)
@@ -155,6 +166,27 @@ class StreamingSimpleScheduler:
             return self.inbox.get(timeout=0.1)
         except _queue_mod.Empty:
             return None
+
+    def _collect_stream_chunk_batch(
+        self, first_msg: IncomingMessage
+    ) -> list[IncomingMessage]:
+        batch = [first_msg]
+        max_batch_size = max(int(self.max_stream_chunk_batch_size()), 1)
+        if max_batch_size <= 1:
+            return batch
+
+        while len(batch) < max_batch_size:
+            try:
+                msg = self.inbox.get_nowait()
+            except _queue_mod.Empty:
+                break
+            if self._is_aborted(msg.request_id):
+                continue
+            if msg.type != "stream_chunk":
+                self._pending_messages.append(msg)
+                break
+            batch.append(msg)
+        return batch
 
     # ------------------------------------------------------------------
     # Abort and cleanup
@@ -407,14 +439,31 @@ class StreamingSimpleScheduler:
                 self._handle_stream_done(request_id)
 
     def _handle_stream_chunk(self, request_id: str, item: Any) -> None:
-        if not isinstance(item, StreamItem):
-            raise TypeError(
-                f"{self.__class__.__name__} expected StreamItem for "
-                f"{request_id!r}, got {type(item).__name__}"
-            )
+        self._handle_stream_chunk_batch(
+            [IncomingMessage(request_id, "stream_chunk", item)]
+        )
+
+    def _handle_stream_chunk_batch(self, batch: list[IncomingMessage]) -> None:
+        valid: list[tuple[str, StreamItem]] = []
+        for msg in batch:
+            item = msg.data
+            if not isinstance(item, StreamItem):
+                self._emit_error(
+                    msg.request_id,
+                    TypeError(
+                        f"{self.__class__.__name__} expected StreamItem for "
+                        f"{msg.request_id!r}, got {type(item).__name__}"
+                    ),
+                )
+                self.abort(msg.request_id)
+                continue
+            if not self._is_aborted(msg.request_id):
+                valid.append((msg.request_id, item))
+        if not valid:
+            return
         with self._state_lock:
-            for out in self.on_stream_chunk(request_id, item):
-                if not self._is_aborted(request_id):
+            for out in self.on_stream_chunk_batch(valid):
+                if not self._is_aborted(out.request_id):
                     self.outbox.put(out)
 
     def _handle_stream_done(self, request_id: str) -> None:

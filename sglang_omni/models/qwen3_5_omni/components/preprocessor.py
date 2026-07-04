@@ -93,6 +93,11 @@ _OMIT_CACHED_VISUAL_ITEM_PAYLOADS_ENV = (
 _VIDEO_PROCESSOR_CACHE_CLONE_ON_HIT_ENV = (
     "SGLANG_OMNI_VIDEO_PROCESSOR_CACHE_CLONE_ON_HIT"
 )
+_FAST_VIDEO_PROCESSOR_ENV = "SGLANG_OMNI_FAST_VIDEO_PROCESSOR"
+_FAST_VIDEO_PROCESSOR_DEVICE_ENV = "SGLANG_OMNI_FAST_VIDEO_PROCESSOR_DEVICE"
+_FAST_VIDEO_PROCESSOR_OUTPUT_DEVICE_ENV = (
+    "SGLANG_OMNI_FAST_VIDEO_PROCESSOR_OUTPUT_DEVICE"
+)
 _PROCESSOR_CACHE_CLONE_ON_SET_ENV = (
     "SGLANG_OMNI_PROCESSOR_CACHE_CLONE_ON_SET"
 )
@@ -383,6 +388,25 @@ def _video_processor_cache_clone_on_hit_enabled() -> bool:
     return value.lower() not in ("0", "false", "no", "off")
 
 
+def _fast_video_processor_enabled() -> bool:
+    value = os.getenv(_FAST_VIDEO_PROCESSOR_ENV, "")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _fast_video_processor_device() -> str:
+    value = os.getenv(_FAST_VIDEO_PROCESSOR_DEVICE_ENV, "cpu").strip()
+    return value or "cpu"
+
+
+def _fast_video_processor_output_device(processor_device: str) -> str:
+    value = os.getenv(_FAST_VIDEO_PROCESSOR_OUTPUT_DEVICE_ENV, "cpu").strip()
+    if not value or value.lower() == "cpu":
+        return "cpu"
+    if value.lower() in ("device", "same", "input"):
+        return processor_device
+    return value
+
+
 def _processor_cache_clone_on_set_enabled() -> bool:
     value = os.getenv(_PROCESSOR_CACHE_CLONE_ON_SET_ENV)
     if value is None or value == "":
@@ -414,6 +438,18 @@ def _video_entry_with_empty_pixels(
     return trimmed, metadata
 
 
+def _video_entry_for_processor_cache(
+    entry: tuple[dict[str, Any], Any],
+) -> tuple[dict[str, Any], Any]:
+    video_inputs, metadata = entry
+    pixels = video_inputs.get("pixel_values_videos")
+    if not (_is_torch_tensor(pixels) and getattr(pixels, "is_cuda", False)):
+        return entry
+    cached_inputs = dict(video_inputs)
+    cached_inputs["pixel_values_videos"] = pixels.detach().cpu()
+    return cached_inputs, metadata
+
+
 def _clone_processor_cache_value(value: Any) -> Any:
     if _is_torch_tensor(value):
         return value.detach().clone()
@@ -442,6 +478,344 @@ def _emit_processor_profile_event(
             event_name=f"qwen35_processor_{event_name}",
             metadata=metadata,
         )
+
+
+class _FastQwen35VideoFeature:
+    """Torch video patchify path compatible with Qwen2VLVideoProcessor."""
+
+    def __init__(self, video_processor: Any, *, device: str = "cpu") -> None:
+        self.video_processor = video_processor
+        self.device = device
+        self.output_device = _fast_video_processor_output_device(str(device))
+        self._device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+        self.patch_size = int(getattr(video_processor, "patch_size", 16))
+        self.merge_size = int(getattr(video_processor, "merge_size", 2))
+        self.temporal_patch_size = int(
+            getattr(video_processor, "temporal_patch_size", 2)
+        )
+        self.min_pixels = getattr(video_processor, "min_pixels", None)
+        self.max_pixels = getattr(video_processor, "max_pixels", None)
+
+    @staticmethod
+    def _smart_resize(
+        height: int,
+        width: int,
+        *,
+        factor: int,
+        min_pixels: int,
+        max_pixels: int,
+    ) -> tuple[int, int]:
+        h_bar = round(height / factor) * factor
+        w_bar = round(width / factor) * factor
+        if h_bar * w_bar > max_pixels:
+            beta = math.sqrt((height * width) / max_pixels)
+            h_bar = math.floor(height / beta / factor) * factor
+            w_bar = math.floor(width / beta / factor) * factor
+        elif h_bar * w_bar < min_pixels:
+            beta = math.sqrt(min_pixels / (height * width))
+            h_bar = math.ceil(height * beta / factor) * factor
+            w_bar = math.ceil(width * beta / factor) * factor
+        return h_bar, w_bar
+
+    def _resolve_pixel_bounds(self, kwargs: dict[str, Any]) -> tuple[int, int]:
+        min_pixels = kwargs.get("min_pixels", self.min_pixels)
+        max_pixels = kwargs.get("max_pixels", self.max_pixels)
+        size = kwargs.get("size")
+        if isinstance(size, dict):
+            min_pixels = size.get("shortest_edge", min_pixels)
+            max_pixels = size.get("longest_edge", max_pixels)
+        if min_pixels is None:
+            min_pixels = 56 * 56
+        if max_pixels is None:
+            max_pixels = 28 * 28 * 1280
+        return int(min_pixels), int(max_pixels)
+
+    def _finalize_pixel_values(self, pixels):
+        if self.output_device == "cpu":
+            return pixels.cpu()
+        return pixels.to(device=self.output_device, non_blocking=False)
+
+    def _process_tensor_video_batch(
+        self,
+        batched_videos: list[Any],
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        import torch
+
+        if self._device_type != "cuda":
+            return None
+        if not batched_videos or not all(
+            isinstance(video, torch.Tensor) for video in batched_videos
+        ):
+            return None
+        shapes = [tuple(video.shape) for video in batched_videos]
+        first_shape = shapes[0]
+        if len(first_shape) != 4 or any(shape != first_shape for shape in shapes):
+            return None
+
+        frames_per_video, channel, height, width = first_shape
+        if channel != 3 or frames_per_video <= 0:
+            return None
+
+        from torchvision.transforms import InterpolationMode
+        from torchvision.transforms import functional as tv_f
+        from transformers.video_utils import VideoMetadata
+
+        min_pixels, max_pixels = self._resolve_pixel_bounds(kwargs)
+        do_resize = bool(
+            kwargs.get("do_resize", getattr(self.video_processor, "do_resize", True))
+        )
+        do_normalize = bool(
+            kwargs.get(
+                "do_normalize", getattr(self.video_processor, "do_normalize", True)
+            )
+        )
+        do_rescale = bool(
+            kwargs.get("do_rescale", getattr(self.video_processor, "do_rescale", True))
+        )
+        # Decoded frame-list tensors are already RGB channel-first uint8.
+        if bool(
+            kwargs.get(
+                "do_convert_rgb",
+                getattr(self.video_processor, "do_convert_rgb", True),
+            )
+        ) and channel != 3:
+            return None
+
+        rescale_factor = float(
+            kwargs.get(
+                "rescale_factor",
+                getattr(self.video_processor, "rescale_factor", 1.0 / 255.0),
+            )
+        )
+        image_mean = kwargs.get(
+            "image_mean", getattr(self.video_processor, "image_mean", [0.5, 0.5, 0.5])
+        )
+        image_std = kwargs.get(
+            "image_std", getattr(self.video_processor, "image_std", [0.5, 0.5, 0.5])
+        )
+        if do_rescale:
+            image_mean = [float(x) / rescale_factor for x in image_mean]
+            image_std = [float(x) / rescale_factor for x in image_std]
+
+        videos = torch.cat(
+            [video.to(device=self.device, non_blocking=False) for video in batched_videos],
+            dim=0,
+        )
+        resized_height, resized_width = int(height), int(width)
+        if do_resize:
+            resized_height, resized_width = self._smart_resize(
+                int(height),
+                int(width),
+                factor=self.patch_size * self.merge_size,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+            )
+            videos = tv_f.resize(
+                videos,
+                size=(resized_height, resized_width),
+                interpolation=InterpolationMode.BICUBIC,
+            )
+        if do_normalize:
+            mean_tensor = torch.tensor(
+                image_mean, device=self.device, dtype=torch.float32
+            )
+            std_tensor = torch.tensor(image_std, device=self.device, dtype=torch.float32)
+            videos = tv_f.normalize(videos.float(), mean_tensor, std_tensor)
+
+        item_count = len(batched_videos)
+        videos = videos.reshape(
+            item_count, frames_per_video, channel, resized_height, resized_width
+        )
+        remainder = frames_per_video % self.temporal_patch_size
+        if remainder:
+            repeat = self.temporal_patch_size - remainder
+            videos = torch.cat(
+                [videos, videos[:, -1:].repeat(1, repeat, 1, 1, 1)],
+                dim=1,
+            )
+        padded_frames = int(videos.shape[1])
+        grid_t = padded_frames // self.temporal_patch_size
+        grid_h = resized_height // self.patch_size
+        grid_w = resized_width // self.patch_size
+        patches = videos.view(
+            item_count,
+            grid_t,
+            self.temporal_patch_size,
+            channel,
+            grid_h // self.merge_size,
+            self.merge_size,
+            self.patch_size,
+            grid_w // self.merge_size,
+            self.merge_size,
+            self.patch_size,
+        )
+        patches = patches.permute(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
+        flat = patches.reshape(
+            item_count * grid_t * grid_h * grid_w,
+            channel * self.temporal_patch_size * self.patch_size * self.patch_size,
+        )
+        video_grid_thw = torch.tensor(
+            [(grid_t, grid_h, grid_w)] * item_count, dtype=torch.long
+        )
+        video_metadata = [
+            VideoMetadata(
+                total_num_frames=int(frames_per_video),
+                fps=None,
+                width=int(width),
+                height=int(height),
+                frames_indices=list(range(int(frames_per_video))),
+            )
+            for _ in range(item_count)
+        ]
+        return {
+            "pixel_values_videos": self._finalize_pixel_values(flat),
+            "video_grid_thw": video_grid_thw,
+            "video_metadata": video_metadata,
+        }
+
+    def __call__(self, *, videos: Any, **kwargs: Any) -> dict[str, Any]:
+        from torchvision.transforms import InterpolationMode
+        from torchvision.transforms import functional as tv_f
+        from transformers.image_transforms import convert_to_rgb
+        from transformers.image_utils import (
+            ChannelDimension,
+            get_image_size,
+            infer_channel_dimension_format,
+            make_list_of_images,
+            to_numpy_array,
+        )
+        from transformers.video_utils import VideoMetadata, make_batched_videos
+
+        batched_videos = make_batched_videos(videos)
+        tensor_batch = self._process_tensor_video_batch(batched_videos, kwargs)
+        if tensor_batch is not None:
+            return tensor_batch
+        min_pixels, max_pixels = self._resolve_pixel_bounds(kwargs)
+        do_resize = bool(kwargs.get("do_resize", getattr(self.video_processor, "do_resize", True)))
+        do_normalize = bool(
+            kwargs.get("do_normalize", getattr(self.video_processor, "do_normalize", True))
+        )
+        do_rescale = bool(
+            kwargs.get("do_rescale", getattr(self.video_processor, "do_rescale", True))
+        )
+        do_convert_rgb = bool(
+            kwargs.get(
+                "do_convert_rgb",
+                getattr(self.video_processor, "do_convert_rgb", True),
+            )
+        )
+        rescale_factor = float(
+            kwargs.get(
+                "rescale_factor",
+                getattr(self.video_processor, "rescale_factor", 1.0 / 255.0),
+            )
+        )
+        image_mean = kwargs.get(
+            "image_mean", getattr(self.video_processor, "image_mean", [0.5, 0.5, 0.5])
+        )
+        image_std = kwargs.get(
+            "image_std", getattr(self.video_processor, "image_std", [0.5, 0.5, 0.5])
+        )
+        if do_rescale:
+            image_mean = [float(x) / rescale_factor for x in image_mean]
+            image_std = [float(x) / rescale_factor for x in image_std]
+        mean_tensor = None
+        std_tensor = None
+        if do_normalize:
+            import torch
+
+            mean_tensor = torch.tensor(image_mean, device=self.device, dtype=torch.float32)
+            std_tensor = torch.tensor(image_std, device=self.device, dtype=torch.float32)
+
+        pixel_values: list[Any] = []
+        video_grid_thw: list[tuple[int, int, int]] = []
+        video_metadata: list[Any] = []
+        for video in batched_videos:
+            frames = make_list_of_images(video)
+            if do_convert_rgb:
+                frames = [convert_to_rgb(frame) for frame in frames]
+            arrays = [to_numpy_array(frame) for frame in frames]
+            input_format = infer_channel_dimension_format(arrays[0])
+            height, width = get_image_size(arrays[0], channel_dim=input_format)
+            resized_height, resized_width = height, width
+            processed = []
+            for array in arrays:
+                import torch
+
+                image = torch.from_numpy(array).to(self.device)
+                if input_format == ChannelDimension.LAST:
+                    image = image.permute(2, 0, 1)
+                if do_resize:
+                    resized_height, resized_width = self._smart_resize(
+                        height,
+                        width,
+                        factor=self.patch_size * self.merge_size,
+                        min_pixels=min_pixels,
+                        max_pixels=max_pixels,
+                    )
+                    image = tv_f.resize(
+                        image,
+                        size=(resized_height, resized_width),
+                        interpolation=InterpolationMode.BICUBIC,
+                    )
+                if do_normalize:
+                    image = tv_f.normalize(
+                        image.float(),
+                        mean_tensor,
+                        std_tensor,
+                    )
+                processed.append(image)
+
+            import torch
+
+            patches = torch.stack(processed, dim=0)
+            remainder = patches.shape[0] % self.temporal_patch_size
+            if remainder:
+                repeat = self.temporal_patch_size - remainder
+                patches = torch.cat(
+                    [patches, patches[-1:].repeat(repeat, 1, 1, 1)],
+                    dim=0,
+                )
+            channel = int(patches.shape[1])
+            grid_t = int(patches.shape[0] // self.temporal_patch_size)
+            grid_h = int(resized_height // self.patch_size)
+            grid_w = int(resized_width // self.patch_size)
+            patches = patches.view(
+                grid_t,
+                self.temporal_patch_size,
+                channel,
+                grid_h // self.merge_size,
+                self.merge_size,
+                self.patch_size,
+                grid_w // self.merge_size,
+                self.merge_size,
+                self.patch_size,
+            )
+            patches = patches.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
+            flat = patches.reshape(
+                grid_t * grid_h * grid_w,
+                channel * self.temporal_patch_size * self.patch_size * self.patch_size,
+            )
+            pixel_values.append(self._finalize_pixel_values(flat))
+            video_grid_thw.append((grid_t, grid_h, grid_w))
+            video_metadata.append(
+                VideoMetadata(
+                    total_num_frames=len(frames),
+                    fps=None,
+                    width=width,
+                    height=height,
+                    frames_indices=list(range(len(frames))),
+                )
+            )
+
+        import torch
+
+        return {
+            "pixel_values_videos": torch.cat(pixel_values, dim=0),
+            "video_grid_thw": torch.tensor(video_grid_thw, dtype=torch.long),
+            "video_metadata": video_metadata,
+        }
 
 
 class _Qwen35ProcessorShim:
@@ -531,6 +905,14 @@ class _Qwen35ProcessorShim:
         ] = OrderedDict()
         self._plain_text_token_cache: OrderedDict[str, tuple[int, ...]] = (
             OrderedDict()
+        )
+        self._fast_video_feature = (
+            _FastQwen35VideoFeature(
+                video_processor,
+                device=_fast_video_processor_device(),
+            )
+            if video_processor is not None
+            else None
         )
 
     @classmethod
@@ -1020,6 +1402,11 @@ class _Qwen35ProcessorShim:
         image_inputs = self.image_processor(images=images, **images_kwargs)
         return image_inputs, image_inputs.get("image_grid_thw", [])
 
+    def _run_video_processor(self, videos, video_kwargs: dict[str, Any]):
+        if _fast_video_processor_enabled() and self._fast_video_feature is not None:
+            return self._fast_video_feature(videos=videos, **video_kwargs)
+        return self.video_processor(videos=videos, **video_kwargs)
+
     def _process_videos(self, videos, video_kwargs: dict[str, Any]):
         if videos is None:
             return {}, [], []
@@ -1041,7 +1428,7 @@ class _Qwen35ProcessorShim:
                 trace_cache_summary=trace_cache_summary,
             )
         else:
-            video_inputs = self.video_processor(videos=videos, **video_kwargs)
+            video_inputs = self._run_video_processor(videos, video_kwargs)
             video_metadata = video_inputs.get("video_metadata", [])
             video_inputs.pop("video_metadata", None)
         video_inputs["use_audio_in_video"] = use_audio_in_video
@@ -1116,7 +1503,7 @@ class _Qwen35ProcessorShim:
                 miss_indices,
                 len(videos),
             )
-            miss_inputs = self.video_processor(videos=miss_videos, **miss_kwargs)
+            miss_inputs = self._run_video_processor(miss_videos, miss_kwargs)
             miss_metadata = miss_inputs.get("video_metadata", [])
             miss_inputs.pop("video_metadata", None)
             miss_entries = self._split_video_inputs(
@@ -1130,7 +1517,7 @@ class _Qwen35ProcessorShim:
                 self._processor_cache_set(
                     self._video_item_processor_cache,
                     cache_keys_by_index[index],
-                    entry,
+                    _video_entry_for_processor_cache(entry),
                     modality="video",
                     index=index,
                     trace_detail=trace_detail,

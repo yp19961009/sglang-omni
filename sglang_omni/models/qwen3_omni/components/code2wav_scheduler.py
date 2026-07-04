@@ -236,6 +236,11 @@ class Code2WavScheduler(StreamingSimpleScheduler):
     def on_stream_chunk(
         self, request_id: str, chunk: StreamItem
     ) -> list[OutgoingMessage]:
+        if self._append_code_chunk(request_id, chunk):
+            return self._decode_and_emit(request_id)
+        return []
+
+    def _append_code_chunk(self, request_id: str, chunk: StreamItem) -> bool:
         self._ensure_request_state(request_id)
         recv_ns = time.monotonic_ns() if self._timing_stats_enabled else 0
         if self._timing_stats_enabled:
@@ -255,25 +260,25 @@ class Code2WavScheduler(StreamingSimpleScheduler):
                         "populate it."
                     ),
                 )
-                return []
+                return False
             self._stream_enabled[request_id] = bool(meta["stream"])
 
         codes = chunk.data.to(device=self._device, dtype=torch.long)
+        if codes.ndim == 0:
+            rows = codes.reshape(1, 1)
+        elif codes.ndim == 1:
+            rows = codes.reshape(1, -1)
+        else:
+            rows = codes.reshape(codes.shape[0], -1)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                "Code2Wav chunk req=%s shape=%s first_codes=%s",
+                "Code2Wav chunk req=%s shape=%s rows=%s first_codes=%s",
                 request_id,
                 tuple(codes.shape),
-                codes.reshape(-1)[:8].tolist(),
+                int(rows.shape[0]),
+                rows.reshape(-1)[:8].tolist(),
             )
 
-        # Skip EOS
-        if codes.ndim >= 1 and codes[0].item() == self._codec_eos_token_id:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "Code2Wav skip EOS req=%s codes=%s", request_id, codes.tolist()
-                )
-            return []
         chunks = self._code_chunks[request_id]
         emitted = self._emitted[request_id]
         ready_before = len(chunks) - emitted
@@ -290,6 +295,15 @@ class Code2WavScheduler(StreamingSimpleScheduler):
                     "emitted_chunks": emitted,
                 },
             )
+        appended = 0
+        skipped_eos = 0
+        for row in rows:
+            # Skip EOS rows. Grouped stream chunks may contain multiple codec rows.
+            if row.numel() > 0 and row.reshape(-1)[0].item() == self._codec_eos_token_id:
+                skipped_eos += 1
+                continue
+            chunks.append(row.reshape(-1))
+            appended += 1
         _emit_event(
             request_id=request_id,
             stage=None,
@@ -297,13 +311,13 @@ class Code2WavScheduler(StreamingSimpleScheduler):
             metadata={
                 "ready_before": ready_before,
                 "stream_chunk_size": self._stream_chunk_size,
+                "rows": int(rows.shape[0]),
+                "appended_rows": appended,
+                "skipped_eos_rows": skipped_eos,
             },
         )
-        chunks.append(codes)
         ready = len(self._code_chunks[request_id]) - self._emitted[request_id]
-        if ready >= self._stream_chunk_size:
-            return self._decode_and_emit(request_id)
-        return []
+        return ready >= self._stream_chunk_size
 
     def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
         # Decode remaining

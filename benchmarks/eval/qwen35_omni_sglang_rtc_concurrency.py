@@ -167,6 +167,18 @@ def _profile_values(rows: list[dict[str, Any]], key: str) -> list[float]:
     return [float(row[key]) for row in rows if row.get(key) is not None]
 
 
+def _profile_metadata_value(events: list[dict[str, Any]], key: str) -> Any:
+    for event in events:
+        metadata = event.get("metadata") or {}
+        if key in metadata:
+            return metadata[key]
+    return None
+
+
+def _string_or_none(value: Any) -> str | None:
+    return str(value) if value is not None else None
+
+
 def _profile_stat_fields(
     rows: list[dict[str, Any]], key: str, prefix: str
 ) -> dict[str, float | None]:
@@ -188,12 +200,23 @@ def _extract_vllm_style_profile_rows(
     actual_request_ids = {str(request_id) for request_id in actual_request_ids}
     rows: list[dict[str, Any]] = []
     for request_id, raw_events in timelines.items():
-        if actual_request_ids and request_id not in actual_request_ids:
-            continue
-        if not actual_request_ids and request_id.startswith(("__prefix__", "__pr__")):
-            continue
         events = sorted(raw_events, key=lambda event: float(event.get("t_rel_ms") or 0.0))
         if not events:
+            continue
+        metadata_request_id = _string_or_none(
+            _profile_metadata_value(events, "metadata_request_id")
+        )
+        pre_run = bool(_profile_metadata_value(events, "pre_run"))
+        if actual_request_ids and (
+            request_id not in actual_request_ids
+            and metadata_request_id not in actual_request_ids
+        ):
+            continue
+        if not actual_request_ids and (
+            request_id.startswith(("__prefix__", "__pr__"))
+            or (metadata_request_id or "").startswith(("__prefix__", "__pr__"))
+            or pre_run
+        ):
             continue
 
         thinker_first_emit_ms = _profile_first_ms(
@@ -259,8 +282,13 @@ def _extract_vllm_style_profile_rows(
 
         row = {
             "profile_request_id": request_id,
+            "profile_metadata_request_id": metadata_request_id,
             "profile_start_timestamp_ns": events[0].get("timestamp_ns"),
             "profile_thinker_ttft_ms": thinker_first_emit_ms,
+            "profile_pre_run": pre_run,
+            "profile_realtime_prefix": bool(_profile_metadata_value(events, "realtime_prefix")),
+            "profile_trunk_size": _profile_metadata_value(events, "trunk_size"),
+            "profile_media_cache_namespace": _profile_metadata_value(events, "media_cache_namespace"),
             "profile_thinker_first_stream_sent_ms": thinker_first_stream_sent_ms,
             "profile_e2e_ttfa_ms": first_audio_received_ms or first_audio_sent_ms,
             "profile_first_audio_sent_ms": first_audio_sent_ms,
@@ -470,6 +498,79 @@ def _apply_talker_request_options(
             payload[name] = value
 
 
+def _build_prefix_payload(
+    *,
+    args: argparse.Namespace,
+    context: dict[str, Any],
+    trunk: int,
+) -> dict[str, Any]:
+    request_id = context["request_id"]
+    media_cache_namespace = context["media_cache_namespace"]
+    offsets = context["offsets"]
+    messages = make_rtc_messages(
+        test_dir=Path(args.rtc_test_dir),
+        trunk_size=trunk,
+        batch_idx=offsets["batch_idx"],
+        pre_run=True,
+        audio_only=args.audio_only,
+        video_fps=args.video_fps,
+        max_chunks_per_turn=args.max_chunks_per_turn,
+        sil_start_idx=offsets["sil_start_idx"],
+        video_start_idx=offsets["video_start_idx"],
+        question_idx=offsets["question_idx"],
+        visual_mode=args.visual_mode,
+    )
+    payload: dict[str, Any] = {
+        "model": args.model,
+        "messages": messages,
+        "modalities": ["text"],
+        "max_tokens": args.prerun_max_tokens,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "min_p": args.min_p,
+        "repetition_penalty": args.repetition_penalty,
+        "seed": args.seed,
+        "stream": False,
+        "video_fps": args.video_fps,
+        "metadata": {
+            "request_id": f"__prefix__{request_id}_t{trunk}",
+            "media_cache_namespace": media_cache_namespace,
+            "trunk_size": trunk,
+            "pre_run": True,
+            "realtime_prefix": True,
+        },
+    }
+    _apply_video_request_options(payload, args)
+    return payload
+
+
+async def _run_prefix_extension(
+    *,
+    session: aiohttp.ClientSession,
+    args: argparse.Namespace,
+    api_url: str,
+    context: dict[str, Any],
+    trunk: int,
+) -> tuple[float, dict[str, Any], int | None]:
+    payload = _build_prefix_payload(args=args, context=context, trunk=trunk)
+    t0 = time.perf_counter()
+    metrics = await post_chat(session, api_url=api_url, payload=payload, stream=False)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    record = {
+        "trunk_size": trunk,
+        "request_id": metrics.request_id,
+        "client_elapsed_ms": elapsed_ms,
+        "first_output_ms": metrics.first_output_ms,
+        "ttft_ms": metrics.ttft_ms,
+        "e2e_total_ms": metrics.e2e_total_ms,
+        "prompt_tokens": metrics.prompt_tokens,
+        "completion_tokens": metrics.completion_tokens,
+    }
+    prompt_tokens = metrics.prompt_tokens if metrics.prompt_tokens > 0 else None
+    return elapsed_ms, record, prompt_tokens
+
+
 async def _run_prefix_extensions(
     *,
     session: aiohttp.ClientSession,
@@ -477,58 +578,28 @@ async def _run_prefix_extensions(
     api_url: str,
     context: dict[str, Any],
 ) -> list[float]:
-    request_id = context["request_id"]
-    media_cache_namespace = context["media_cache_namespace"]
-    offsets = context["offsets"]
     prefix_times: list[float] = []
+    prefix_records: list[dict[str, Any]] = []
     last_prompt_tokens: int | None = None
-    # Match vLLM's rtc_profile_client: prefix trunk T caches T - 1 historical
-    # chunks, and the measured trunk T adds the final question chunk.
+    # Match vLLM rtc_profile_client: call pre_run(1..T).  The RTC prompt
+    # builder interprets pre_run(T) as "cache T-1 historical chunks"; the
+    # measured actual request then appends the question chunk.
     for trunk in range(1, args.trunk_size + 1):
-        messages = make_rtc_messages(
-            test_dir=Path(args.rtc_test_dir),
-            trunk_size=trunk,
-            batch_idx=offsets["batch_idx"],
-            pre_run=True,
-            audio_only=args.audio_only,
-            video_fps=args.video_fps,
-            max_chunks_per_turn=args.max_chunks_per_turn,
-            sil_start_idx=offsets["sil_start_idx"],
-            video_start_idx=offsets["video_start_idx"],
-            question_idx=offsets["question_idx"],
-            visual_mode=args.visual_mode,
+        elapsed_ms, record, prompt_tokens = await _run_prefix_extension(
+            session=session,
+            args=args,
+            api_url=api_url,
+            context=context,
+            trunk=trunk,
         )
-        payload: dict[str, Any] = {
-            "model": args.model,
-            "messages": messages,
-            "modalities": ["text"],
-            "max_tokens": args.prerun_max_tokens,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "top_k": args.top_k,
-            "min_p": args.min_p,
-            "repetition_penalty": args.repetition_penalty,
-            "seed": args.seed,
-            "stream": False,
-            "video_fps": args.video_fps,
-            "metadata": {
-                "request_id": f"__prefix__{request_id}_t{trunk}",
-                "media_cache_namespace": media_cache_namespace,
-                "trunk_size": trunk,
-                "pre_run": True,
-                "realtime_prefix": True,
-            },
-        }
-        _apply_video_request_options(payload, args)
-        t0 = time.perf_counter()
-        metrics = await post_chat(session, api_url=api_url, payload=payload, stream=False)
-        prefix_times.append((time.perf_counter() - t0) * 1000.0)
-        if metrics.prompt_tokens > 0:
-            last_prompt_tokens = metrics.prompt_tokens
+        prefix_times.append(elapsed_ms)
+        prefix_records.append(record)
+        if prompt_tokens is not None:
+            last_prompt_tokens = prompt_tokens
     if last_prompt_tokens is not None:
         context["actual_prefix_cache_limit"] = last_prompt_tokens
+    context["prefix_records"] = prefix_records
     return prefix_times
-
 
 async def _run_actual(
     *,
@@ -593,15 +664,25 @@ async def _run_actual(
         stream=True,
         output_wav=sample_dir / f"{request_id}.wav" if not args.text_only else None,
     )
+    prefix_total_ms = sum(prefix_times)
+    prefix_before_last_ms = sum(prefix_times[:-1])
+    last_prefix_ms = prefix_times[-1] if prefix_times else None
+    prefix_records = context.get("prefix_records") or []
     row = {
         **asdict(measured),
         "sample_idx": sample_idx,
         "success": True,
         "error": None,
-        "prefix_total_ms": sum(prefix_times),
+        "prefix_total_ms": prefix_total_ms,
         "prefix_avg_ms": _mean(prefix_times),
-        "pre_run_total_ms": sum(prefix_times),
+        "prefix_request_count": len(prefix_times),
+        "prefix_records": prefix_records,
+        "stream_prefix_before_last_client_ms": prefix_before_last_ms,
+        "stream_last_chunk_trunk_size": args.trunk_size if prefix_times else None,
+        "stream_last_chunk_client_elapsed_ms": last_prefix_ms,
+        "pre_run_total_ms": prefix_total_ms,
         "pre_run_avg_ms": _mean(prefix_times),
+        "pre_run_request_count": len(prefix_times),
         "batch_idx": offsets["batch_idx"],
         "sil_start_idx": offsets["sil_start_idx"],
         "video_start_idx": offsets["video_start_idx"],
@@ -619,6 +700,18 @@ async def _run_actual(
         else 0
     )
     row["audio_tail_rtf"] = _audio_tail_rtf(row)
+    if row.get("ttft_ms") is not None:
+        row["actual_after_prefix_e2e_ttft_ms"] = (
+            prefix_total_ms + float(row["ttft_ms"])
+        )
+    if row.get("ttfa_ms") is not None:
+        row["actual_after_prefix_e2e_ttfa_ms"] = (
+            prefix_total_ms + float(row["ttfa_ms"])
+        )
+    if row.get("e2e_total_ms") is not None:
+        row["actual_after_prefix_e2e_total_ms"] = (
+            prefix_total_ms + float(row["e2e_total_ms"])
+        )
     (sample_dir / "result.json").write_text(
         json.dumps(row, indent=2, ensure_ascii=False),
         encoding="utf-8",
@@ -721,7 +814,111 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
 
     timeout = aiohttp.ClientTimeout(total=args.timeout_s)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        if args.serialize_prerun or args.barrier_prerun:
+        if (
+            args.prefix_dispatch_shape == "lockstep"
+            and not args.skip_prerun
+            and not args.serialize_prerun
+            and not args.barrier_prerun
+        ):
+            contexts = [
+                _session_context(args, out_dir, sample_idx)
+                for sample_idx in range(args.total_samples)
+            ]
+            active_contexts = list(contexts)
+            prefix_by_sample: dict[int, list[float]] = {
+                int(context["sample_idx"]): [] for context in contexts
+            }
+
+            profile_started = False
+            t0 = time.perf_counter()
+            try:
+                if profile_actual_run_id:
+                    await _start_request_profile(
+                        session,
+                        base_url=base_url,
+                        run_id=profile_actual_run_id,
+                        event_dir=profile_actual_event_dir,
+                    )
+                    profile_started = True
+
+                for trunk in range(1, args.trunk_size + 1):
+                    if not active_contexts:
+                        break
+                    results = await asyncio.gather(
+                        *(
+                            _run_prefix_extension(
+                                session=session,
+                                args=args,
+                                api_url=api_url,
+                                context=context,
+                                trunk=trunk,
+                            )
+                            for context in active_contexts
+                        ),
+                        return_exceptions=True,
+                    )
+                    next_active_contexts: list[dict[str, Any]] = []
+                    for context, result in zip(active_contexts, results):
+                        sample_idx = int(context["sample_idx"])
+                        if isinstance(result, BaseException):
+                            err = {
+                                "sample_idx": sample_idx,
+                                "success": False,
+                                "error": _compact_error(result),
+                            }
+                            async with lock:
+                                errors.append(err)
+                                print(
+                                    f"failed prefix sample={sample_idx} "
+                                    f"trunk={trunk}: {err['error']}",
+                                    flush=True,
+                                )
+                            continue
+                        elapsed_ms, record, prompt_tokens = result
+                        prefix_by_sample[sample_idx].append(elapsed_ms)
+                        context.setdefault("prefix_records", []).append(record)
+                        if prompt_tokens is not None:
+                            context["actual_prefix_cache_limit"] = prompt_tokens
+                        next_active_contexts.append(context)
+                    active_contexts = next_active_contexts
+                    print(
+                        f"lockstep prefix trunk={trunk} completed "
+                        f"active={len(active_contexts)}/{args.total_samples}",
+                        flush=True,
+                    )
+
+                if args.post_prerun_sleep_ms > 0:
+                    await asyncio.sleep(args.post_prerun_sleep_ms / 1000.0)
+
+                queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+                for context in active_contexts:
+                    sample_idx = int(context["sample_idx"])
+                    if len(prefix_by_sample.get(sample_idx, [])) == args.trunk_size:
+                        queue.put_nowait(context)
+                for _ in range(args.concurrency):
+                    queue.put_nowait(None)
+
+                await asyncio.gather(
+                    *(
+                        actual_worker(
+                            session=session,
+                            queue=queue,
+                            prefix_by_sample=prefix_by_sample,
+                            worker_idx=i,
+                        )
+                        for i in range(args.concurrency)
+                    )
+                )
+                elapsed_s = time.perf_counter() - t0
+                actual_elapsed_s = None
+            finally:
+                if profile_started:
+                    await _stop_request_profile(
+                        session,
+                        base_url=base_url,
+                        run_id=profile_actual_run_id,
+                    )
+        elif args.serialize_prerun or args.barrier_prerun:
             contexts = [
                 _session_context(args, out_dir, sample_idx)
                 for sample_idx in range(args.total_samples)
@@ -997,9 +1194,12 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         if not profile_rows:
             profile_rows = _extract_vllm_style_profile_rows(profile_json, set())
-        profile_by_request_id = {
-            str(row["profile_request_id"]): row for row in profile_rows
-        }
+        profile_by_request_id: dict[str, dict[str, Any]] = {}
+        for profile_row in profile_rows:
+            for key in ("profile_request_id", "profile_metadata_request_id"):
+                value = profile_row.get(key)
+                if value is not None:
+                    profile_by_request_id[str(value)] = profile_row
         matched_profile_rows = 0
         for row in rows:
             row.setdefault("client_first_text_event_ms", row.get("first_text_event_ms"))
@@ -1030,6 +1230,56 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             row["ttft_semantics"] = ttft_semantics
 
     first_text_event = client_first_text_event
+    for row in rows:
+        prefix_total = float(row.get("prefix_total_ms") or 0.0)
+        if row.get("ttft_ms") is not None:
+            row["actual_after_prefix_e2e_ttft_ms"] = (
+                prefix_total + float(row["ttft_ms"])
+            )
+        if row.get("ttfa_ms") is not None:
+            row["actual_after_prefix_e2e_ttfa_ms"] = (
+                prefix_total + float(row["ttfa_ms"])
+            )
+        if row.get("e2e_total_ms") is not None:
+            row["actual_after_prefix_e2e_total_ms"] = (
+                prefix_total + float(row["e2e_total_ms"])
+            )
+
+    prefix_request_count = [
+        float(row["prefix_request_count"])
+        for row in rows
+        if row.get("prefix_request_count") is not None
+    ]
+    prefix_total = [
+        float(row["prefix_total_ms"])
+        for row in rows
+        if row.get("prefix_total_ms") is not None
+    ]
+    stream_prefix_before_last = [
+        float(row["stream_prefix_before_last_client_ms"])
+        for row in rows
+        if row.get("stream_prefix_before_last_client_ms") is not None
+    ]
+    stream_last_chunk_client = [
+        float(row["stream_last_chunk_client_elapsed_ms"])
+        for row in rows
+        if row.get("stream_last_chunk_client_elapsed_ms") is not None
+    ]
+    actual_after_prefix_ttft = [
+        float(row["actual_after_prefix_e2e_ttft_ms"])
+        for row in rows
+        if row.get("actual_after_prefix_e2e_ttft_ms") is not None
+    ]
+    actual_after_prefix_ttfa = [
+        float(row["actual_after_prefix_e2e_ttfa_ms"])
+        for row in rows
+        if row.get("actual_after_prefix_e2e_ttfa_ms") is not None
+    ]
+    actual_after_prefix_total = [
+        float(row["actual_after_prefix_e2e_total_ms"])
+        for row in rows
+        if row.get("actual_after_prefix_e2e_total_ms") is not None
+    ]
 
     metrics = {
         "trunk_size": args.trunk_size,
@@ -1045,15 +1295,19 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "serialize_prerun": bool(args.serialize_prerun),
         "barrier_prerun": bool(args.barrier_prerun),
         "skip_prerun": bool(args.skip_prerun),
-        "realtime_prefix_trunk_size": max(0, args.trunk_size - 1),
+        "realtime_prefix_request_count": args.trunk_size,
+        "realtime_cached_history_chunks": max(0, args.trunk_size - 1),
         "qps": completed / elapsed_s if elapsed_s > 0 else None,
         "concurrency_shape": (
             "serialized_prefix"
             if args.serialize_prerun
             else "barrier_prefix"
             if args.barrier_prerun
+            else "vllm_lockstep_prefix"
+            if args.prefix_dispatch_shape == "lockstep" and not args.skip_prerun
             else "vllm_pipeline"
         ),
+        "prefix_dispatch_shape": args.prefix_dispatch_shape,
         "mode": "text" if args.text_only else "text_audio",
         "max_tokens": args.max_tokens,
         "prefix_max_tokens": args.prerun_max_tokens,
@@ -1130,6 +1384,31 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "prompt_tokens_avg": _mean([float(row["prompt_tokens"]) for row in rows]),
         "completion_tokens_avg": _mean(
             [float(row["completion_tokens"]) for row in rows]
+        ),
+        "prefix_request_count_avg": _mean(prefix_request_count),
+        "prefix_total_avg_ms": _mean(prefix_total),
+        "prefix_total_p50_ms": _percentile(prefix_total, 50),
+        "prefix_total_p95_ms": _percentile(prefix_total, 95),
+        "prefix_total_p99_ms": _percentile(prefix_total, 99),
+        "stream_prefix_before_last_client_avg_ms": _mean(stream_prefix_before_last),
+        "stream_prefix_before_last_client_p99_ms": _percentile(
+            stream_prefix_before_last, 99
+        ),
+        "stream_last_chunk_client_elapsed_avg_ms": _mean(stream_last_chunk_client),
+        "stream_last_chunk_client_elapsed_p99_ms": _percentile(
+            stream_last_chunk_client, 99
+        ),
+        "actual_after_prefix_e2e_ttft_avg_ms": _mean(actual_after_prefix_ttft),
+        "actual_after_prefix_e2e_ttft_p99_ms": _percentile(
+            actual_after_prefix_ttft, 99
+        ),
+        "actual_after_prefix_e2e_ttfa_avg_ms": _mean(actual_after_prefix_ttfa),
+        "actual_after_prefix_e2e_ttfa_p99_ms": _percentile(
+            actual_after_prefix_ttfa, 99
+        ),
+        "actual_after_prefix_e2e_total_avg_ms": _mean(actual_after_prefix_total),
+        "actual_after_prefix_e2e_total_p99_ms": _percentile(
+            actual_after_prefix_total, 99
         ),
         "profile_actual_run_id": profile_actual_run_id,
         "profile_actual_event_dir": (
@@ -1265,6 +1544,17 @@ def parse_args() -> argparse.Namespace:
             "Run RTC prefix-extension requests concurrently at the requested "
             "concurrency, wait for all of them, then launch measured final chunk "
             "requests."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-dispatch-shape",
+        choices=("lockstep", "per_worker"),
+        default="lockstep",
+        help=(
+            "Dispatch RTC prefix chunks in vLLM-style lockstep by default: "
+            "send trunk t for all sessions, wait, then trunk t+1. Use "
+            "per_worker for the older shape where each worker runs 1..T "
+            "independently."
         ),
     )
     parser.add_argument(

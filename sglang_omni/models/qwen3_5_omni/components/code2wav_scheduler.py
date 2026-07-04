@@ -13,14 +13,17 @@ import inspect
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from sglang_omni.models.qwen3_omni.components.code2wav_scheduler import (
     Code2WavScheduler,
+    _emit_event,
 )
 from sglang_omni.models.weight_loader import resolve_dtype
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
@@ -38,6 +41,8 @@ QWEN35_CODE2WAV_SAMPLE_RATE = 24000
 QWEN35_CODE2WAV_STREAM_CHUNK_SIZE = 4
 QWEN35_CODE2WAV_DYNAMIC_CHUNK_SIZES = (2, 4, 6, 8)
 QWEN35_CODE2WAV_DYNAMIC_CHUNK_STEPS = (8, 4, 2, 1)
+# Keep cross-request stream batching opt-in until batched code2wav shapes are prewarmed.
+QWEN35_CODE2WAV_STREAM_BATCH_SIZE = 1
 QWEN35_CODE2WAV_ODEINT_METHODS = frozenset({"euler", "rk4"})
 QWEN35_CODE2WAV_FREQUENCIES = frozenset({"50hz", "25hz"})
 QWEN35_CODE2WAV_FREQUENCY_ALIASES = {
@@ -658,6 +663,13 @@ class Qwen35Code2WavScheduler(Code2WavScheduler):
             chunk_sizes,
             chunk_steps,
         )
+        self._qwen35_stream_batch_size = _coerce_positive_int(
+            os.getenv(
+                "SGLANG_OMNI_QWEN35_CODE2WAV_STREAM_BATCH_SIZE",
+                str(QWEN35_CODE2WAV_STREAM_BATCH_SIZE),
+            ),
+            option_name="SGLANG_OMNI_QWEN35_CODE2WAV_STREAM_BATCH_SIZE",
+        )
         self._qwen35_invalid_codec_rows_logged: set[str] = set()
 
     def _compute_padding_interval(self) -> int:
@@ -725,6 +737,217 @@ class Qwen35Code2WavScheduler(Code2WavScheduler):
                 int(audio_np.shape[0]),
             )
         return audio_np
+
+    def max_stream_chunk_batch_size(self) -> int:
+        if self._qwen35_enable_dynamic_chunk:
+            return 1
+        return self._qwen35_stream_batch_size
+
+    def on_stream_chunk_batch(
+        self, batch: list[tuple[str, StreamItem]]
+    ) -> list[OutgoingMessage]:
+        if self._qwen35_enable_dynamic_chunk or len(batch) <= 1:
+            return super().on_stream_chunk_batch(batch)
+
+        ready_request_ids: list[str] = []
+        ready_seen: set[str] = set()
+        for request_id, chunk in batch:
+            if self._qwen35_skip_code2wav.get(request_id, False):
+                continue
+            if self._should_skip_invalid_codec_row(request_id, chunk):
+                continue
+            if self._append_code_chunk(request_id, chunk) and request_id not in ready_seen:
+                ready_request_ids.append(request_id)
+                ready_seen.add(request_id)
+        if not ready_request_ids:
+            return []
+        return self._decode_ready_requests_batch(ready_request_ids)
+
+    def _decode_ready_requests_batch(
+        self, request_ids: list[str]
+    ) -> list[OutgoingMessage]:
+        states: list[dict[str, Any]] = []
+        for request_id in request_ids:
+            if self._is_aborted(request_id):
+                continue
+            chunks = self._code_chunks.get(request_id)
+            if not chunks:
+                continue
+            start = self._emitted.get(request_id, 0)
+            end = len(chunks)
+            if end - start < self._stream_chunk_size:
+                continue
+            state = self._qwen35_decode_state(request_id, chunks, start, end)
+            if state is not None:
+                states.append(state)
+        if not states:
+            return []
+        if len(states) == 1:
+            return self._decode_and_emit(states[0]["request_id"])
+
+        grouped: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        for state in states:
+            key = (int(state["padding_to"]), int(state["code_groups"]))
+            grouped.setdefault(key, []).append(state)
+
+        messages: list[OutgoingMessage] = []
+        for group_states in grouped.values():
+            if len(group_states) == 1:
+                messages.extend(self._decode_and_emit(group_states[0]["request_id"]))
+            else:
+                messages.extend(self._decode_state_group(group_states))
+        return messages
+
+    def _qwen35_decode_state(
+        self,
+        request_id: str,
+        code_chunks: list[torch.Tensor],
+        start: int,
+        end: int,
+    ) -> dict[str, Any] | None:
+        if start >= end:
+            return None
+        context = min(self._left_context_size, start)
+        window = torch.stack(code_chunks[start - context : end], dim=0).to(
+            device=self._device,
+            dtype=torch.long,
+        )
+        valid_chunk = end - start
+        code_len = int(window.shape[0])
+        code_groups = int(window.shape[1])
+        padding_to = max(code_len, self._qwen35_padding_interval)
+        if padding_to % self._qwen35_padding_interval != 0:
+            padding_to += self._qwen35_padding_interval - (
+                padding_to % self._qwen35_padding_interval
+            )
+        metadata = {
+            "start": start,
+            "end": end,
+            "new_chunks": valid_chunk,
+            "context_chunks": context,
+            "stream_chunk_size": self._stream_chunk_size,
+        }
+        return {
+            "request_id": request_id,
+            "window": window,
+            "start": start,
+            "end": end,
+            "context": context,
+            "valid_chunk": valid_chunk,
+            "code_len": code_len,
+            "code_groups": code_groups,
+            "padding_to": padding_to,
+            "metadata": metadata,
+        }
+
+    def _decode_state_group(
+        self, states: list[dict[str, Any]]
+    ) -> list[OutgoingMessage]:
+        batch_size = len(states)
+        padding_to = int(states[0]["padding_to"])
+        code_groups = int(states[0]["code_groups"])
+        batched_codec = torch.zeros(
+            (batch_size, padding_to, code_groups),
+            dtype=states[0]["window"].dtype,
+            device=self._device,
+        )
+        for idx, state in enumerate(states):
+            code_len = int(state["code_len"])
+            batched_codec[idx, :code_len, :] = state["window"]
+
+        collect_end_ns = time.monotonic_ns() if self._timing_stats_enabled else 0
+        for state in states:
+            request_id = state["request_id"]
+            metadata = dict(state["metadata"])
+            metadata["batch_size"] = batch_size
+            if request_id in self._collecting_window:
+                self._collecting_window.discard(request_id)
+                if self._timing_stats_enabled:
+                    self._record_collect_end(request_id, end_ns=collect_end_ns)
+                _emit_event(
+                    request_id=request_id,
+                    stage=None,
+                    event_name="code2wav_window_collect_end",
+                    metadata=metadata,
+                )
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name="code2wav_decode_start",
+                metadata=metadata,
+            )
+
+        decode_start_ns = time.monotonic_ns() if self._timing_stats_enabled else 0
+        try:
+            with torch.no_grad():
+                if self._device.type == "cuda":
+                    torch.cuda.set_device(self._device)
+                decode = getattr(self._model, "decode", None)
+                if callable(decode):
+                    wav = decode(batched_codec).to(torch.float32)
+                else:
+                    wav = self._model(batched_codec.transpose(1, 2)).to(torch.float32)
+        except Exception as exc:
+            for state in states:
+                self._fail_request(state["request_id"], exc)
+            return []
+
+        decode_end_ns = time.monotonic_ns() if self._timing_stats_enabled else 0
+        wav = wav.reshape(wav.shape[0], -1)
+        messages: list[OutgoingMessage] = []
+        for idx, state in enumerate(states):
+            request_id = state["request_id"]
+            code_len = int(state["code_len"])
+            valid_chunk = int(state["valid_chunk"])
+            audio_start = (code_len - valid_chunk) * self._total_upsample
+            audio_end = code_len * self._total_upsample
+            audio = wav[idx, audio_start:audio_end]
+            audio_np = audio.detach().cpu().float().numpy().copy()
+            if self._timing_stats_enabled:
+                self._record_decode_duration(
+                    request_id,
+                    duration_ms=(decode_end_ns - decode_start_ns) / 1e6,
+                )
+            decode_metadata = dict(state["metadata"])
+            decode_metadata["samples"] = int(audio_np.shape[0])
+            decode_metadata["batch_size"] = batch_size
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name="code2wav_decode_end",
+                metadata=decode_metadata,
+            )
+            self._emitted[request_id] = int(state["end"])
+            messages.extend(self._messages_for_decoded_audio(request_id, audio_np))
+        return messages
+
+    def _messages_for_decoded_audio(
+        self, request_id: str, audio: np.ndarray
+    ) -> list[OutgoingMessage]:
+        messages: list[OutgoingMessage] = []
+        if audio.size <= 0:
+            return messages
+        is_first = not self._audio_chunks[request_id]
+        self._audio_chunks[request_id].append(audio)
+        self._record_audio_part(request_id)
+        if is_first:
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name="code2wav_first_audio",
+                metadata={"samples": int(audio.shape[0])},
+            )
+        if self._stream_enabled.get(request_id, True):
+            messages.append(
+                OutgoingMessage(
+                    request_id=request_id,
+                    type="stream",
+                    target=None,
+                    data=self._build_audio_payload(audio),
+                    metadata={"modality": "audio"},
+                )
+            )
+        return messages
 
     def on_streaming_new_request(self, request_id: str, payload: StagePayload) -> None:
         super().on_streaming_new_request(request_id, payload)

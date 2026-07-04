@@ -297,6 +297,20 @@ def test_maybe_enable_subtalker_torch_compile_falls_back_to_code_predictor():
     assert server_args.enable_torch_compile is False
 
 
+def test_maybe_enable_subtalker_torch_compile_can_be_disabled(monkeypatch):
+    model = SimpleNamespace(
+        enable_subtalker_torch_compile=lambda: (_ for _ in ()).throw(
+            AssertionError("compile hook should not be called")
+        )
+    )
+    server_args = SimpleNamespace(enable_torch_compile=True)
+
+    monkeypatch.setenv("SGLANG_OMNI_QWEN35_SUBTALKER_TORCH_COMPILE", "0")
+
+    assert bootstrap._maybe_enable_subtalker_torch_compile(model, server_args) is False
+    assert server_args.enable_torch_compile is False
+
+
 def test_maybe_enable_subtalker_torch_compile_ignores_disabled_flag():
     model = SimpleNamespace(
         enable_subtalker_torch_compile=lambda: (_ for _ in ()).throw(
