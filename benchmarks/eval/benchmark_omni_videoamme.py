@@ -53,6 +53,54 @@ Talker WER
 | Qwen3-Omni | thinker-talker, ci-50, c=8 | 50/50     | 0       | 2.58%      | 18.87%              | 155.00%            | 200.00%            | 6                  | 6.3183   | 11.750                | PR #411 [H200, c=8, max_tokens=256] |
 | Qwen3-Omni | thinker-talker, ci-50, c=8 | 50/50     | 0       | 2.29%      | 11.94%              | 100.00%            | 200.00%            | 4                  | 6.0412   | 12.356                | local [H100, c=8, max_tokens=256] |
 
+Qwen3.5-Omni Full-Chain Result (this workspace, 2026-07-05)
+
+Rationale
+
+This is the primary non-RTC benchmark path for Qwen3.5-Omni. Each request sends
+the complete Video-AMME video + audio-question payload once through the normal
+chat-completions API, with text+audio streaming output enabled. It intentionally
+does not run the RTC pre-run/actual prefix-cache flow, so the numbers reflect
+end-to-end full-chain preprocess, encoder, prefill, thinker decode, talker, and
+code2wav behavior under ordinary concurrent requests. Use this path when checking
+full-chain accuracy, audio stability, and steady service latency. Keep RTC chunk
+latency reports separate because they answer a different question: incremental
+latency after historical chunks have already been cached.
+
+Reproduce
+
+    env -u SGLANG_OMNI_SKIP_PREFILL_HIDDEN_CAPTURE TRACE_CACHE=0 FORCE_RESTART=1 \
+        SGLANG_OMNI_CUDA_VISIBLE_DEVICES=0,1,2 \
+        SGLANG_OMNI_SERVER_WARMUP=0 \
+        SGLANG_OMNI_MAX_PREFILL_TOKENS=20000 \
+        SGLANG_OMNI_THINKER_MAX_RUNNING_REQUESTS=12 \
+        SGLANG_OMNI_THINKER_MAX_MAMBA_CACHE_SIZE=256 \
+        SGLANG_OMNI_MAMBA_SCHEDULER_STRATEGY=no_buffer \
+        bash reports/run_sglang_qwen35_stable_server.sh
+
+    MAX_CONCURRENCY=8 MAX_SAMPLES=50 \
+        OUTPUT_DIR=results/videoamme_sg_fullchain_c8_n50_rerun_20260705_0807 \
+        bash reports/run_sglang_qwen35_videoamme_benchmark.sh
+
+Accuracy
+
+| Model        | Config                         | accuracy | correct | failed | mc_fallback | Source |
+| ------------ | ------------------------------ | -------- | ------- | ------ | ----------- | ------ |
+| Qwen3.5-Omni | full-chain, ci-50, c=8, audio  | 60.00%   | 30/50   | 0      | 0           | local [H20 ECS, 3 GPUs, max_tokens=256, temperature=0] |
+
+Speed
+
+| Model        | Config                        | completed | failed | latency_mean_s | latency_median_s | latency_p95_s | latency_p99_s | text_ttft_mean_s | audio_ttfp_mean_s | audio_duration_mean_s | audio_chunks_mean | output_tokens_mean | prompt_tokens_mean | throughput_qps | Source |
+| ------------ | ----------------------------- | --------- | ------ | -------------- | ---------------- | ------------- | ------------- | ---------------- | ----------------- | --------------------- | ----------------- | ------------------ | ------------------ | -------------- | ------ |
+| Qwen3.5-Omni | full-chain, ci-50, c=8, audio | 50        | 0      | 12.947         | 10.827           | 24.907        | 26.541        | 9.7567           | 12.4598           | 2.512                 | 8.2               | 7.0                | 14709.0            | 0.601          | local run results/videoamme_sg_fullchain_c8_n50_rerun_20260705_0807 |
+
+Audio Stability
+
+| Model        | Config                        | wav_count | bad_count | max_audio_duration_s | Notes |
+| ------------ | ----------------------------- | --------- | --------- | -------------------- | ----- |
+| Qwen3.5-Omni | full-chain, ci-50, c=8, audio | 50        | 0         | 13.2                 | no failed requests, no !!!! text, no >=200-token truncation, no >30s audio tails |
+
+
 Local v1 Pipeline Result (this workspace, 2026-05-01)
 
 Accuracy

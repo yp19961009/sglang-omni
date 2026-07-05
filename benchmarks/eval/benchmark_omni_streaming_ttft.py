@@ -156,6 +156,10 @@ def _event_text_delta(evt: dict) -> str | None:
 
 
 def _event_audio_data(evt: dict) -> str | None:
+    audio = evt.get("audio")
+    if isinstance(audio, dict) and audio.get("data"):
+        return audio["data"]
+
     for choice in evt.get("choices", []):
         delta = choice.get("delta") or {}
         audio = delta.get("audio")

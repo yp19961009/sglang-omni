@@ -135,6 +135,9 @@ def _event_text_delta(evt: dict[str, Any]) -> str | None:
 
 
 def _event_audio_obj(evt: dict[str, Any]) -> dict[str, Any] | None:
+    audio = evt.get("audio")
+    if isinstance(audio, dict) and audio.get("data"):
+        return audio
     for choice in evt.get("choices", []):
         delta = choice.get("delta") or {}
         audio = delta.get("audio")
@@ -201,20 +204,35 @@ def _combine_wav_chunks(
 
 
 async def _iter_sse_json(response: aiohttp.ClientResponse):
-    while True:
-        raw = await response.content.readline()
-        if not raw:
-            break
-        line = raw.decode("utf-8", errors="replace").strip()
-        if not line.startswith("data:"):
-            continue
-        body = line[len("data:") :].strip()
+    buffer = ""
+
+    async def emit_block(block: str):
+        data_parts = []
+        for line in block.splitlines():
+            line = line.strip()
+            if line.startswith("data:"):
+                data_parts.append(line[len("data:") :].strip())
+        body = "\n".join(data_parts).strip()
         if not body or body == "[DONE]":
-            continue
+            return None
         try:
-            yield json.loads(body)
+            return json.loads(body)
         except json.JSONDecodeError:
             logger.debug("Skipping non-JSON SSE payload: %s", body[:120])
+            return None
+
+    async for raw in response.content.iter_any():
+        buffer += raw.decode("utf-8", errors="replace")
+        while "\n\n" in buffer:
+            block, buffer = buffer.split("\n\n", 1)
+            evt = await emit_block(block)
+            if evt is not None:
+                yield evt
+
+    if buffer.strip():
+        evt = await emit_block(buffer)
+        if evt is not None:
+            yield evt
 
 
 async def _apply_chat_completion_stream_response(
@@ -362,6 +380,15 @@ def make_video_send_fn(
             if audio_language:
                 audio_config["language"] = audio_language
             payload["audio"] = audio_config
+            if os.getenv("OMNI_BENCH_VLLM_QWEN35_AUDIO_COMPAT", "0").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }:
+                payload["enable_audio_output"] = True
+                if audio_voice:
+                    payload["voice_type"] = audio_voice
         if video_fps is not None:
             payload["video_fps"] = video_fps
         if video_max_frames is not None:
