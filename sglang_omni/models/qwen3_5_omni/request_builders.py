@@ -1232,6 +1232,56 @@ def _resolve_qwen35_talker_max_new_tokens(
     )
 
 
+def _env_int_with_min(name: str, default: int, *, minimum: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return int(default)
+    try:
+        return max(int(minimum), int(raw))
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r", name, raw)
+        return int(default)
+
+
+def _resolve_qwen35_full_chain_talker_max_new_tokens(
+    current_max_new_tokens: int,
+    *,
+    assistant_token_count: int,
+    thinker_done: bool,
+) -> int:
+    if not thinker_done:
+        return int(current_max_new_tokens)
+    if not _env_flag_enabled(
+        os.getenv("QWEN35_FULL_CHAIN_TALKER_DYNAMIC_MAX_TOKENS"),
+        default=True,
+    ):
+        return int(current_max_new_tokens)
+
+    # In full-chain benchmarks the thinker text is already complete when the
+    # talker request is built. Bound the codec tail by actual text length so a
+    # short answer cannot keep sampling audio until the generic 2048-token cap.
+    per_text_token = _env_int_with_min(
+        "QWEN35_FULL_CHAIN_TALKER_AUDIO_TOKENS_PER_TEXT_TOKEN",
+        8,
+        minimum=1,
+    )
+    tail_tokens = _env_int_with_min(
+        "QWEN35_FULL_CHAIN_TALKER_AUDIO_TAIL_TOKENS",
+        48,
+        minimum=0,
+    )
+    min_tokens = _env_int_with_min(
+        "QWEN35_FULL_CHAIN_TALKER_MIN_AUDIO_TOKENS",
+        48,
+        minimum=1,
+    )
+    dynamic_cap = max(
+        min_tokens,
+        int(assistant_token_count) * per_text_token + tail_tokens,
+    )
+    return min(int(current_max_new_tokens), int(dynamic_cap))
+
+
 def _to_subtalker_sampling_namespace(config: dict[str, Any]) -> SimpleNamespace:
     # The subtalker samples residual codec groups inside the model and does not
     # need a separate SGLang Req. Keep a lightweight object for decode and
@@ -1842,6 +1892,13 @@ def _env_flag_enabled(raw: str | None, *, default: bool = False) -> bool:
     return raw not in {"0", "false", "False", "no", "NO", "off", "OFF"}
 
 
+def _talker_lenient_prompt_repair_enabled() -> bool:
+    return _env_flag_enabled(
+        os.getenv("QWEN35_TALKER_LENIENT_PROMPT_REPAIR"),
+        default=True,
+    )
+
+
 def _trim_partial_trailing_visual_features_enabled() -> bool:
     return _env_flag_enabled(
         os.getenv("QWEN35_TRIM_PARTIAL_TRAILING_VISUAL_FEATURES"),
@@ -2012,6 +2069,32 @@ def _is_qwen35_direct_full_actual(request: Any) -> bool:
         and bool(metadata.get("direct_full"))
         and not bool(metadata.get("pre_run"))
     )
+
+
+def _qwen35_state_has_multimodal_inputs(state: Qwen3OmniPipelineState) -> bool:
+    thinker_inputs = state.thinker_inputs or {}
+    model_inputs = thinker_inputs.get("model_inputs", {})
+    if isinstance(
+        model_inputs,
+        dict,
+    ) and qwen3_request_builders._has_multimodal_model_inputs(model_inputs):
+        return True
+    media_cache_keys = thinker_inputs.get("media_cache_keys")
+    return isinstance(media_cache_keys, dict) and any(
+        value is not None for value in media_cache_keys.values()
+    )
+
+
+def _is_qwen35_non_rtc_multimodal_actual(
+    request: Any,
+    state: Qwen3OmniPipelineState,
+) -> bool:
+    metadata = getattr(request, "metadata", None)
+    if isinstance(metadata, dict) and bool(metadata.get("pre_run")):
+        return False
+    if _is_qwen35_direct_full_actual(request) or _is_qwen35_rtc_actual(request):
+        return False
+    return _qwen35_state_has_multimodal_inputs(state)
 
 
 def _is_qwen35_rtc_prefill_only_prerun(request: Any) -> bool:
@@ -2330,6 +2413,21 @@ def make_thinker_scheduler_adapters(
     def request_builder(payload):
         state = Qwen3OmniPipelineState.from_dict(payload.data)
         _prepare_qwen35_thinker_inputs(state, thinker_config)
+        non_rtc_multimodal_actual = _is_qwen35_non_rtc_multimodal_actual(
+            payload.request,
+            state,
+        )
+        non_rtc_full_chain_audio = non_rtc_multimodal_actual and should_generate_audio_output(
+            payload.request
+        )
+        limit_prefix_cache_before_media = _limit_prefix_cache_before_media_enabled(
+            payload.request
+        ) or non_rtc_multimodal_actual
+        mamba_media_branching_cache = _mamba_media_branching_cache_enabled(
+            payload.request
+        )
+        if non_rtc_multimodal_actual:
+            mamba_media_branching_cache = False
         params = _params_for_qwen35_prerun(
             payload.request.params or {},
             payload.request,
@@ -2342,12 +2440,9 @@ def make_thinker_scheduler_adapters(
             request_id=payload.request_id,
             thinker_config=thinker_config,
             mrope_position_builder=qwen35_mrope_builder,
-            limit_prefix_cache_before_media=_limit_prefix_cache_before_media_enabled(
-                payload.request
-            ),
-            mamba_media_branching_cache=_mamba_media_branching_cache_enabled(
-                payload.request
-            ),
+            limit_prefix_cache_before_media=limit_prefix_cache_before_media,
+            mamba_media_branching_cache=mamba_media_branching_cache,
+            use_media_pad_values=not non_rtc_multimodal_actual,
         )
         req = getattr(req_data, "req", None)
         rtc_namespace = (
@@ -2357,8 +2452,16 @@ def make_thinker_scheduler_adapters(
         )
         if req is not None and rtc_namespace is not None:
             req._omni_rtc_cache_namespace = rtc_namespace
-        if req is not None and _is_qwen35_direct_full_actual(payload.request):
+        if req is not None and (
+            _is_qwen35_direct_full_actual(payload.request) or non_rtc_multimodal_actual
+        ):
             req._omni_direct_full_actual = True
+            if non_rtc_multimodal_actual:
+                req._omni_non_rtc_multimodal_actual = True
+                qwen3_request_builders._install_prefix_cache_limit_patch(req.__class__)
+                req._omni_max_prefix_cache_len = 0
+            if non_rtc_full_chain_audio:
+                req._omni_non_rtc_full_chain_audio = True
             if _direct_full_isolate_prefill_enabled():
                 req._omni_isolate_prefill_batch = True
         if req is not None and _is_qwen35_rtc_prerun(payload.request):
@@ -3330,16 +3433,13 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
             slot_sums.get(modality, 0) != missing
             for modality, missing in missing_by_modality.items()
         ):
-            inferred_slot_lengths = self._infer_rtc_media_slot_lengths(
-                prompt_len=prompt_len,
-                missing_by_modality=missing_by_modality,
-            )
-            if inferred_slot_lengths is not None:
-                slot_lengths = inferred_slot_lengths
-                slot_sums = {
-                    modality: sum(lengths)
-                    for modality, lengths in slot_lengths.items()
+            total_missing = sum(missing_by_modality.values())
+            if total_missing <= prompt_len:
+                slot_lengths = {
+                    modality: [missing]
+                    for modality, missing in missing_by_modality.items()
                 }
+                slot_sums = dict(missing_by_modality)
         total_media = sum(slot_sums.values())
         if any(
             slot_sums.get(modality, 0) != missing
@@ -3351,36 +3451,12 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
 
         sequence: list[tuple[str, int]] = []
         fallback_modality = "__text_fallback__"
-        if (
-            "video" in slot_lengths
-            and "audio" in slot_lengths
-            and len(slot_lengths["video"]) == len(slot_lengths["audio"])
-            and not slot_lengths.get("image")
-        ):
-            extras = self._distribute_prompt_extra(
-                prompt_len - total_media,
-                len(slot_lengths["video"]),
-            )
-            for index, (video_len, audio_len) in enumerate(
-                zip(
-                    slot_lengths["video"],
-                    slot_lengths["audio"],
-                )
-            ):
-                extra_len = extras[index] if index < len(extras) else 0
-                if extra_len > 1:
-                    sequence.append((fallback_modality, extra_len - 1))
-                sequence.append(("video", video_len))
-                if extra_len > 0:
-                    sequence.append((fallback_modality, 1))
-                sequence.append(("audio", audio_len))
-        else:
-            extra_len = prompt_len - total_media
-            if extra_len > 0:
-                sequence.append((fallback_modality, extra_len))
-            for modality in ("image", "video", "audio"):
-                for length in slot_lengths.get(modality, []):
-                    sequence.append((modality, length))
+        extra_len = prompt_len - total_media
+        if extra_len > 0:
+            sequence.append((fallback_modality, extra_len))
+        for modality in ("image", "video", "audio"):
+            for length in slot_lengths.get(modality, []):
+                sequence.append((modality, length))
 
         if sum(length for _, length in sequence) != prompt_len:
             return None
@@ -3658,13 +3734,14 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
         if original_prompt_ids is not None:
             return original_prompt_ids
 
-        partial_rtc = self._canonicalize_partial_rtc_media_prompt(
-            prompt_ids,
-            invalid_mask,
-            prompt_model_inputs,
-        )
-        if partial_rtc is not None:
-            return partial_rtc
+        if not bool(invalid_mask.all()):
+            partial_rtc = self._canonicalize_partial_rtc_media_prompt(
+                prompt_ids,
+                invalid_mask,
+                prompt_model_inputs,
+            )
+            if partial_rtc is not None:
+                return partial_rtc
 
         missing_modalities: list[tuple[str, int, int]] = []
         for modality, feature_key, token_id in (
@@ -3814,6 +3891,16 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
             prompt_model_inputs,
             missing_modalities,
         )
+        if _talker_lenient_prompt_repair_enabled() and not bool(invalid_mask.all()):
+            canonical = prompt_ids.clone()
+            canonical[invalid_mask] = int(self._fallback_prompt_text_token_id())
+            logger.warning(
+                "Qwen3.5 talker prompt used text fallback for partially "
+                "unmapped media pad ids: gaps=%s; %s",
+                modality_state or "none",
+                debug_summary,
+            )
+            return canonical
         raise ValueError(
             "Qwen3.5 talker prompt contains unmapped media cache pad ids: "
             f"{formatted}; modality feature/token gaps: {modality_state or 'none'}; "
@@ -3932,11 +4019,29 @@ class Qwen35TalkerPrefillBuilder(TalkerPrefillBuilder):
             mask_rows = int(mask.sum().item())
             feature_rows = int(feature_tensor.shape[0])
             if feature_rows != mask_rows:
-                raise ValueError(
-                    "Qwen3.5 talker prompt media feature/token mismatch after "
-                    f"canonicalization: {modality_key} rows={feature_rows}, "
-                    f"token_count={mask_rows}, prompt_len={prompt_ids.numel()}"
+                if not _talker_lenient_prompt_repair_enabled():
+                    raise ValueError(
+                        "Qwen3.5 talker prompt media feature/token mismatch after "
+                        f"canonicalization: {modality_key} rows={feature_rows}, "
+                        f"token_count={mask_rows}, prompt_len={prompt_ids.numel()}"
+                    )
+                rows_to_scatter = min(feature_rows, mask_rows)
+                logger.warning(
+                    "Qwen3.5 talker prompt repaired media feature/token mismatch: "
+                    "%s rows=%d token_count=%d scattered=%d prompt_len=%d",
+                    modality_key,
+                    feature_rows,
+                    mask_rows,
+                    rows_to_scatter,
+                    int(prompt_ids.numel()),
                 )
+                if rows_to_scatter <= 0:
+                    continue
+                mask_positions = torch.nonzero(mask, as_tuple=False).reshape(-1)
+                prompt_hidden[mask_positions[:rows_to_scatter]] = feature_tensor[
+                    :rows_to_scatter
+                ].to(device=prompt_hidden.device, dtype=prompt_hidden.dtype)
+                continue
             prompt_hidden[mask] = feature_tensor.to(
                 device=prompt_hidden.device,
                 dtype=prompt_hidden.dtype,
@@ -4729,6 +4834,26 @@ def make_talker_scheduler_adapters(
             mrope_position_builder=_compute_qwen35_mrope_positions,
         )
         if hasattr(req_data, "req"):
+            if (
+                should_generate_audio_output(payload)
+                and bool(getattr(req_data, "thinker_chunks_done", False))
+                and not _is_qwen35_rtc_actual(payload.request)
+            ):
+                sampling_params = getattr(req_data.req, "sampling_params", None)
+                current_max_new_tokens = int(
+                    getattr(sampling_params, "max_new_tokens", 0) or 0
+                )
+                adjusted_max_new_tokens = (
+                    _resolve_qwen35_full_chain_talker_max_new_tokens(
+                        current_max_new_tokens,
+                        assistant_token_count=len(
+                            getattr(payload, "prefetched_chunks", []) or []
+                        ),
+                        thinker_done=True,
+                    )
+                )
+                sampling_params.max_new_tokens = adjusted_max_new_tokens
+                req_data.max_new_tokens = adjusted_max_new_tokens
             req = req_data.req
             is_streaming = bool(params.get("stream"))
             if (

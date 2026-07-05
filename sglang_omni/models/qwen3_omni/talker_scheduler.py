@@ -22,6 +22,19 @@ logger = logging.getLogger(__name__)
 _READY_SUBSET_MIN_SIZE_ENV = "SGLANG_OMNI_TALKER_READY_SUBSET_MIN_SIZE"
 _READY_SUBSET_STATS_ENV = "SGLANG_OMNI_TALKER_READY_SUBSET_STATS"
 _READY_SUBSET_STATS_LOG_INTERVAL_NS = 1_000_000_000
+_PARTIAL_START_SCOPE_ENV = "SGLANG_OMNI_TALKER_PARTIAL_START_SCOPE"
+
+
+def _normalize_partial_start_scope(raw: str | None) -> str:
+    value = (raw or "rtc").strip().lower()
+    if value in {"", "default", "rtc", "realtime"}:
+        return "rtc"
+    if value in {"all", "always"}:
+        return "all"
+    logger.warning(
+        "Ignoring invalid %s=%r; using 'rtc'", _PARTIAL_START_SCOPE_ENV, raw
+    )
+    return "rtc"
 
 
 def _ready_subset_min_size() -> int:
@@ -84,10 +97,28 @@ class QwenTalkerScheduler(OmniScheduler):
             )
         self._enable_partial_start = bool(enable_partial_start)
         self._partial_start_min_chunks = int(partial_start_min_chunks)
+        self._partial_start_scope = _normalize_partial_start_scope(
+            os.getenv(_PARTIAL_START_SCOPE_ENV)
+        )
         self._im_end_token_id = im_end_token_id
         self._ready_subset_deferred_batch: Any | None = None
         self._ready_subset_stats = self._new_ready_subset_stats()
         self._ready_subset_stats_last_log_ns = 0
+
+    @staticmethod
+    def _is_rtc_partial_start_payload(payload: Any) -> bool:
+        request = getattr(payload, "request", None)
+        metadata = getattr(request, "metadata", None)
+        if not isinstance(metadata, dict) or bool(metadata.get("pre_run")):
+            return False
+        namespace = metadata.get("media_cache_namespace")
+        return isinstance(namespace, str) and namespace.startswith("rtc:")
+
+    def _partial_start_allowed_for_payload(self, payload: Any) -> bool:
+        scope = getattr(self, "_partial_start_scope", "rtc")
+        if scope == "all":
+            return True
+        return self._is_rtc_partial_start_payload(payload)
 
     def _count_usable_prefetched_chunks(self, prefetched: list[Any]) -> int:
         im_end = self._im_end_token_id
@@ -109,6 +140,8 @@ class QwenTalkerScheduler(OmniScheduler):
             return True
         if not self._enable_partial_start:
             return False
+        if not self._partial_start_allowed_for_payload(payload):
+            return False
         prefetched = getattr(payload, "prefetched_chunks", None) or []
         return (
             self._count_usable_prefetched_chunks(prefetched)
@@ -122,8 +155,13 @@ class QwenTalkerScheduler(OmniScheduler):
     def _should_recheck_deferred_request_on_stream_chunk(
         self, request_id: str, chunk: Any
     ) -> bool:
-        del request_id, chunk
-        return self._enable_partial_start
+        del chunk
+        if not self._enable_partial_start:
+            return False
+        payload = getattr(self, "_deferred_request_payloads", {}).get(request_id)
+        if payload is None:
+            return True
+        return self._partial_start_allowed_for_payload(payload)
 
     def _is_batch_ready_to_run(self, batch: Any) -> bool:
         if (

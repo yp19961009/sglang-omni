@@ -218,6 +218,11 @@ def _apply_typed_runtime_args(args: dict[str, Any], stage_cfg: StageConfig) -> N
         overrides = dict(args.get("server_args_overrides") or {})
         overrides["mamba_full_memory_ratio"] = float(mamba_full_memory_ratio)
         args["server_args_overrides"] = overrides
+    mamba_scheduler_strategy = runtime.sglang_server_args.mamba_scheduler_strategy
+    if mamba_scheduler_strategy is not None:
+        overrides = dict(args.get("server_args_overrides") or {})
+        overrides["mamba_scheduler_strategy"] = str(mamba_scheduler_strategy)
+        args["server_args_overrides"] = overrides
 
 
 def _resolve_primary_gpu_id(

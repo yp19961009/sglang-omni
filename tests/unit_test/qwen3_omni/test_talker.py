@@ -673,23 +673,37 @@ def _fresh_partial_scheduler(
     *,
     enable_partial_start: bool = False,
     partial_start_min_chunks: int = MIN_PARTIAL_START_CHUNKS,
+    partial_start_scope: str = "rtc",
 ) -> QwenTalkerScheduler:
     """Build a bare scheduler instance with only the partial-start state needed."""
     scheduler = object.__new__(QwenTalkerScheduler)
     scheduler._enable_partial_start = enable_partial_start
     scheduler._partial_start_min_chunks = partial_start_min_chunks
+    scheduler._partial_start_scope = partial_start_scope
     scheduler._im_end_token_id = None
     return scheduler
+
+
+def _rtc_request(
+    *,
+    namespace: str = "rtc:r0",
+    pre_run: bool = False,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        metadata={"media_cache_namespace": namespace, "pre_run": pre_run}
+    )
 
 
 def _make_payload(
     *,
     request_id: str = "r0",
+    request: Any | None = None,
     prefetched_chunks: list[Any] | None = None,
     prefetched_stream_done: bool = False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         request_id=request_id,
+        request=request if request is not None else _rtc_request(),
         prefetched_chunks=list(prefetched_chunks or []),
         prefetched_stream_done=prefetched_stream_done,
     )
@@ -722,6 +736,19 @@ def test_partial_enabled_at_threshold_returns_true_with_done_false() -> None:
     payload = _make_payload(prefetched_chunks=[object()] * 5)
 
     assert scheduler._is_request_build_ready(payload, pending_stream_done=False)
+
+
+def test_partial_enabled_non_rtc_waits_for_stream_done() -> None:
+    """Regular full-chain audio requests should not build talker from partial text."""
+    scheduler = _fresh_partial_scheduler(
+        enable_partial_start=True, partial_start_min_chunks=5
+    )
+    payload = _make_payload(
+        request=SimpleNamespace(metadata={}), prefetched_chunks=[object()] * 50
+    )
+
+    assert not scheduler._is_request_build_ready(payload, pending_stream_done=False)
+    assert scheduler._is_request_build_ready(payload, pending_stream_done=True)
 
 
 def test_partial_rejects_min_chunks_below_layout_floor(monkeypatch) -> None:
@@ -1057,6 +1084,7 @@ def _build_state_machine_scheduler(
     scheduler = object.__new__(QwenTalkerScheduler)
     scheduler._enable_partial_start = enable_partial_start
     scheduler._partial_start_min_chunks = partial_start_min_chunks
+    scheduler._partial_start_scope = "rtc"
     scheduler._im_end_token_id = None
     scheduler._pending_stream_chunks = {}
     scheduler._pending_stream_done = set()
@@ -1100,6 +1128,7 @@ def test_process_input_requests_partial_build_state_machine() -> None:
     chunks = [SimpleNamespace(data=torch.tensor([float(i)])) for i in range(5)]
     payload = SimpleNamespace(
         request_id="rid-partial-1",
+        request=_rtc_request(namespace="rtc:rid-partial-1"),
         prefetched_chunks=list(chunks),
         prefetched_stream_done=False,
     )
@@ -1143,6 +1172,7 @@ def test_process_input_requests_keeps_deferred_when_below_threshold() -> None:
     )
     payload = SimpleNamespace(
         request_id="rid-stay",
+        request=_rtc_request(namespace="rtc:rid-stay"),
         prefetched_chunks=[SimpleNamespace(data=torch.tensor([0.0]))] * 2,
         prefetched_stream_done=False,
     )

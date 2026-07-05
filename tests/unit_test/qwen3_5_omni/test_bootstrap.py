@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from sglang_omni.models.qwen3_5_omni import bootstrap
 
 
@@ -17,6 +19,139 @@ def test_ensure_embed_capture_layer():
     assert bootstrap._ensure_embed_capture_layer([18]) == [0, 18]
     assert bootstrap._ensure_embed_capture_layer("0,18") == [0, 18]
     assert bootstrap._ensure_embed_capture_layer([0, "18", 18]) == [0, 18]
+
+
+@pytest.mark.parametrize(
+    (
+        "env_value",
+        "expected_init_graph_calls",
+        "expected_final_disable_cuda_graph",
+        "expected_enable_return_hidden_states",
+    ),
+    [
+        (None, 0, True, False),
+        ("1", 1, False, True),
+    ],
+)
+def test_thinker_cuda_graph_guard_for_hidden_capture(
+    monkeypatch,
+    env_value,
+    expected_init_graph_calls,
+    expected_final_disable_cuda_graph,
+    expected_enable_return_hidden_states,
+):
+    from sglang.srt.utils import hf_transformers_utils
+
+    from sglang_omni.model_runner import thinker_model_runner
+    from sglang_omni.models.qwen3_5_omni import request_builders
+    from sglang_omni.scheduling import bootstrap as scheduling_bootstrap
+    from sglang_omni.scheduling import omni_scheduler, sglang_backend
+
+    if env_value is None:
+        monkeypatch.delenv(
+            "SGLANG_OMNI_QWEN35_ALLOW_THINKER_CUDA_GRAPH_WITH_HIDDEN",
+            raising=False,
+        )
+    else:
+        monkeypatch.setenv(
+            "SGLANG_OMNI_QWEN35_ALLOW_THINKER_CUDA_GRAPH_WITH_HIDDEN",
+            env_value,
+        )
+
+    server_args = SimpleNamespace(disable_cuda_graph=False)
+    infrastructure_saw_graph_disabled = []
+    capture_hidden_layers_seen = []
+    init_graph_calls = 0
+    moe_patch_calls = 0
+
+    class FakeModelRunner:
+        model = object()
+
+        def init_device_graphs(self):
+            nonlocal init_graph_calls
+            init_graph_calls += 1
+            assert server_args.disable_cuda_graph is False
+
+    model_config = SimpleNamespace(
+        model_path="model",
+        vocab_size=10,
+        hf_config=SimpleNamespace(thinker_config=object()),
+    )
+    model_worker = SimpleNamespace(
+        model_runner=FakeModelRunner(),
+        model_config=model_config,
+    )
+
+    def fake_create_infrastructure(*args, **kwargs):
+        infrastructure_saw_graph_disabled.append(bool(args[0].disable_cuda_graph))
+        capture_hidden_layers_seen.append(kwargs.get("capture_hidden_layers"))
+        return (
+            model_worker,
+            object(),
+            object(),
+            object(),
+            object(),
+            object(),
+            model_config,
+        )
+
+    monkeypatch.setattr(
+        scheduling_bootstrap,
+        "create_sglang_infrastructure",
+        fake_create_infrastructure,
+    )
+    monkeypatch.setattr(
+        hf_transformers_utils, "get_tokenizer", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(
+        bootstrap, "_metadata_config", lambda *args, **kwargs: SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        request_builders,
+        "make_thinker_scheduler_adapters",
+        lambda **kwargs: (object(), object()),
+    )
+    monkeypatch.setattr(
+        request_builders,
+        "make_thinker_stream_output_builder",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        request_builders, "should_generate_audio_output", lambda payload: True
+    )
+    monkeypatch.setattr(
+        sglang_backend, "SGLangOutputProcessor", lambda **kwargs: object()
+    )
+    monkeypatch.setattr(
+        thinker_model_runner,
+        "ThinkerModelRunner",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(omni_scheduler, "OmniScheduler", SimpleNamespace)
+
+    def fake_apply_moe_patch():
+        nonlocal moe_patch_calls
+        moe_patch_calls += 1
+
+    monkeypatch.setattr(bootstrap, "apply_moe_sum_reduce_fx_guard_patch", fake_apply_moe_patch)
+
+    scheduler = bootstrap.create_thinker_scheduler(
+        server_args,
+        speech_enabled=True,
+    )
+
+    assert infrastructure_saw_graph_disabled == [True]
+    assert capture_hidden_layers_seen == [
+        bootstrap.QWEN3_5_OMNI_DEFAULT_CAPTURE_HIDDEN_LAYERS
+    ]
+    assert init_graph_calls == expected_init_graph_calls
+    assert (
+        getattr(server_args, "enable_return_hidden_states", False)
+        is expected_enable_return_hidden_states
+    )
+    assert server_args.disable_cuda_graph is expected_final_disable_cuda_graph
+    assert moe_patch_calls == 1
+    assert scheduler.server_args is server_args
 
 
 def test_resolve_capture_hidden_layers_falls_back_without_model_path():

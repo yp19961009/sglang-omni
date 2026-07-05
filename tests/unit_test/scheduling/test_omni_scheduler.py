@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import torch
+
 from sglang_omni.scheduling import omni_scheduler
 
 
@@ -688,3 +690,50 @@ def test_omni_scheduler_releases_protected_rtc_prefix_when_actual_finishes(
     assert req._omni_release_protected_prefix_cache_on_finish is False
 
 
+
+
+def test_keep_mamba_track_for_non_rtc_full_chain_audio_actual(monkeypatch):
+    monkeypatch.delenv("QWEN35_RTC_DISABLE_ACTUAL_MAMBA_TRACK", raising=False)
+    scheduler = object.__new__(omni_scheduler.OmniScheduler)
+    batch = SimpleNamespace(
+        mamba_track_mask=torch.tensor([True, True]),
+        mamba_track_seqlens=torch.tensor([8, 8]),
+        reqs=[
+            SimpleNamespace(
+                _omni_non_rtc_full_chain_audio=True,
+                sampling_params=SimpleNamespace(max_new_tokens=32),
+            ),
+            SimpleNamespace(
+                _omni_non_rtc_full_chain_audio=True,
+                sampling_params=SimpleNamespace(max_new_tokens=0),
+            ),
+        ],
+    )
+
+    scheduler._disable_omni_rtc_actual_mamba_track(batch)
+
+    assert batch.mamba_track_mask.tolist() == [True, True]
+    assert batch.mamba_track_seqlens.tolist() == [8, 8]
+
+
+def test_disable_mamba_track_keeps_rtc_env_gate(monkeypatch):
+    monkeypatch.delenv("QWEN35_RTC_DISABLE_ACTUAL_MAMBA_TRACK", raising=False)
+    scheduler = object.__new__(omni_scheduler.OmniScheduler)
+    batch = SimpleNamespace(
+        mamba_track_mask=torch.tensor([True]),
+        mamba_track_seqlens=torch.tensor([8]),
+        reqs=[
+            SimpleNamespace(
+                extra_key="media-cache:rtc:req-0",
+                sampling_params=SimpleNamespace(max_new_tokens=32),
+            )
+        ],
+    )
+
+    scheduler._disable_omni_rtc_actual_mamba_track(batch)
+    assert batch.mamba_track_mask.tolist() == [True]
+
+    monkeypatch.setenv("QWEN35_RTC_DISABLE_ACTUAL_MAMBA_TRACK", "1")
+    scheduler._disable_omni_rtc_actual_mamba_track(batch)
+    assert batch.mamba_track_mask.tolist() == [False]
+    assert batch.mamba_track_seqlens.tolist() == [-1]

@@ -1126,6 +1126,7 @@ def build_sglang_thinker_request(
     ) = None,
     limit_prefix_cache_before_media: bool = False,
     mamba_media_branching_cache: bool = False,
+    use_media_pad_values: bool = True,
 ) -> "SGLangARRequestData":
     """Build SGLangARRequestData from pipeline state.
 
@@ -1161,7 +1162,7 @@ def build_sglang_thinker_request(
         else:
             model_inputs["original_input_ids"] = original_input_ids
     pad_values: dict[str, int] = {}
-    if thinker_config is not None and (
+    if use_media_pad_values and thinker_config is not None and (
         media_cache_keys or _has_multimodal_model_inputs(model_inputs)
     ):
         token_id_map: dict[int, int] = {}

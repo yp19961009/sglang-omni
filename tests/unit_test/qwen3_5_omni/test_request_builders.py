@@ -701,10 +701,10 @@ def test_qwen35_talker_maps_fully_compressed_media_cache_prompt():
         },
     )
 
-    assert canonical.tolist() == [3, 3, 3, 1, 1, 3, 3, 3, 1, 1]
+    assert canonical.tolist() == [3, 3, 3, 3, 3, 3, 1, 1, 1, 1]
 
 
-def test_qwen35_talker_maps_compressed_rtc_media_prompt_with_text_filler():
+def test_qwen35_talker_maps_compressed_full_chain_media_prompt_with_text_filler():
     builder = _builder(_FakeTalkerModel())
     compressed_ids = torch.arange(
         -6000000000000000000,
@@ -725,13 +725,12 @@ def test_qwen35_talker_maps_compressed_rtc_media_prompt_with_text_filler():
     assert int((canonical == 3).sum().item()) == 35200
     assert int((canonical == 1).sum().item()) == 560
     assert int((canonical == 0).sum().item()) == 800
-    assert canonical[:19].tolist() == [0] * 19
-    assert canonical[19:899].tolist() == [3] * 880
-    assert canonical[899].item() == 0
-    assert canonical[900:914].tolist() == [1] * 14
+    assert canonical[:800].tolist() == [0] * 800
+    assert canonical[800:36000].tolist() == [3] * 35200
+    assert canonical[36000:].tolist() == [1] * 560
 
 
-def test_qwen35_talker_maps_compressed_rtc_media_prompt_without_slot_metadata():
+def test_qwen35_talker_maps_compressed_full_chain_media_prompt_without_slot_metadata():
     builder = _builder(_FakeTalkerModel())
     compressed_ids = torch.arange(
         -6000000000000000000,
@@ -750,13 +749,12 @@ def test_qwen35_talker_maps_compressed_rtc_media_prompt_without_slot_metadata():
     assert int((canonical == 3).sum().item()) == 35200
     assert int((canonical == 1).sum().item()) == 560
     assert int((canonical == 0).sum().item()) == 800
-    assert canonical[:19].tolist() == [0] * 19
-    assert canonical[19:899].tolist() == [3] * 880
-    assert canonical[899].item() == 0
-    assert canonical[900:914].tolist() == [1] * 14
+    assert canonical[:800].tolist() == [0] * 800
+    assert canonical[800:36000].tolist() == [3] * 35200
+    assert canonical[36000:].tolist() == [1] * 560
 
 
-def test_qwen35_talker_preserves_original_text_in_compressed_rtc_prompt():
+def test_qwen35_talker_preserves_original_text_in_compressed_full_chain_prompt():
     builder = _builder(_FakeTalkerModel())
     compressed_ids = torch.arange(
         -6000000000000000000,
@@ -778,10 +776,28 @@ def test_qwen35_talker_preserves_original_text_in_compressed_rtc_prompt():
     assert int((canonical == 1).sum().item()) == 560
     assert int((canonical == 99).sum().item()) == 800
     assert int((canonical == 0).sum().item()) == 0
-    assert canonical[:19].tolist() == [99] * 19
-    assert canonical[19:899].tolist() == [3] * 880
-    assert canonical[899].item() == 99
-    assert canonical[900:914].tolist() == [1] * 14
+    assert canonical[:800].tolist() == [99] * 800
+    assert canonical[800:36000].tolist() == [3] * 35200
+    assert canonical[36000:].tolist() == [1] * 560
+
+
+def test_qwen35_talker_maps_non_rtc_fully_compressed_media_prompt():
+    builder = _builder(_FakeTalkerModel())
+    prompt_ids = torch.arange(
+        -6000000000000000000,
+        -6000000000000000000 + 16,
+        dtype=torch.long,
+    )
+
+    canonical = builder._canonicalize_prompt_ids_for_talker(
+        prompt_ids,
+        {
+            "video_embeds": torch.ones((8, 4)),
+            "audio_embeds": torch.ones((3, 4)),
+        },
+    )
+
+    assert canonical.tolist() == [0] * 5 + [3] * 8 + [1] * 3
 
 
 def test_qwen35_talker_restores_original_ids_for_partially_compressed_rtc_prompt():
@@ -2572,6 +2588,63 @@ def test_qwen35_thinker_adapter_can_disable_mamba_media_branching_cache(monkeypa
     assert captured["mamba_media_branching_cache"] is False
 
 
+def test_qwen35_thinker_adapter_disables_mamba_branching_for_full_chain_audio(
+    monkeypatch,
+):
+    captured = {}
+
+    class _FakeReq:
+        def init_next_round_input(self, tree_cache=None):
+            del tree_cache
+            return None
+
+    fake_req = _FakeReq()
+
+    def _fake_build_sglang_thinker_request(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return SimpleNamespace(stage_payload=None, req=fake_req)
+
+    monkeypatch.delenv("QWEN35_MAMBA_MEDIA_BRANCH_CACHE", raising=False)
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "build_sglang_thinker_request",
+        _fake_build_sglang_thinker_request,
+    )
+
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    state = Qwen3OmniPipelineState(
+        prompt={"input_ids": torch.tensor([1])},
+        thinker_inputs={
+            "model_inputs": {
+                "video_embeds": torch.ones(1, 4),
+                "audio_embeds": torch.ones(1, 4),
+            }
+        },
+    )
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(
+            inputs={},
+            params={"modalities": ["text", "audio"]},
+        ),
+        data=state.to_dict(),
+    )
+
+    request_builder(payload)
+
+    assert captured["limit_prefix_cache_before_media"] is True
+    assert captured["mamba_media_branching_cache"] is False
+    assert fake_req._omni_direct_full_actual is True
+    assert fake_req._omni_non_rtc_multimodal_actual is True
+    assert fake_req._omni_non_rtc_full_chain_audio is True
+    assert fake_req._omni_max_prefix_cache_len == 0
+
+
 def test_qwen35_thinker_adapter_disables_mamba_branching_for_rtc_omit_by_default(
     monkeypatch,
 ):
@@ -4331,6 +4404,108 @@ def test_qwen35_thinker_adapter_isolates_direct_full_prefill(monkeypatch):
     assert fake_req._omni_isolate_prefill_batch is True
     assert not hasattr(fake_req, "_omni_skip_finished_mamba_cache_insert")
 
+def test_qwen35_non_rtc_full_chain_disables_media_pad_values(monkeypatch):
+    captured = {}
+
+    class _FakeReq:
+        extra_key = None
+        sampling_params = SimpleNamespace(max_new_tokens=64)
+        origin_input_ids = [151644, 872, 1, 151645]
+
+        def init_next_round_input(self, tree_cache=None):
+            del tree_cache
+            return None
+
+    fake_req = _FakeReq()
+
+    def _fake_build_sglang_thinker_request(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return SimpleNamespace(req=fake_req, stage_payload=None)
+
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "build_sglang_thinker_request",
+        _fake_build_sglang_thinker_request,
+    )
+
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    state = Qwen3OmniPipelineState(
+        prompt={"input_ids": torch.tensor([1])},
+        thinker_inputs={"model_inputs": {"video_embeds": torch.ones((1, 4))}},
+    )
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(
+            inputs={},
+            params={"stream": False, "modalities": ["text", "audio"]},
+        ),
+        data=state.to_dict(),
+    )
+
+    request_builder(payload)
+
+    assert captured["use_media_pad_values"] is False
+    assert fake_req._omni_non_rtc_multimodal_actual is True
+    assert fake_req._omni_non_rtc_full_chain_audio is True
+    assert fake_req._omni_max_prefix_cache_len == 0
+
+
+def test_qwen35_non_rtc_text_multimodal_disables_media_pad_values(monkeypatch):
+    captured = {}
+
+    class _FakeReq:
+        extra_key = None
+        sampling_params = SimpleNamespace(max_new_tokens=64)
+        origin_input_ids = [151644, 872, 1, 151645]
+
+        def init_next_round_input(self, tree_cache=None):
+            del tree_cache
+            return None
+
+    fake_req = _FakeReq()
+
+    def _fake_build_sglang_thinker_request(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return SimpleNamespace(req=fake_req, stage_payload=None)
+
+    monkeypatch.setattr(
+        request_builders.qwen3_request_builders,
+        "build_sglang_thinker_request",
+        _fake_build_sglang_thinker_request,
+    )
+
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=object(),
+        vocab_size=16,
+        thinker_config=SimpleNamespace(),
+    )
+    state = Qwen3OmniPipelineState(
+        prompt={"input_ids": torch.tensor([1])},
+        thinker_inputs={"model_inputs": {"video_embeds": torch.ones((1, 4))}},
+    )
+    payload = StagePayload(
+        request_id="req-0",
+        request=OmniRequest(
+            inputs={},
+            params={"stream": True, "modalities": ["text"]},
+        ),
+        data=state.to_dict(),
+    )
+
+    request_builder(payload)
+
+    assert captured["use_media_pad_values"] is False
+    assert fake_req._omni_non_rtc_multimodal_actual is True
+    assert not hasattr(fake_req, "_omni_non_rtc_full_chain_audio")
+    assert fake_req._omni_max_prefix_cache_len == 0
+
+
 def test_qwen35_rtc_slot_inference_allows_uneven_text_filler():
     lengths = Qwen35TalkerPrefillBuilder._infer_rtc_media_slot_lengths(
         prompt_len=36334,
@@ -4345,3 +4520,48 @@ def test_qwen35_rtc_slot_inference_allows_uneven_text_filler():
     assert extras[:14] == [15] * 14
     assert extras[14:] == [14] * 26
 
+
+
+def test_qwen35_full_chain_talker_max_new_tokens_caps_by_text_length(monkeypatch):
+    for name in (
+        "QWEN35_FULL_CHAIN_TALKER_DYNAMIC_MAX_TOKENS",
+        "QWEN35_FULL_CHAIN_TALKER_AUDIO_TOKENS_PER_TEXT_TOKEN",
+        "QWEN35_FULL_CHAIN_TALKER_AUDIO_TAIL_TOKENS",
+        "QWEN35_FULL_CHAIN_TALKER_MIN_AUDIO_TOKENS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert (
+        request_builders._resolve_qwen35_full_chain_talker_max_new_tokens(
+            2048,
+            assistant_token_count=4,
+            thinker_done=True,
+        )
+        == 80
+    )
+    assert (
+        request_builders._resolve_qwen35_full_chain_talker_max_new_tokens(
+            64,
+            assistant_token_count=4,
+            thinker_done=True,
+        )
+        == 64
+    )
+    assert (
+        request_builders._resolve_qwen35_full_chain_talker_max_new_tokens(
+            2048,
+            assistant_token_count=4,
+            thinker_done=False,
+        )
+        == 2048
+    )
+
+    monkeypatch.setenv("QWEN35_FULL_CHAIN_TALKER_DYNAMIC_MAX_TOKENS", "0")
+    assert (
+        request_builders._resolve_qwen35_full_chain_talker_max_new_tokens(
+            2048,
+            assistant_token_count=4,
+            thinker_done=True,
+        )
+        == 2048
+    )

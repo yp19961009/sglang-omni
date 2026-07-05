@@ -120,6 +120,8 @@ def _native_layers_to_capture_supported(forward_fn: Any) -> bool:
 
 
 def _deepstack_tensor_for_layer(value: Any, layer_id: int) -> torch.Tensor | None:
+    if layer_id < 0:
+        return None
     if value is None:
         return None
     key = f"deepstack_input_embeds_{layer_id}"
@@ -130,9 +132,9 @@ def _deepstack_tensor_for_layer(value: Any, layer_id: int) -> torch.Tensor | Non
             return value[layer_id]
         return None
     if isinstance(value, (list, tuple)):
-        return value[layer_id] if layer_id < len(value) else None
+        return value[layer_id] if 0 <= layer_id < len(value) else None
     if isinstance(value, torch.Tensor):
-        if value.ndim >= 3 and layer_id < value.shape[0]:
+        if value.ndim >= 3 and 0 <= layer_id < value.shape[0]:
             return value[layer_id]
         return value if layer_id == 0 else None
     try:
@@ -141,21 +143,25 @@ def _deepstack_tensor_for_layer(value: Any, layer_id: int) -> torch.Tensor | Non
         return None
 
 
-def _add_deepstack_for_layer(
+def _add_deepstack_to_residual(
     hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
     deepstack_input_embeds: Any,
     layer_id: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     layer_deepstack = _deepstack_tensor_for_layer(deepstack_input_embeds, layer_id)
     if layer_deepstack is None:
-        return hidden_states
+        return hidden_states, residual
     layer_deepstack = layer_deepstack.to(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    # Qwen3NextVLModel adds deepstack visual features after the matching layer;
-    # keep the same placement so attention inputs remain unchanged.
-    return hidden_states + layer_deepstack
+    # SGLang Qwen3-VL applies deepstack after the residual add for the previous
+    # decoder layer. Qwen3Next layers do not forward post_residual_addition, so
+    # inject it into residual before the next layer's input RMSNorm.
+    if residual is None:
+        return hidden_states + layer_deepstack, residual
+    return hidden_states, residual + layer_deepstack
 
 
 def _install_layers_to_capture_support(text_model: nn.Module) -> None:
@@ -202,6 +208,13 @@ def _install_layers_to_capture_support(text_model: nn.Module) -> None:
             aux_hidden_by_layer[0] = hidden_states.clone()
         residual = None
         for layer_id, layer in enumerate(text_model.layers):
+            if has_deepstack:
+                hidden_states, residual = _add_deepstack_to_residual(
+                    hidden_states,
+                    residual,
+                    deepstack_input_embeds,
+                    layer_id - 1,
+                )
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_id
             ):
@@ -212,17 +225,15 @@ def _install_layers_to_capture_support(text_model: nn.Module) -> None:
                     residual=residual,
                     forward_batch=forward_batch,
                 )
-            if has_deepstack:
-                hidden_states = _add_deepstack_for_layer(
-                    hidden_states,
-                    deepstack_input_embeds,
-                    layer_id,
-                )
             if layer_id != 0 and layer_id in capture_set:
-                # Qwen3.5 accept_hidden_layer is the hidden state after the
-                # selected layer, including deepstack injection. Layer 0 keeps
-                # the text/embed hidden state before the first layer.
                 aux_hidden_by_layer[layer_id] = hidden_states.clone()
+        if has_deepstack:
+            hidden_states, residual = _add_deepstack_to_residual(
+                hidden_states,
+                residual,
+                deepstack_input_embeds,
+                len(text_model.layers) - 1,
+            )
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = text_model.norm(hidden_states)

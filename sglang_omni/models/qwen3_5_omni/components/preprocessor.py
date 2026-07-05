@@ -80,6 +80,7 @@ _AUDIO_REQUEST_PARAM_INPUT_ALIASES = _AUDIO_REQUEST_INPUT_ALIASES[:-1]
 _PROCESSOR_ITEM_CACHE_KEYS = "_sglang_omni_item_cache_keys"
 _PROCESSOR_PROFILE_REQUEST_ID = "_sglang_omni_profile_request_id"
 _PROCESSOR_TRACE_CACHE_SUMMARY = "_sglang_omni_trace_cache_summary"
+_PROCESSOR_REQUEST_METADATA = "_sglang_omni_request_metadata"
 _PROCESSOR_ITEM_CACHE_MAX_ENTRIES_ENV = (
     "SGLANG_OMNI_PROCESSOR_ITEM_CACHE_MAX_ENTRIES"
 )
@@ -414,9 +415,16 @@ def _processor_cache_clone_on_set_enabled() -> bool:
     return value.lower() not in ("0", "false", "no", "off")
 
 
-def _qwen35_rtc_prompt_style_enabled() -> bool:
+def _qwen35_rtc_prompt_style_enabled(request_metadata: Any | None = None) -> bool:
     value = os.getenv(_QWEN35_RTC_PROMPT_STYLE_ENV, "")
-    return value.lower() not in ("", "0", "false", "no", "off")
+    if value.lower() in ("", "0", "false", "no", "off"):
+        return False
+    if request_metadata is None:
+        return True
+    if not isinstance(request_metadata, dict):
+        return False
+    namespace = request_metadata.get("media_cache_namespace")
+    return isinstance(namespace, str) and namespace.startswith("rtc:")
 
 
 def _cached_video_pixel_fallbacks_enabled() -> bool:
@@ -964,6 +972,7 @@ class _Qwen35ProcessorShim:
             raise ValueError("You need to specify a `text` input to process.")
 
         profile_request_id = kwargs.pop(_PROCESSOR_PROFILE_REQUEST_ID, None)
+        request_metadata = kwargs.pop(_PROCESSOR_REQUEST_METADATA, None)
         profile_metadata = {
             "num_text": len(text) if isinstance(text, list) else int(text is not None),
             "num_images": len(images) if isinstance(images, list) else int(images is not None),
@@ -1015,6 +1024,7 @@ class _Qwen35ProcessorShim:
             _emit_processor_profile_event(
                 profile_request_id, "replace_tokens_start", profile_metadata
             )
+            rtc_prompt_style = _qwen35_rtc_prompt_style_enabled(request_metadata)
             text = self.replace_multimodal_special_tokens(
                 text,
                 iter(audio_lengths),
@@ -1028,6 +1038,7 @@ class _Qwen35ProcessorShim:
                 ),
                 audio_timestamp_interval=output_kwargs["audio_timestamp_interval"],
                 use_audio_in_video=iter(video_inputs.pop("use_audio_in_video", [])),
+                rtc_prompt_style=rtc_prompt_style,
             )
             video_pixel_fallbacks = video_inputs.pop(
                 "video_item_pixel_fallbacks",
@@ -1742,13 +1753,19 @@ class _Qwen35ProcessorShim:
         audio_tokens_per_second,
         audio_timestamp_interval,
         use_audio_in_video,
+        rtc_prompt_style: bool | None = None,
     ):
         merge_length_image = self.image_processor.merge_size**2
         processed_text = []
+        use_rtc_prompt_style = (
+            _qwen35_rtc_prompt_style_enabled()
+            if rtc_prompt_style is None
+            else bool(rtc_prompt_style)
+        )
         for sample in text:
             rtc_metadata = (
                 self._rtc_prompt_style_metadata(sample)
-                if _qwen35_rtc_prompt_style_enabled()
+                if use_rtc_prompt_style
                 else None
             )
             rtc_audio_metadata = iter((rtc_metadata or {}).get("audio", ()))

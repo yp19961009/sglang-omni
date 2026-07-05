@@ -267,6 +267,25 @@ def test_qwen35_preprocessor_uses_remote_processor_fallback():
     assert Qwen35OmniPreprocessor.chat_template_fallback_model_paths == ()
 
 
+def test_rtc_prompt_style_requires_rtc_metadata_when_metadata_is_passed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_QWEN35_RTC_PROMPT_STYLE", "1")
+
+    assert preprocessor._qwen35_rtc_prompt_style_enabled() is True
+    assert preprocessor._qwen35_rtc_prompt_style_enabled({}) is False
+    assert (
+        preprocessor._qwen35_rtc_prompt_style_enabled(
+            {"media_cache_namespace": "direct:abc"}
+        )
+        is False
+    )
+    assert (
+        preprocessor._qwen35_rtc_prompt_style_enabled({"media_cache_namespace": "rtc:abc"})
+        is True
+    )
+
+
 def test_qwen35_preprocessor_accepts_next_audio_feature_alias():
     input_audio_features = torch.ones(1, 4, 8)
     audio_inputs = qwen3_preprocessor._build_audio_mm_inputs_compat(

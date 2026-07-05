@@ -808,6 +808,7 @@ def apply_ar_server_args_cli_overrides(
     thinker_max_mamba_cache_size: int | None = None,
     talker_max_mamba_cache_size: int | None = None,
     mamba_full_memory_ratio: float | None = None,
+    mamba_scheduler_strategy: str | None = None,
     page_size: int | None = None,
 ) -> PipelineConfig:
     prefix_mode = _normalize_stage_toggle_mode("prefix_caching", prefix_caching)
@@ -872,6 +873,14 @@ def apply_ar_server_args_cli_overrides(
     )
     if mamba_full_memory_ratio is not None:
         shared_updates["mamba_full_memory_ratio"] = mamba_full_memory_ratio
+    if mamba_scheduler_strategy is not None:
+        mamba_scheduler_strategy = mamba_scheduler_strategy.strip().lower()
+        if mamba_scheduler_strategy not in {"auto", "no_buffer", "extra_buffer"}:
+            raise typer.BadParameter(
+                "--mamba-scheduler-strategy must be one of: "
+                "auto, no_buffer, extra_buffer"
+            )
+        shared_updates["mamba_scheduler_strategy"] = mamba_scheduler_strategy
     page_size = _validate_positive_int("--page-size", page_size)
     if page_size is not None:
         shared_updates["page_size"] = page_size
@@ -2136,6 +2145,14 @@ def serve(
             help="Set SGLang mamba_full_memory_ratio for supported AR stages.",
         ),
     ] = None,
+    mamba_scheduler_strategy: Annotated[
+        str | None,
+        typer.Option(
+            "--mamba-scheduler-strategy",
+            "--mamba_scheduler_strategy",
+            help="Set SGLang mamba_scheduler_strategy: auto, no_buffer, or extra_buffer.",
+        ),
+    ] = None,
     page_size: Annotated[
         int | None,
         typer.Option(
@@ -3010,6 +3027,7 @@ def serve(
         thinker_max_mamba_cache_size=thinker_max_mamba_cache_size,
         talker_max_mamba_cache_size=talker_max_mamba_cache_size,
         mamba_full_memory_ratio=mamba_full_memory_ratio,
+        mamba_scheduler_strategy=mamba_scheduler_strategy,
         page_size=page_size,
     )
     merged_config = apply_torch_compile_cli_overrides(

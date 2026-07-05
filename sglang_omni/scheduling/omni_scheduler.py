@@ -1985,9 +1985,7 @@ class OmniScheduler:
         return raw in {"1", "true", "yes", "on"}
 
     @staticmethod
-    def _is_omni_rtc_actual_req(req: Any) -> bool:
-        if "rtc:" not in str(getattr(req, "extra_key", "")):
-            return False
+    def _is_actual_decode_req(req: Any) -> bool:
         sampling_params = getattr(req, "sampling_params", None)
         max_new_tokens = getattr(sampling_params, "max_new_tokens", None)
         try:
@@ -1995,15 +1993,31 @@ class OmniScheduler:
         except (TypeError, ValueError):
             return False
 
+    @classmethod
+    def _is_omni_rtc_actual_req(cls, req: Any) -> bool:
+        return "rtc:" in str(getattr(req, "extra_key", "")) and cls._is_actual_decode_req(
+            req
+        )
+
+    @classmethod
+    def _should_disable_omni_mamba_track_for_req(cls, req: Any) -> bool:
+        # Mamba tracking updates the request-local SSM state needed by decode.
+        # Full-chain audio actual requests keep local tracking enabled; the
+        # vendor MambaRadixCache guard prevents writing those actual states back
+        # into the public prefix cache. Keep this path for RTC debugging only.
+        return cls._rtc_disable_actual_mamba_track_enabled() and cls._is_omni_rtc_actual_req(
+            req
+        )
+
     def _disable_omni_rtc_actual_mamba_track(self, batch: Any) -> None:
-        if not self._rtc_disable_actual_mamba_track_enabled():
-            return
         track_mask = getattr(batch, "mamba_track_mask", None)
         if track_mask is None:
             return
         reqs = list(getattr(batch, "reqs", []) or [])
         disabled_indices = [
-            idx for idx, req in enumerate(reqs) if self._is_omni_rtc_actual_req(req)
+            idx
+            for idx, req in enumerate(reqs)
+            if self._should_disable_omni_mamba_track_for_req(req)
         ]
         if not disabled_indices:
             return

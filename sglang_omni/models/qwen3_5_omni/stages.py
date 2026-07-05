@@ -472,11 +472,14 @@ def create_sglang_thinker_executor_from_config(
     if server_args_overrides:
         overrides.update(server_args_overrides)
     mamba_scheduler_strategy = os.getenv(
-        "QWEN35_THINKER_MAMBA_SCHEDULER_STRATEGY",
-        "extra_buffer",
+        "SGLANG_OMNI_MAMBA_SCHEDULER_STRATEGY"
+    ) or os.getenv(
+        "QWEN35_THINKER_MAMBA_SCHEDULER_STRATEGY"
     )
     if mamba_scheduler_strategy:
         overrides["mamba_scheduler_strategy"] = mamba_scheduler_strategy
+    else:
+        overrides.setdefault("mamba_scheduler_strategy", "extra_buffer")
     overrides["tp_size"] = tp_size
     has_explicit_colocated_mem_fraction = (
         total_gpu_memory_fraction is not None

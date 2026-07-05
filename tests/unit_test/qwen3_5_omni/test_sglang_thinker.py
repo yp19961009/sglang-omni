@@ -228,6 +228,90 @@ def test_qwen35_sglang_thinker_applies_deepstack(monkeypatch):
     assert output.tolist() == [[14.0]]
 
 
+def test_qwen35_sglang_thinker_applies_deepstack_to_next_residual(monkeypatch):
+    class FakeForwardMode:
+        def is_idle(self):
+            return False
+
+    class ResidualLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.seen_residuals = []
+
+        def forward(
+            self,
+            *,
+            layer_id,
+            positions,
+            hidden_states,
+            residual,
+            forward_batch,
+        ):
+            del layer_id, positions, forward_batch
+            self.seen_residuals.append(
+                None if residual is None else residual.detach().clone()
+            )
+            next_residual = hidden_states if residual is None else residual
+            return hidden_states + 1, next_residual
+
+    class DeepstackTextModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer0 = ResidualLayer()
+            self.layer1 = ResidualLayer()
+            self.layers = nn.ModuleList([self.layer0, self.layer1])
+
+        def norm(self, hidden, residual=None):
+            if residual is None:
+                return hidden
+            return hidden + residual, None
+
+        def forward(self, input_ids, positions, forward_batch, inputs_embeds=None):
+            del input_ids, positions, forward_batch
+            return inputs_embeds
+
+        def embed_tokens(self, input_ids):
+            return input_ids.to(dtype=torch.float32).unsqueeze(-1)
+
+    class DeepstackLanguageModel(nn.Module):
+        instance = None
+
+        def __init__(self, config, quant_config=None, prefix=""):
+            super().__init__()
+            del config, quant_config, prefix
+            self.model = DeepstackTextModel()
+            self.lm_head = object()
+            DeepstackLanguageModel.instance = self
+
+        def logits_processor(self, input_ids, hidden_states, lm_head, forward_batch):
+            del input_ids, lm_head, forward_batch
+            return hidden_states
+
+    monkeypatch.setattr(
+        sglang_thinker,
+        "Qwen3NextForCausalLM",
+        DeepstackLanguageModel,
+    )
+    model = sglang_thinker.Qwen3OmniNextThinkerForConditionalGeneration(
+        _RootConfig()
+    )
+
+    output = model(
+        input_ids=torch.tensor([3]),
+        positions=torch.tensor([0]),
+        forward_batch=SimpleNamespace(
+            mrope_positions=None,
+            forward_mode=FakeForwardMode(),
+        ),
+        input_deepstack_embeds={"deepstack_input_embeds_0": torch.tensor([[10.0]])},
+    )
+
+    text_model = DeepstackLanguageModel.instance.model
+    assert text_model.layer0.seen_residuals == [None]
+    assert text_model.layer1.seen_residuals[0].tolist() == [[13.0]]
+    assert output.tolist() == [[18.0]]
+
+
 def test_qwen35_sglang_thinker_load_weights_strips_omni_prefixes(monkeypatch):
     _install_fake_language_model(monkeypatch)
     model = sglang_thinker.Qwen3OmniNextThinkerForConditionalGeneration(
@@ -306,7 +390,7 @@ def test_qwen35_hidden_capture_forward_returns_aux_states():
     assert [tensor.tolist() for tensor in aux] == [[[3.0]], [[6.0]]]
 
 
-def test_qwen35_hidden_capture_records_layer_output_after_deepstack():
+def test_qwen35_hidden_capture_applies_final_deepstack_after_capture():
     class FakeForwardMode:
         def is_idle(self):
             return False
@@ -349,7 +433,7 @@ def test_qwen35_hidden_capture_records_layer_output_after_deepstack():
     )
 
     assert hidden.tolist() == [[15.0]]
-    assert [tensor.tolist() for tensor in aux] == [[[3.0]], [[15.0]]]
+    assert [tensor.tolist() for tensor in aux] == [[[3.0]], [[5.0]]]
 
 
 def test_qwen35_hidden_capture_delegates_native_capture_without_deepstack():
@@ -391,3 +475,16 @@ def test_qwen35_hidden_capture_delegates_native_capture_without_deepstack():
     assert text_model.native_called
     assert hidden.tolist() == [[12.0]]
     assert [tensor.tolist() for tensor in aux] == [[[2.0]], [[3.0]]]
+
+
+def test_qwen35_deepstack_tensor_for_layer_rejects_negative_index():
+    layers = [torch.tensor([1.0]), torch.tensor([2.0])]
+    stacked = torch.stack([torch.ones(1, 2), torch.full((1, 2), 2.0)])
+
+    assert sglang_thinker._deepstack_tensor_for_layer(layers, -1) is None
+    assert sglang_thinker._deepstack_tensor_for_layer(stacked, -1) is None
+    assert sglang_thinker._deepstack_tensor_for_layer(layers, 0) is layers[0]
+    assert torch.equal(
+        sglang_thinker._deepstack_tensor_for_layer(stacked, 1),
+        stacked[1],
+    )

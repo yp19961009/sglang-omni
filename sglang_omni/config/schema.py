@@ -71,6 +71,7 @@ class SGLangServerArgsConfig(BaseModel):
     max_running_requests: int | None = None
     max_mamba_cache_size: int | None = None
     mamba_full_memory_ratio: float | None = None
+    mamba_scheduler_strategy: Literal["auto", "no_buffer", "extra_buffer"] | None = None
 
     def model_post_init(self, __context: Any = None) -> None:
         mem_fraction_static = self.mem_fraction_static

@@ -1594,6 +1594,12 @@ class Qwen3OmniPreprocessor:
                 processor_kwargs["_sglang_omni_profile_request_id"] = (
                     payload.request_id
                 )
+                # Qwen3.5 RTC prompt styling is a realtime-only format. Pass
+                # request metadata explicitly so ordinary full-chain requests do
+                # not inherit the RTC style from the server-wide environment.
+                processor_kwargs["_sglang_omni_request_metadata"] = (
+                    request_metadata if isinstance(request_metadata, dict) else {}
+                )
                 processor_kwargs.setdefault("videos_kwargs", {})[
                     _TRACE_CACHE_SUMMARY_PROCESSOR_KEY
                 ] = trace_cache_summary

@@ -7,9 +7,14 @@ import logging
 import os
 from typing import Any
 
+from sglang_omni.vendor.sglang.moe import apply_moe_sum_reduce_fx_guard_patch
+
 QWEN3_5_OMNI_THINKER_ARCH_OVERRIDE = "Qwen3OmniNextThinkerForConditionalGeneration"
 QWEN3_5_OMNI_TALKER_ARCH_OVERRIDE = "Qwen3OmniNextTalkerModel"
 QWEN3_5_OMNI_DEFAULT_CAPTURE_HIDDEN_LAYERS = [0, 24]
+_ALLOW_THINKER_CUDA_GRAPH_WITH_HIDDEN_ENV = (
+    "SGLANG_OMNI_QWEN35_ALLOW_THINKER_CUDA_GRAPH_WITH_HIDDEN"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +24,12 @@ def _env_flag(name: str, *, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _allow_thinker_cuda_graph_with_hidden_capture() -> bool:
+    return _env_flag(
+        _ALLOW_THINKER_CUDA_GRAPH_WITH_HIDDEN_ENV, default=False
+    )
 
 
 def _subtalker_compile_warmup_batches(server_args: Any) -> list[int]:
@@ -269,6 +280,7 @@ def create_thinker_scheduler(
     from sglang_omni.scheduling.omni_scheduler import OmniScheduler
     from sglang_omni.scheduling.sglang_backend import SGLangOutputProcessor
 
+    apply_moe_sum_reduce_fx_guard_patch()
     if speech_enabled:
         if capture_hidden_layers is None:
             capture_hidden_layers = _resolve_capture_hidden_layers_from_config(
@@ -281,9 +293,19 @@ def create_thinker_scheduler(
         capture_hidden_layers = None
     capture_hidden = speech_enabled
     want_cuda_graph = not bool(getattr(server_args, "disable_cuda_graph", False))
-    defer_cuda_graph_capture = want_cuda_graph and capture_hidden
-    if defer_cuda_graph_capture:
-        server_args.enable_return_hidden_states = True
+    hidden_graph_requested = want_cuda_graph and capture_hidden
+    allow_hidden_graph = _allow_thinker_cuda_graph_with_hidden_capture()
+    defer_cuda_graph_capture = hidden_graph_requested and allow_hidden_graph
+    if hidden_graph_requested:
+        if allow_hidden_graph:
+            server_args.enable_return_hidden_states = True
+        else:
+            logger.warning(
+                "Qwen3.5 thinker CUDA graph disabled while hidden-state "
+                "capture is enabled for full-chain audio; set %s=1 to "
+                "force the old CUDA graph path.",
+                _ALLOW_THINKER_CUDA_GRAPH_WITH_HIDDEN_ENV,
+            )
         server_args.disable_cuda_graph = True
 
     (
