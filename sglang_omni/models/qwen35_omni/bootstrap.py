@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Qwen3.5-Omni-specific scheduler construction."""
+
+from __future__ import annotations
+
+from typing import Any
+
+# Register qwen3_omni_next AutoConfig before SGLang ModelConfig loads config.json.
+import sglang_omni.models.qwen35_omni.hf_config  # noqa: F401
+
+
+def create_thinker_scheduler(
+    server_args: Any,
+    gpu_id: int = 0,
+    *,
+    tp_rank: int = 0,
+    nccl_port: int | None = None,
+    total_gpu_memory_fraction: float | None = None,
+):
+    from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+    from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
+    from sglang_omni.models.qwen35_omni.request_builders import (
+        make_thinker_scheduler_adapters,
+        make_thinker_stream_output_builder,
+    )
+    from sglang_omni.scheduling.bootstrap import create_sglang_infrastructure
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+    from sglang_omni.scheduling.sglang_backend import SGLangOutputProcessor
+
+    (
+        model_worker,
+        tree_cache,
+        req_to_token_pool,
+        token_to_kv_pool_allocator,
+        prefill_mgr,
+        decode_mgr,
+        model_config,
+    ) = create_sglang_infrastructure(
+        server_args,
+        gpu_id,
+        tp_rank=tp_rank,
+        nccl_port=nccl_port,
+        model_arch_override="Qwen35OmniNextThinkerForCausalLM",
+        total_gpu_memory_fraction=total_gpu_memory_fraction,
+    )
+
+    output_proc = SGLangOutputProcessor(
+        capture_hidden=False,
+        capture_hidden_layers=None,
+        model=model_worker.model_runner.model,
+    )
+    model_runner = ThinkerModelRunner(model_worker, output_proc)
+
+    tokenizer = get_tokenizer(model_config.model_path, trust_remote_code=True)
+    thinker_config = model_config.hf_config.thinker_config
+    request_builder, result_adapter = make_thinker_scheduler_adapters(
+        tokenizer=tokenizer,
+        vocab_size=model_config.vocab_size,
+        thinker_config=thinker_config,
+    )
+    stream_output_builder = make_thinker_stream_output_builder()
+
+    return OmniScheduler(
+        tp_worker=model_worker,
+        tree_cache=tree_cache,
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        server_args=server_args,
+        model_config=model_config,
+        prefill_manager=prefill_mgr,
+        decode_manager=decode_mgr,
+        model_runner=model_runner,
+        request_builder=request_builder,
+        result_adapter=result_adapter,
+        stream_output_builder=stream_output_builder,
+    )

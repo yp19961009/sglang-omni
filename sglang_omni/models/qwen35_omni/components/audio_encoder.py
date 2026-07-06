@@ -1,0 +1,266 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Audio encoder component for Qwen3.5-Omni Next."""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Iterable
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from sglang_omni.models.qwen35_omni.components.common import load_thinker_config
+from sglang_omni.models.qwen35_omni.components.preprocessor import (
+    get_feat_extract_output_lengths,
+)
+from sglang_omni.models.weight_loader import load_module, resolve_dtype
+
+AUDIO_TOWER_PREFIX = ("thinker.audio_tower.", "audio_tower.")
+
+
+class SinusoidsPositionEmbedding(nn.Module):
+    def __init__(self, length: int, channels: int, max_timescale: int = 10000) -> None:
+        super().__init__()
+        if channels % 2 != 0:
+            raise ValueError("SinusoidsPositionEmbedding requires even channels")
+        log_timescale_increment = math.log(max_timescale) / (channels // 2 - 1)
+        inv_timescales = torch.exp(
+            -log_timescale_increment * torch.arange(channels // 2).float()
+        )
+        scaled_time = torch.arange(length)[:, None] * inv_timescales[None, :]
+        positional_embedding = torch.cat(
+            [torch.sin(scaled_time), torch.cos(scaled_time)], dim=1
+        )
+        self.register_buffer("positional_embedding", positional_embedding, persistent=False)
+
+    def forward(self, seqlen: int) -> torch.Tensor:
+        return self.positional_embedding[:seqlen, :]
+
+
+class Qwen35OmniNextAudioAttention(nn.Module):
+    def __init__(self, config: object) -> None:
+        super().__init__()
+        self.embed_dim = int(config.d_model)
+        self.num_heads = int(config.encoder_attention_heads)
+        self.head_dim = self.embed_dim // self.num_heads
+        if self.head_dim * self.num_heads != self.embed_dim:
+            raise ValueError("d_model must be divisible by encoder_attention_heads")
+        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+
+    def _project(self, linear: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+        seq_len = x.shape[0]
+        return (
+            linear(x)
+            .view(seq_len, self.num_heads, self.head_dim)
+            .transpose(0, 1)
+            .unsqueeze(0)
+        )
+
+    def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        outputs = []
+        for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
+            if end <= start:
+                continue
+            x = hidden_states[start:end]
+            q = self._project(self.q_proj, x)
+            k = self._project(self.k_proj, x)
+            v = self._project(self.v_proj, x)
+            attn = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+            attn = attn.squeeze(0).transpose(0, 1).reshape(x.shape[0], self.embed_dim)
+            outputs.append(self.out_proj(attn))
+        if not outputs:
+            return hidden_states.new_empty((0, self.embed_dim))
+        return torch.cat(outputs, dim=0)
+
+
+class Qwen35OmniNextAudioEncoderLayer(nn.Module):
+    def __init__(self, config: object) -> None:
+        super().__init__()
+        self.embed_dim = int(config.d_model)
+        self.self_attn = Qwen35OmniNextAudioAttention(config)
+        self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
+        self.fc1 = nn.Linear(self.embed_dim, int(config.encoder_ffn_dim), bias=True)
+        self.fc2 = nn.Linear(int(config.encoder_ffn_dim), self.embed_dim, bias=True)
+        self.final_layer_norm = nn.LayerNorm(self.embed_dim)
+        self.activation_fn = F.gelu
+
+    def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.self_attn_layer_norm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, cu_seqlens)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.final_layer_norm(hidden_states)
+        hidden_states = self.fc2(self.activation_fn(self.fc1(hidden_states)))
+        hidden_states = residual + hidden_states
+        if hidden_states.dtype == torch.float16:
+            clamp = torch.finfo(hidden_states.dtype).max - 1000
+            hidden_states = torch.clamp(hidden_states, min=-clamp, max=clamp)
+        return hidden_states
+
+
+class Qwen35OmniNextAudioEncoderModel(nn.Module):
+    def __init__(self, config: object) -> None:
+        super().__init__()
+        self.num_mel_bins = int(config.num_mel_bins)
+        self.max_source_positions = int(config.max_source_positions)
+        self.n_window = int(config.n_window)
+        self.n_window_infer = int(config.n_window_infer)
+        self.conv_chunksize = int(config.conv_chunksize)
+        self.positional_embedding = SinusoidsPositionEmbedding(
+            self.max_source_positions, int(config.d_model)
+        )
+        hidden = int(config.downsample_hidden_size)
+        self.conv2d1 = nn.Conv2d(1, hidden, 3, 2, padding=1)
+        self.conv2d2 = nn.Conv2d(hidden, hidden, 3, 2, padding=1)
+        self.conv2d3 = nn.Conv2d(hidden, hidden, 3, 2, padding=1)
+        self.conv2d4 = nn.Conv2d(hidden, hidden, 3, 2, padding=1)
+        conv_freq = (((((self.num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2 + 1) // 2)
+        self.conv_out = nn.Linear(hidden * conv_freq, int(config.d_model), bias=False)
+        self.layers = nn.ModuleList(
+            [Qwen35OmniNextAudioEncoderLayer(config) for _ in range(int(config.encoder_layers))]
+        )
+        self.ln_post = nn.LayerNorm(int(config.d_model))
+        self.proj1 = nn.Linear(int(config.d_model), int(config.d_model), bias=True)
+        self.proj2 = nn.Linear(int(config.d_model), int(config.output_dim), bias=True)
+        self.act = F.gelu
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.conv2d1.weight.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.conv2d1.weight.device
+
+    def _get_cnn_output_lengths(self, input_lengths: torch.Tensor) -> torch.Tensor:
+        lengths = input_lengths
+        for _ in range(4):
+            lengths = (lengths - 1) // 2 + 1
+        return lengths
+
+    def forward(
+        self,
+        input_features: torch.Tensor,
+        feature_lens: torch.Tensor,
+        aftercnn_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
+        chunk_lengths = torch.tensor(
+            [self.n_window * 2] * int(chunk_num.sum().item()),
+            dtype=torch.long,
+            device=feature_lens.device,
+        )
+        tail_chunk_index = F.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
+        chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
+        chunk_lengths[chunk_lengths == 0] = self.n_window * 2
+
+        chunk_list = input_features.T.split(chunk_lengths.tolist(), dim=0)
+        padded_feature = nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
+        feature_lens_after_cnn = self._get_cnn_output_lengths(chunk_lengths)
+        max_len_after_cnn = int(feature_lens_after_cnn.max().item())
+        indices = torch.arange(max_len_after_cnn, device=padded_feature.device)
+        padded_mask_after_cnn = indices.unsqueeze(0) < feature_lens_after_cnn.unsqueeze(1)
+
+        padded_feature = padded_feature.unsqueeze(1)
+        if padded_feature.size(0) <= self.conv_chunksize:
+            padded_embed = F.gelu(self.conv2d1(padded_feature))
+            padded_embed = F.gelu(self.conv2d2(padded_embed))
+            padded_embed = F.gelu(self.conv2d3(padded_embed))
+            padded_embed = F.gelu(self.conv2d4(padded_embed))
+        else:
+            chunks = []
+            for chunk in padded_feature.split(self.conv_chunksize, dim=0):
+                chunk = F.gelu(self.conv2d1(chunk))
+                chunk = F.gelu(self.conv2d2(chunk))
+                chunk = F.gelu(self.conv2d3(chunk))
+                chunk = F.gelu(self.conv2d4(chunk))
+                chunks.append(chunk)
+            padded_embed = torch.cat(chunks, dim=0)
+
+        bsz, channels, freq, steps = padded_embed.size()
+        padded_embed = padded_embed.permute(0, 3, 1, 2).contiguous().view(
+            bsz, steps, channels * freq
+        )
+        padded_embed = self.conv_out(padded_embed)
+        pos = self.positional_embedding.positional_embedding[: padded_embed.shape[1], :]
+        padded_embed = padded_embed + pos.unsqueeze(0).to(padded_embed.dtype)
+        hidden_states = padded_embed[padded_mask_after_cnn]
+
+        cu_chunk_lens = [0]
+        window_aftercnn = padded_mask_after_cnn.shape[-1] * (
+            self.n_window_infer // (self.n_window * 2)
+        )
+        for cnn_len in aftercnn_lens.tolist():
+            num_full_chunks = int(cnn_len) // int(window_aftercnn)
+            remainder = int(cnn_len) % int(window_aftercnn)
+            cu_chunk_lens.extend([int(window_aftercnn)] * num_full_chunks)
+            if remainder:
+                cu_chunk_lens.append(remainder)
+        cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(
+            -1, dtype=torch.int32
+        )
+
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, cu_seqlens)
+        hidden_states = self.ln_post(hidden_states)
+        hidden_states = self.proj2(self.act(self.proj1(hidden_states)))
+        return hidden_states
+
+
+class Qwen35OmniAudioEncoder(nn.Module):
+    """Audio tower extracted from Qwen3.5-Omni."""
+
+    def __init__(
+        self,
+        model_path: str,
+        *,
+        device: str = "cuda",
+        dtype: str | torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        torch_dtype = resolve_dtype(dtype)
+        thinker_cfg = load_thinker_config(model_path)
+        self._device = torch.device(device)
+        self.audio_tower = load_module(
+            Qwen35OmniNextAudioEncoderModel(thinker_cfg.audio_config),
+            model_path,
+            prefix=AUDIO_TOWER_PREFIX,
+            dtype=torch_dtype,
+            device=device,
+            strict=True,
+        )
+
+    def forward(
+        self,
+        *,
+        input_features: torch.Tensor,
+        feature_attention_mask: torch.Tensor | None = None,
+        audio_feature_lengths: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if feature_attention_mask is not None:
+            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+            input_features = (
+                input_features.permute(0, 2, 1)[feature_attention_mask.bool()]
+                .permute(1, 0)
+                .contiguous()
+            )
+        if audio_feature_lengths is None:
+            raise ValueError("audio_feature_lengths or feature_attention_mask is required")
+        audio_feature_lengths = audio_feature_lengths.to(self._device, dtype=torch.long)
+        audio_output_lengths = get_feat_extract_output_lengths(audio_feature_lengths)
+        audio_embeds = self.audio_tower(
+            input_features.to(device=self._device, dtype=self.audio_tower.dtype),
+            feature_lens=audio_feature_lengths,
+            aftercnn_lens=audio_output_lengths,
+        )
+        return {
+            "audio_embeds": audio_embeds,
+            "audio_feature_lengths": audio_feature_lengths,
+            "audio_output_lengths": audio_output_lengths,
+        }

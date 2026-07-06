@@ -26,6 +26,7 @@ _ARCH_CONFIG_MAP: dict[str, tuple[str, str | None]] = {
     "BailingMoeV2ForCausalLM": ("llm_config", None),
     "Qwen3OmniTalker": ("talker_config", "text_config"),
     "Qwen3OmniThinkerForCausalLM": ("thinker_config", "text_config"),
+    "Qwen35OmniNextThinkerForCausalLM": ("thinker_config", "text_config"),
     "Qwen3ASRForConditionalGeneration": ("thinker_config", "text_config"),
     "Qwen3TTSTalker": ("talker_config", None),
     "MossTTSDelaySGLangModel": ("language_config", None),
@@ -101,6 +102,22 @@ class ModelWorker:
             model_config.vocab_size = int(cfg.vocab_size)
             model_config.head_dim = int(cfg.d_model) // int(cfg.decoder_attention_heads)
             model_config.v_head_dim = model_config.head_dim
+            return
+        if arch == "Qwen35OmniNextThinkerForCausalLM":
+            root_cfg = model_config.hf_config
+            thinker_cfg = getattr(root_cfg, "thinker_config", None)
+            text_cfg = getattr(thinker_cfg, "text_config", None)
+            if thinker_cfg is None or text_cfg is None:
+                return
+            text_cfg.thinker_config = thinker_cfg
+            text_cfg.architectures = [arch]
+            model_config.hf_config = text_cfg
+            model_config.hf_text_config = text_cfg
+            model_config.num_attention_heads = text_cfg.num_attention_heads
+            model_config.num_key_value_heads = text_cfg.num_key_value_heads
+            model_config.hidden_size = text_cfg.hidden_size
+            model_config.num_hidden_layers = text_cfg.num_hidden_layers
+            model_config.vocab_size = text_cfg.vocab_size
             return
         entry = _ARCH_CONFIG_MAP.get(arch)
         if entry is None:
@@ -407,6 +424,7 @@ def _apply_model_worker_backend_policy(
     is_qwen3_omni_arch = model_arch_override in (
         "Qwen3OmniTalker",
         "Qwen3OmniThinkerForCausalLM",
+        "Qwen35OmniNextThinkerForCausalLM",
     )
     if is_qwen3_omni_arch and server_args.ep_size != 1:
         raise ValueError(

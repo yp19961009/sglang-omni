@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -300,6 +301,54 @@ def _extract_audio_from_path(video_path: Path, target_sr: int) -> Any | None:
         return None
 
 
+def _unpack_qwen_video_reader_result(result: Any) -> tuple[torch.Tensor, float]:
+    """Normalize qwen-vl-utils video reader returns across package versions."""
+
+    if not isinstance(result, (tuple, list)):
+        raise TypeError(f"Unexpected video reader return type: {type(result).__name__}")
+    if len(result) == 2:
+        video, sample_fps = result
+    elif len(result) == 3:
+        video, _metadata, sample_fps = result
+    else:
+        raise ValueError(
+            f"Unexpected video reader return arity: {len(result)}; expected 2 or 3"
+        )
+    return video, float(sample_fps)
+
+
+def _qwen_video_pixel_limits() -> tuple[int, int, int, int]:
+    """Return video resize constants for old and new qwen-vl-utils versions."""
+
+    image_factor = getattr(qwen_vision, "IMAGE_FACTOR", None)
+    if image_factor is None:
+        image_factor = 14 * getattr(qwen_vision, "SPATIAL_MERGE_SIZE", 2)
+    min_pixels = getattr(
+        qwen_vision,
+        "VIDEO_MIN_PIXELS",
+        getattr(qwen_vision, "VIDEO_MIN_TOKEN_NUM", 128) * image_factor * image_factor,
+    )
+    max_pixels = getattr(
+        qwen_vision,
+        "VIDEO_MAX_PIXELS",
+        getattr(qwen_vision, "VIDEO_MAX_TOKEN_NUM", 768) * image_factor * image_factor,
+    )
+    total_pixels = getattr(qwen_vision, "VIDEO_TOTAL_PIXELS", None)
+    if total_pixels is None:
+        total_pixels = int(
+            float(
+                os.environ.get(
+                    "VIDEO_MAX_PIXELS",
+                    getattr(qwen_vision, "MODEL_SEQ_LEN", 128000)
+                    * image_factor
+                    * image_factor
+                    * 0.9,
+                )
+            )
+        )
+    return int(image_factor), int(min_pixels), int(max_pixels), int(total_pixels)
+
+
 def load_video_path(
     path: str | Path,
     fps: float | None = None,
@@ -323,7 +372,9 @@ def load_video_path(
         ele["total_pixels"] = int(total_pixels)
     backend = qwen_vision.get_video_reader_backend()
     try:
-        video, sample_fps = qwen_vision.VIDEO_READER_BACKENDS[backend](ele)
+        video, sample_fps = _unpack_qwen_video_reader_result(
+            qwen_vision.VIDEO_READER_BACKENDS[backend](ele)
+        )
     except Exception as backend_exc:
         if backend == "torchvision":
             raise VideoDecodeError(
@@ -332,7 +383,9 @@ def load_video_path(
             ) from backend_exc
         logger.warning("Video reader %s failed, falling back to torchvision", backend)
         try:
-            video, sample_fps = qwen_vision.VIDEO_READER_BACKENDS["torchvision"](ele)
+            video, sample_fps = _unpack_qwen_video_reader_result(
+                qwen_vision.VIDEO_READER_BACKENDS["torchvision"](ele)
+            )
         except Exception as fallback_exc:
             raise VideoDecodeError(
                 f"Failed to decode video path={path}; {backend} failed with "
@@ -341,12 +394,16 @@ def load_video_path(
                 f"{fallback_exc}"
             ) from fallback_exc
     nframes, _, height, width = video.shape
-    min_pixels = ele.get("min_pixels", qwen_vision.VIDEO_MIN_PIXELS)
-    total_pixels = ele.get("total_pixels", qwen_vision.VIDEO_TOTAL_PIXELS)
+    image_factor, default_min_pixels, default_max_pixels, default_total_pixels = (
+        _qwen_video_pixel_limits()
+    )
+    frame_factor = getattr(qwen_vision, "FRAME_FACTOR", 2)
+    min_pixels = ele.get("min_pixels", default_min_pixels)
+    total_pixels = ele.get("total_pixels", default_total_pixels)
     max_pixels = max(
         min(
-            qwen_vision.VIDEO_MAX_PIXELS,
-            total_pixels / nframes * qwen_vision.FRAME_FACTOR,
+            default_max_pixels,
+            total_pixels / nframes * frame_factor,
         ),
         int(min_pixels * 1.05),
     )
@@ -356,13 +413,13 @@ def load_video_path(
         resized_height, resized_width = qwen_vision.smart_resize(
             ele["resized_height"],
             ele["resized_width"],
-            factor=qwen_vision.IMAGE_FACTOR,
+            factor=image_factor,
         )
     else:
         resized_height, resized_width = qwen_vision.smart_resize(
             height,
             width,
-            factor=qwen_vision.IMAGE_FACTOR,
+            factor=image_factor,
             min_pixels=min_pixels,
             max_pixels=max_pixels,
         )
