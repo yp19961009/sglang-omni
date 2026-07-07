@@ -4,6 +4,7 @@ from pathlib import Path
 
 from benchmarks.eval.qwen35_omni_single_s2t import (
     VideoAMMESample,
+    _client_profile_paths,
     _sglang_server_command,
     _vllm_server_command,
     build_alignment_report,
@@ -118,6 +119,44 @@ def test_client_stdout_payload_optionally_includes_raw_responses():
     }
 
 
+def test_client_stdout_payload_optionally_includes_profile():
+    result = {
+        "summary": {"total_cases": 1},
+        "records": [],
+        "profile": {
+            "run_id": "run-1",
+            "event_dir": "/tmp/results_events",
+            "report_path": "/tmp/results_profile.json",
+            "request_count": 1,
+            "stage_breakdown": [{"stage": "thinker", "total_ms": 123.4}],
+            "hop_breakdown": [],
+        },
+    }
+
+    assert client_stdout_payload(
+        result, print_raw_response=False, print_profile=False
+    ) == {"total_cases": 1}
+    assert client_stdout_payload(
+        result, print_raw_response=False, print_profile=True
+    ) == {
+        "total_cases": 1,
+        "profile": result["profile"],
+    }
+
+
+def test_client_profile_paths_default_next_to_output():
+    args = Namespace(
+        output="/myapp/benchmarks/qwen35_s2t_align/manual-single/results.json",
+        profile_event_dir=None,
+        profile_output=None,
+    )
+
+    assert _client_profile_paths(args, run_id="run-1") == (
+        "/myapp/benchmarks/qwen35_s2t_align/manual-single/results_events/run-1",
+        "/myapp/benchmarks/qwen35_s2t_align/manual-single/results_profile.json",
+    )
+
+
 def test_client_parser_prints_raw_response_by_default():
     parser = build_parser()
 
@@ -147,6 +186,8 @@ def test_client_parser_prints_raw_response_by_default():
 
     assert default_args.print_raw_response is True
     assert disabled_args.print_raw_response is False
+    assert default_args.profile is True
+    assert default_args.print_profile is True
 
 
 def test_sglang_baseline_command_disables_radix_cache():

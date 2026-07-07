@@ -25,6 +25,10 @@ from pathlib import Path
 from typing import Any
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 LOGGER = logging.getLogger("qwen35_omni_single_s2t")
 
 DEFAULT_MODEL_PATH = (
@@ -90,6 +94,99 @@ def _host_path(path: str) -> str:
 def _write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _client_profile_run_id(args: argparse.Namespace) -> str:
+    return args.profile_run_id or time.strftime("qwen35-client-%Y%m%d-%H%M%S")
+
+
+def _client_profile_paths(args: argparse.Namespace, *, run_id: str) -> tuple[str, str]:
+    output_path = Path(args.output)
+    stem_path = output_path.with_suffix("")
+    event_dir = args.profile_event_dir or str(
+        stem_path.parent / f"{stem_path.name}_events" / run_id
+    )
+    report_path = args.profile_output or f"{stem_path}_profile.json"
+    return str(event_dir), str(report_path)
+
+
+def _start_client_profile(
+    session: Any,
+    args: argparse.Namespace,
+    *,
+    run_id: str,
+    event_dir: str,
+) -> str | None:
+    url = f"{args.base_url.rstrip('/')}/start_request_profile"
+    response = session.post(
+        url,
+        json={"run_id": run_id, "event_dir": event_dir},
+        timeout=args.profile_timeout_s,
+    )
+    response.raise_for_status()
+    body = response.json()
+    return str(body.get("run_id") or run_id)
+
+
+def _stop_client_profile(
+    session: Any,
+    args: argparse.Namespace,
+    *,
+    run_id: str,
+) -> None:
+    url = f"{args.base_url.rstrip('/')}/stop_request_profile"
+    response = session.post(
+        url,
+        json={"run_id": run_id},
+        timeout=args.profile_timeout_s,
+    )
+    response.raise_for_status()
+
+
+def _render_client_profile(event_dir: str, report_path: str) -> dict[str, Any]:
+    from sglang_omni.profiler.views import build_report
+
+    report = build_report(event_dir)
+    _write_json(Path(report_path), report)
+    return report
+
+
+def _log_client_profile(
+    *,
+    engine: str,
+    event_dir: str,
+    report_path: str,
+    report: dict[str, Any],
+) -> None:
+    from sglang_omni.profiler.views import format_table
+
+    LOGGER.info(
+        "[%s] stage_profile request_count=%s event_dir=%s report=%s",
+        engine,
+        report.get("request_count"),
+        event_dir,
+        report_path,
+    )
+    stage_rows = report.get("stage_breakdown", [])
+    if stage_rows:
+        LOGGER.info(
+            "[%s] stage_profile:\n%s",
+            engine,
+            format_table(
+                stage_rows,
+                ["stage", "interval", "count", "total_ms", "avg_ms", "p95_ms"],
+            ).rstrip(),
+        )
+    hop_rows = report.get("hop_breakdown", [])
+    if hop_rows:
+        LOGGER.info(
+            "[%s] hop_profile:\n%s",
+            engine,
+            format_table(
+                hop_rows,
+                ["src", "dst", "kind", "count", "total_ms", "avg_ms", "p95_ms"],
+            ).rstrip(),
+        )
 
 
 def _find_snapshot(root: Path, repo_dir: str) -> Path:
@@ -299,74 +396,123 @@ def run_client(args: argparse.Namespace) -> dict[str, Any]:
 
     records: list[dict[str, Any]] = []
     session = requests.Session()
-    for idx, case in enumerate(cases, 1):
-        payload = payload_builder(args, case.sample)
-        start = time.perf_counter()
-        error = ""
-        body: dict[str, Any] = {}
-        text = ""
-        usage: dict[str, Any] = {}
+    profile_info: dict[str, str] | None = None
+    profile_report: dict[str, Any] | None = None
+    if args.profile and args.engine == "sglang":
+        profile_run_id = _client_profile_run_id(args)
+        event_dir, report_path = _client_profile_paths(args, run_id=profile_run_id)
         try:
-            response = session.post(url, json=payload, timeout=args.timeout_s)
-            latency_s = time.perf_counter() - start
-            response.raise_for_status()
-            body = response.json()
-            message = body.get("choices", [{}])[0].get("message", {})
-            text = message.get("content") or ""
-            usage = body.get("usage") or {}
-        except Exception as exc:  # noqa: BLE001 - persisted as benchmark output.
-            latency_s = time.perf_counter() - start
-            error = str(exc)
-
-        predicted, fallback = parse_prediction(text, case.sample.options)
-        is_success = error == ""
-        is_correct = is_success and predicted == case.sample.expected
-        record = {
-            "case_id": case.case_id,
-            "probe_kind": case.probe_kind,
-            "sample_id": case.sample.sample_id,
-            "video_id": case.sample.video_id,
-            "question_id": case.sample.question_id,
-            "duration": case.sample.duration,
-            "domain": case.sample.domain,
-            "sub_category": case.sample.sub_category,
-            "task_type": case.sample.task_type,
-            "video_path": case.sample.video_path,
-            "audio_path": case.sample.audio_path,
-            "expected": case.sample.expected,
-            "predicted": predicted,
-            "is_correct": is_correct,
-            "is_success": is_success,
-            "is_mc_fallback": fallback,
-            "has_timestamp_loop": bool(TIMESTAMP_LOOP_RE.search(text)),
-            "latency_s": round(latency_s, 4),
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-            "raw_response": text,
-            "error": error,
-        }
-        records.append(record)
-        LOGGER.info(
-            "[%s] %d/%d %s expected=%s predicted=%s correct=%s latency=%.3fs error=%s",
-            args.engine,
-            idx,
-            len(cases),
-            case.case_id,
-            case.sample.expected,
-            predicted or "-",
-            is_correct,
-            latency_s,
-            error or "-",
-        )
-        if args.print_raw_response:
-            LOGGER.info(
-                "[%s] %s raw_response:\n%s",
-                args.engine,
-                case.case_id,
-                text or "",
+            run_id = _start_client_profile(
+                session,
+                args,
+                run_id=profile_run_id,
+                event_dir=event_dir,
             )
-        if args.sleep_s > 0:
-            time.sleep(args.sleep_s)
+            if run_id is not None:
+                profile_info = {
+                    "run_id": run_id,
+                    "event_dir": event_dir,
+                    "report_path": report_path,
+                }
+                LOGGER.info(
+                    "[%s] request profiler started run_id=%s event_dir=%s",
+                    args.engine,
+                    run_id,
+                    event_dir,
+                )
+        except Exception as exc:  # noqa: BLE001 - profiler should not block eval.
+            LOGGER.warning("[%s] request profiler start failed: %s", args.engine, exc)
+    elif args.profile:
+        LOGGER.info("[%s] request profiler is only available for SGLang", args.engine)
+
+    try:
+        for idx, case in enumerate(cases, 1):
+            payload = payload_builder(args, case.sample)
+            start = time.perf_counter()
+            error = ""
+            body: dict[str, Any] = {}
+            text = ""
+            usage: dict[str, Any] = {}
+            try:
+                response = session.post(url, json=payload, timeout=args.timeout_s)
+                latency_s = time.perf_counter() - start
+                response.raise_for_status()
+                body = response.json()
+                message = body.get("choices", [{}])[0].get("message", {})
+                text = message.get("content") or ""
+                usage = body.get("usage") or {}
+            except Exception as exc:  # noqa: BLE001 - persisted as benchmark output.
+                latency_s = time.perf_counter() - start
+                error = str(exc)
+
+            predicted, fallback = parse_prediction(text, case.sample.options)
+            is_success = error == ""
+            is_correct = is_success and predicted == case.sample.expected
+            record = {
+                "case_id": case.case_id,
+                "probe_kind": case.probe_kind,
+                "sample_id": case.sample.sample_id,
+                "video_id": case.sample.video_id,
+                "question_id": case.sample.question_id,
+                "duration": case.sample.duration,
+                "domain": case.sample.domain,
+                "sub_category": case.sample.sub_category,
+                "task_type": case.sample.task_type,
+                "video_path": case.sample.video_path,
+                "audio_path": case.sample.audio_path,
+                "expected": case.sample.expected,
+                "predicted": predicted,
+                "is_correct": is_correct,
+                "is_success": is_success,
+                "is_mc_fallback": fallback,
+                "has_timestamp_loop": bool(TIMESTAMP_LOOP_RE.search(text)),
+                "latency_s": round(latency_s, 4),
+                "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+                "completion_tokens": int(usage.get("completion_tokens") or 0),
+                "raw_response": text,
+                "error": error,
+            }
+            records.append(record)
+            LOGGER.info(
+                "[%s] %d/%d %s expected=%s predicted=%s correct=%s latency=%.3fs error=%s",
+                args.engine,
+                idx,
+                len(cases),
+                case.case_id,
+                case.sample.expected,
+                predicted or "-",
+                is_correct,
+                latency_s,
+                error or "-",
+            )
+            if args.print_raw_response:
+                LOGGER.info(
+                    "[%s] %s raw_response:\n%s",
+                    args.engine,
+                    case.case_id,
+                    text or "",
+                )
+            if args.sleep_s > 0:
+                time.sleep(args.sleep_s)
+    finally:
+        if profile_info is not None:
+            try:
+                _stop_client_profile(session, args, run_id=profile_info["run_id"])
+            except Exception as exc:  # noqa: BLE001 - keep benchmark output.
+                LOGGER.warning("[%s] request profiler stop failed: %s", args.engine, exc)
+            try:
+                profile_report = _render_client_profile(
+                    profile_info["event_dir"],
+                    profile_info["report_path"],
+                )
+                _log_client_profile(
+                    engine=args.engine,
+                    event_dir=profile_info["event_dir"],
+                    report_path=profile_info["report_path"],
+                    report=profile_report,
+                )
+            except Exception as exc:  # noqa: BLE001 - keep benchmark output.
+                LOGGER.warning("[%s] request profiler render failed: %s", args.engine, exc)
 
     result = {
         "engine": args.engine,
@@ -388,12 +534,24 @@ def run_client(args: argparse.Namespace) -> dict[str, Any]:
         "summary": summarize_records(records),
         "records": records,
     }
+    if profile_info is not None and profile_report is not None:
+        result["profile"] = {
+            **profile_info,
+            "request_count": profile_report.get("request_count"),
+            "stage_breakdown": profile_report.get("stage_breakdown", []),
+            "hop_breakdown": profile_report.get("hop_breakdown", []),
+        }
     if args.output:
         _write_json(Path(args.output), result)
     return result
 
 
-def client_stdout_payload(result: dict[str, Any], *, print_raw_response: bool) -> dict[str, Any]:
+def client_stdout_payload(
+    result: dict[str, Any],
+    *,
+    print_raw_response: bool,
+    print_profile: bool = True,
+) -> dict[str, Any]:
     payload = dict(result["summary"])
     if print_raw_response:
         payload["raw_responses"] = [
@@ -406,6 +564,8 @@ def client_stdout_payload(result: dict[str, Any], *, print_raw_response: bool) -
             }
             for record in result.get("records", [])
         ]
+    if print_profile and result.get("profile"):
+        payload["profile"] = result["profile"]
     return payload
 
 
@@ -991,6 +1151,34 @@ def add_client_args(parser: argparse.ArgumentParser) -> None:
         default=True,
         help="Print raw model responses in the client stdout payload and logs.",
     )
+    parser.add_argument(
+        "--profile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Collect SGLang request profile events and print stage breakdown.",
+    )
+    parser.add_argument(
+        "--profile-run-id",
+        default=None,
+        help="Run id for client request profiling; defaults to a timestamp.",
+    )
+    parser.add_argument(
+        "--profile-event-dir",
+        default=None,
+        help="Request profile event directory; defaults next to --output.",
+    )
+    parser.add_argument(
+        "--profile-output",
+        default=None,
+        help="Request profile report JSON path; defaults next to --output.",
+    )
+    parser.add_argument("--profile-timeout-s", type=int, default=30)
+    parser.add_argument(
+        "--print-profile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print profile summary in the client stdout payload.",
+    )
 
 
 def add_orchestrate_args(parser: argparse.ArgumentParser) -> None:
@@ -1064,6 +1252,7 @@ def main(argv: list[str] | None = None) -> int:
                 client_stdout_payload(
                     result,
                     print_raw_response=args.print_raw_response,
+                    print_profile=args.print_profile,
                 ),
                 ensure_ascii=False,
                 indent=2,
