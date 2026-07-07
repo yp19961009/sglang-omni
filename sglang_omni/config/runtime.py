@@ -125,14 +125,33 @@ def _validate_runtime_sources(
     """Validate ownership of runtime fields."""
 
     typed_mem_fraction = stage_cfg.runtime.sglang_server_args.mem_fraction_static
-    if typed_mem_fraction is not None and _server_args_mem_fraction_static_is_set(
-        factory_args,
-        runtime_overrides,
+    if typed_mem_fraction is not None and _server_args_field_is_set(
+        factory_args, runtime_overrides, "mem_fraction_static"
     ):
         raise ValueError(
             f"Stage {stage_cfg.name!r} sets mem_fraction_static through both "
             "server_args_overrides and typed "
             "runtime.sglang_server_args.mem_fraction_static"
+        )
+
+    typed_disable_radix = stage_cfg.runtime.sglang_server_args.disable_radix_cache
+    if typed_disable_radix is not None and _server_args_field_is_set(
+        factory_args, runtime_overrides, "disable_radix_cache"
+    ):
+        raise ValueError(
+            f"Stage {stage_cfg.name!r} sets disable_radix_cache through both "
+            "server_args_overrides and typed "
+            "runtime.sglang_server_args.disable_radix_cache"
+        )
+
+    typed_max_prefill = stage_cfg.runtime.sglang_server_args.max_prefill_tokens
+    if typed_max_prefill is not None and _server_args_field_is_set(
+        factory_args, runtime_overrides, "max_prefill_tokens"
+    ):
+        raise ValueError(
+            f"Stage {stage_cfg.name!r} sets max_prefill_tokens through both "
+            "server_args_overrides and typed "
+            "runtime.sglang_server_args.max_prefill_tokens"
         )
 
     reject_untyped_total_gpu_memory_fraction(
@@ -158,15 +177,16 @@ def _validate_runtime_sources(
             )
 
 
-def _server_args_mem_fraction_static_is_set(
+def _server_args_field_is_set(
     factory_args: dict[str, Any],
     runtime_overrides: dict[str, Any],
+    field_name: str,
 ) -> bool:
     for source in (factory_args, runtime_overrides):
         server_args = source.get("server_args_overrides")
         if (
             isinstance(server_args, dict)
-            and server_args.get("mem_fraction_static") is not None
+            and server_args.get(field_name) is not None
         ):
             return True
     return False
@@ -203,10 +223,10 @@ def _apply_typed_runtime_args(args: dict[str, Any], stage_cfg: StageConfig) -> N
             )
         args[target_arg] = value
 
-    mem_fraction_static = runtime.sglang_server_args.mem_fraction_static
-    if mem_fraction_static is not None:
+    server_args_overrides = runtime.sglang_server_args.model_dump(exclude_none=True)
+    if server_args_overrides:
         overrides = dict(args.get("server_args_overrides") or {})
-        overrides["mem_fraction_static"] = mem_fraction_static
+        overrides.update(server_args_overrides)
         args["server_args_overrides"] = overrides
 
 

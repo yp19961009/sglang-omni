@@ -151,6 +151,10 @@ class Qwen35OmniPipelineConfig(PipelineConfig):
     def encoder_mem_reserve_role_to_stage(cls) -> dict[str, str]:
         return {"thinker": THINKER_STAGE}
 
+    @classmethod
+    def generation_sglang_role_to_stage(cls) -> dict[str, str]:
+        return {"generation": THINKER_STAGE}
+
     model_path: str
     placement_policy: str | None = None
     placement: PlacementConfig = Field(

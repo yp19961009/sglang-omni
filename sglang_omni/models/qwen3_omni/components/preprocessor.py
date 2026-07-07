@@ -69,6 +69,14 @@ def _contextualize_cache_key(base_key: str | None, **context: Any) -> str | None
     return "|".join(parts)
 
 
+def _emit_preprocess_event(payload: StagePayload, event_name: str) -> None:
+    _emit_event(
+        request_id=payload.request_id,
+        stage=None,
+        event_name=event_name,
+    )
+
+
 DEFAULT_THINKER_MAX_NEW_TOKENS = 2048
 QWEN3_OMNI_CHAT_TEMPLATE_FALLBACK_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
@@ -341,9 +349,13 @@ class Qwen3OmniPreprocessor:
             )
 
             # Compute cache keys BEFORE conversion (paths are cheap to hash)
-            image_cache_key = compute_image_cache_key(raw_images)
-            raw_audio_cache_key = compute_audio_cache_key(raw_audios)
-            video_cache_key = compute_video_cache_key(raw_videos)
+            _emit_preprocess_event(payload, "preprocess_cache_key_start")
+            try:
+                image_cache_key = compute_image_cache_key(raw_images)
+                raw_audio_cache_key = compute_audio_cache_key(raw_audios)
+                video_cache_key = compute_video_cache_key(raw_videos)
+            finally:
+                _emit_preprocess_event(payload, "preprocess_cache_key_end")
 
             # Count explicit audio inputs (for placeholder insertion)
             if raw_audios:
@@ -355,20 +367,24 @@ class Qwen3OmniPreprocessor:
             # If we need audio from video, extract it during video loading to avoid duplicate downloads
             extract_audio_from_video_flag = bool(use_audio_in_video and raw_videos)
 
-            images, videos_result, audios_result = await asyncio.gather(
-                ensure_image_list_async(raw_images),
-                ensure_video_list_async(
-                    raw_videos,
-                    fps=resolved_video_fps,
-                    max_frames=resolved_video_max_frames,
-                    min_pixels=resolved_video_min_pixels,
-                    max_pixels=resolved_video_max_pixels,
-                    total_pixels=resolved_video_total_pixels,
-                    extract_audio=extract_audio_from_video_flag,
-                    audio_target_sr=audio_target_sr,
-                ),
-                ensure_audio_list_async(raw_audios, target_sr=audio_target_sr),
-            )
+            _emit_preprocess_event(payload, "preprocess_media_load_start")
+            try:
+                images, videos_result, audios_result = await asyncio.gather(
+                    ensure_image_list_async(raw_images),
+                    ensure_video_list_async(
+                        raw_videos,
+                        fps=resolved_video_fps,
+                        max_frames=resolved_video_max_frames,
+                        min_pixels=resolved_video_min_pixels,
+                        max_pixels=resolved_video_max_pixels,
+                        total_pixels=resolved_video_total_pixels,
+                        extract_audio=extract_audio_from_video_flag,
+                        audio_target_sr=audio_target_sr,
+                    ),
+                    ensure_audio_list_async(raw_audios, target_sr=audio_target_sr),
+                )
+            finally:
+                _emit_preprocess_event(payload, "preprocess_media_load_end")
             videos, sampled_video_fps, extracted_audio_from_video = videos_result
 
             # Merge extracted audio from videos with explicit audio (if any)
@@ -419,22 +435,26 @@ class Qwen3OmniPreprocessor:
             resolved_video_seconds_per_chunk = None
             resolved_video_position_id_per_seconds = None
 
-        messages_norm = normalize_messages(messages)
-        # Insert placeholders:
-        # - Explicit audio files get independent audio placeholders
-        # - Video audio (when use_audio_in_video=True) is handled by video token, no separate placeholder
-        num_audios_for_placeholder = num_explicit_audios
-        messages_mm = self._build_multimodal_messages(
-            messages_norm,
-            num_images=len(images),
-            num_audios=num_audios_for_placeholder,
-            num_videos=len(videos),
-        )
-        prompt_text = self.processor.apply_chat_template(
-            messages_mm,
-            add_generation_prompt=True,
-            tokenize=False,
-        )
+        _emit_preprocess_event(payload, "preprocess_prompt_start")
+        try:
+            messages_norm = normalize_messages(messages)
+            # Insert placeholders:
+            # - Explicit audio files get independent audio placeholders
+            # - Video audio (when use_audio_in_video=True) is handled by video token, no separate placeholder
+            num_audios_for_placeholder = num_explicit_audios
+            messages_mm = self._build_multimodal_messages(
+                messages_norm,
+                num_images=len(images),
+                num_audios=num_audios_for_placeholder,
+                num_videos=len(videos),
+            )
+            prompt_text = self.processor.apply_chat_template(
+                messages_mm,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+        finally:
+            _emit_preprocess_event(payload, "preprocess_prompt_end")
 
         videos_kwargs: dict[str, Any] = {}
         if sampled_video_fps is not None:
@@ -468,15 +488,19 @@ class Qwen3OmniPreprocessor:
         if videos_kwargs:
             processor_kwargs["videos_kwargs"] = videos_kwargs
 
-        hf_inputs = self.processor(
-            text=prompt_text,
-            images=images or None,
-            videos=videos or None,
-            audio=audios or None,
-            add_special_tokens=False,
-            return_tensors="pt",
-            **processor_kwargs,
-        )
+        _emit_preprocess_event(payload, "preprocess_hf_processor_start")
+        try:
+            hf_inputs = self.processor(
+                text=prompt_text,
+                images=images or None,
+                videos=videos or None,
+                audio=audios or None,
+                add_special_tokens=False,
+                return_tensors="pt",
+                **processor_kwargs,
+            )
+        finally:
+            _emit_preprocess_event(payload, "preprocess_hf_processor_end")
 
         input_ids = hf_inputs["input_ids"][0]
         attention_mask = hf_inputs.get("attention_mask")
@@ -485,6 +509,7 @@ class Qwen3OmniPreprocessor:
         else:
             attention_mask = torch.ones_like(input_ids)
 
+        _emit_preprocess_event(payload, "preprocess_finalize_start")
         validate_prompt_seq_len(
             input_ids,
             max_seq_len=self.max_seq_len,
@@ -561,6 +586,7 @@ class Qwen3OmniPreprocessor:
             encoder_inputs["audio_encoder"] = audio_encoder_inputs
         else:
             encoder_inputs["audio_encoder"] = {"_skip": True, "_result": {}}
+        _emit_preprocess_event(payload, "preprocess_finalize_end")
 
         return self._finalize_state(
             payload,

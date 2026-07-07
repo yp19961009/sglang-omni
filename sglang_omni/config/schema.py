@@ -67,13 +67,20 @@ class SGLangServerArgsConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    disable_radix_cache: bool | None = None
     mem_fraction_static: float | None = None
+    max_prefill_tokens: int | None = None
 
     def model_post_init(self, __context: Any = None) -> None:
         value = self.mem_fraction_static
         if value is not None and not 0.0 < value < 1.0:
             raise ValueError(
                 "runtime.sglang_server_args.mem_fraction_static must be in (0, 1)"
+            )
+        prefill_tokens = self.max_prefill_tokens
+        if prefill_tokens is not None and prefill_tokens <= 0:
+            raise ValueError(
+                "runtime.sglang_server_args.max_prefill_tokens must be positive"
             )
 
 

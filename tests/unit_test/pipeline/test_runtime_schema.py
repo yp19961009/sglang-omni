@@ -12,6 +12,8 @@ from sglang_omni.config import (
     StageResourceConfig,
     StageRuntimeConfig,
 )
+from sglang_omni.config.runtime import resolve_stage_static_factory_args
+from sglang_omni.models.qwen35_omni.config import Qwen35OmniPipelineConfig
 
 _FACTORY = "tests.unit_test.fixtures.pipeline_fakes.dummy_factory"
 
@@ -51,6 +53,66 @@ def test_invalid_total_gpu_memory_fraction_raises() -> None:
 def test_invalid_sglang_mem_fraction_static_raises() -> None:
     with pytest.raises(ValueError, match="mem_fraction_static"):
         SGLangServerArgsConfig(mem_fraction_static=1.0)
+
+
+def test_invalid_sglang_max_prefill_tokens_raises() -> None:
+    with pytest.raises(ValueError, match="max_prefill_tokens"):
+        SGLangServerArgsConfig(max_prefill_tokens=0)
+
+
+def test_typed_sglang_server_args_merge_into_factory_overrides() -> None:
+    stage = _stage(
+        factory_args={"server_args_overrides": {"foo": "bar"}},
+        runtime=StageRuntimeConfig(
+            sglang_server_args=SGLangServerArgsConfig(
+                disable_radix_cache=True,
+                max_prefill_tokens=4096,
+                mem_fraction_static=0.7,
+            ),
+        ),
+    )
+    config = PipelineConfig(model_path="dummy", stages=[stage])
+
+    args = resolve_stage_static_factory_args(stage, config)
+
+    assert args["server_args_overrides"] == {
+        "disable_radix_cache": True,
+        "foo": "bar",
+        "mem_fraction_static": 0.7,
+        "max_prefill_tokens": 4096,
+    }
+
+
+def test_typed_sglang_server_args_reject_duplicate_disable_radix_cache() -> None:
+    stage = _stage(
+        factory_args={"server_args_overrides": {"disable_radix_cache": False}},
+        runtime=StageRuntimeConfig(
+            sglang_server_args=SGLangServerArgsConfig(disable_radix_cache=True),
+        ),
+    )
+    config = PipelineConfig(model_path="dummy", stages=[stage])
+
+    with pytest.raises(ValueError, match="disable_radix_cache"):
+        resolve_stage_static_factory_args(stage, config)
+
+
+def test_typed_sglang_server_args_reject_duplicate_max_prefill_tokens() -> None:
+    stage = _stage(
+        factory_args={"server_args_overrides": {"max_prefill_tokens": 4096}},
+        runtime=StageRuntimeConfig(
+            sglang_server_args=SGLangServerArgsConfig(max_prefill_tokens=8192),
+        ),
+    )
+    config = PipelineConfig(model_path="dummy", stages=[stage])
+
+    with pytest.raises(ValueError, match="max_prefill_tokens"):
+        resolve_stage_static_factory_args(stage, config)
+
+
+def test_qwen35_generation_server_args_target_thinker_stage() -> None:
+    assert Qwen35OmniPipelineConfig.generation_sglang_role_to_stage() == {
+        "generation": "thinker",
+    }
 
 
 def test_invalid_stage_runtime_values_raise() -> None:

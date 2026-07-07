@@ -15,7 +15,6 @@ from sglang_omni.models.qwen35_omni.components.preprocessor import Qwen35OmniPre
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import build_sglang_server_args
-from sglang_omni.scheduling.stage_cache import StageOutputCache
 from sglang_omni.utils.gpu_memory import format_bytes_gib, get_process_gpu_memory_bytes
 from sglang_omni.utils.misc import avail_gpu_mem
 
@@ -24,8 +23,6 @@ logger = logging.getLogger(__name__)
 IMAGE_STAGE = qwen3_stages.IMAGE_STAGE
 AUDIO_STAGE = qwen3_stages.AUDIO_STAGE
 THINKER_STAGE = qwen3_stages.THINKER_STAGE
-QWEN35_ENCODER_CACHE_MAX_BYTES = qwen3_stages.QWEN3_ENCODER_CACHE_MAX_BYTES
-QWEN35_ENCODER_CACHE_MAX_ENTRIES = qwen3_stages.QWEN3_ENCODER_CACHE_MAX_ENTRIES
 
 load_state = qwen3_stages.load_state
 store_state = qwen3_stages.store_state
@@ -70,11 +67,6 @@ def create_image_encoder_executor(
     from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
     model = Qwen35OmniImageEncoder(model_path=model_path, device=device, dtype=dtype)
-    cache = StageOutputCache(
-        max_size=QWEN35_ENCODER_CACHE_MAX_ENTRIES,
-        max_bytes=QWEN35_ENCODER_CACHE_MAX_BYTES,
-        cache_device="cpu",
-    )
 
     def _encode(payload: StagePayload) -> StagePayload:
         _emit_event(
@@ -88,7 +80,6 @@ def create_image_encoder_executor(
                 payload,
                 stage_name=IMAGE_STAGE,
                 model=model,
-                cache=cache,
             )
         finally:
             _emit_event(
@@ -110,7 +101,6 @@ def create_image_encoder_executor(
             return qwen3_stages._batch_image_encoder_payloads(
                 payloads,
                 model=model,
-                cache=cache,
             )
         finally:
             for p in payloads:
@@ -140,11 +130,6 @@ def create_audio_encoder_executor(
     from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
     model = Qwen35OmniAudioEncoder(model_path=model_path, device=device, dtype=dtype)
-    cache = StageOutputCache(
-        max_size=QWEN35_ENCODER_CACHE_MAX_ENTRIES,
-        max_bytes=QWEN35_ENCODER_CACHE_MAX_BYTES,
-        cache_device="cpu",
-    )
 
     def _encode(payload: StagePayload) -> StagePayload:
         _emit_event(
@@ -158,7 +143,6 @@ def create_audio_encoder_executor(
                 payload,
                 stage_name=AUDIO_STAGE,
                 model=model,
-                cache=cache,
             )
         finally:
             _emit_event(
@@ -180,7 +164,6 @@ def create_audio_encoder_executor(
             return qwen3_stages._batch_audio_encoder_payloads(
                 payloads,
                 model=model,
-                cache=cache,
             )
         finally:
             for p in payloads:
