@@ -71,15 +71,22 @@ Local Qwen3.5-Omni S2T Result (this workspace, 2026-07-08)
 
 Accuracy
 
-| Model          | Config                   | accuracy | correct | failed | mc_fallback | Source |
-| -------------- | ------------------------ | -------- | ------- | ------ | ----------- | ------ |
-| Qwen3.5-Omni   | thinker-only, ci-50, c=8 | 72.00%   | 36/50   | 0      | 0           | local H20 GPU6, qwen35_s2t_align/sglang-qwen35-videoamme-c8-20260708-183040 |
+| Model        | Config                                              | accuracy | correct | failed | mc_fallback | Source                                                                                        |
+| ------------ | --------------------------------------------------- | -------- | ------- | ------ | ----------- | --------------------------------------------------------------------------------------------- |
+| Qwen3.5-Omni | thinker-only, ci-50, c=8                            | 72.00%   | 36/50   | 0      | 0           | local H20 GPU6, qwen35_s2t_align/sglang-qwen35-videoamme-c8-20260708-183040                   |
+| Qwen3.5-Omni | thinker-only, ci-50, c=8, stream=True, video_fps=1  | 64.00%   | 32/50   | 0      | 0           | local H20 GPU6, qwen35_s2t_align/sglang-qwen35-videoamme-c8-fps1-ttft-20260708-185632         |
 
 Speed
 
-| Model          | Config                   | completed | failed | latency_mean_s | latency_median_s | latency_p95_s | latency_p99_s | output_tok_per_req_s | output_tokens_mean | output_tokens_total | prompt_tokens_mean | prompt_tokens_total | throughput_qps | Source |
-| -------------- | ------------------------ | --------- | ------ | -------------- | ---------------- | ------------- | ------------- | -------------------- | ------------------ | ------------------- | ------------------ | ------------------- | -------------- | ------ |
-| Qwen3.5-Omni   | thinker-only, ci-50, c=8 | 50        | 0      | 15.389         | 14.565           | 23.419        | 33.100        | 0.4                  | 7.0                | 345                 | 14763.0            | 738170              | 0.505          | local H20 GPU6, max_tokens=256, fps=2, max_frames=128, max_pixels=401408 |
+| Model        | Config                   | completed | failed | latency_mean_s | latency_median_s | latency_p95_s | latency_p99_s | output_tok_per_req_s | output_tokens_mean | output_tokens_total | prompt_tokens_mean | prompt_tokens_total | throughput_qps | Source                                                                         |
+| ------------ | ------------------------ | --------- | ------ | -------------- | ---------------- | ------------- | ------------- | -------------------- | ------------------ | ------------------- | ------------------ | ------------------- | -------------- | ------------------------------------------------------------------------------ |
+| Qwen3.5-Omni | thinker-only, ci-50, c=8 | 50        | 0      | 15.389         | 14.565           | 23.419        | 33.100        | 0.4                  | 7.0                | 345                 | 14763.0            | 738170              | 0.505          | local H20 GPU6, max_tokens=256, fps=2, max_frames=128, max_pixels=401408       |
+
+Streaming TTFT / Speed (video_fps=1)
+
+| Model        | Config                                             | completed | failed | latency_mean_s | latency_median_s | latency_p95_s | latency_p99_s | text_ttft_mean_s | text_ttft_median_s | text_ttft_p95_s | text_ttft_p99_s | output_tok_per_req_s | output_tokens_mean | output_tokens_total | prompt_tokens_mean | prompt_tokens_total | throughput_qps | Source                                                                         |
+| ------------ | -------------------------------------------------- | --------- | ------ | -------------- | ---------------- | ------------- | ------------- | ---------------- | ------------------ | --------------- | --------------- | -------------------- | ------------------ | ------------------- | ------------------ | ------------------- | -------------- | ------------------------------------------------------------------------------ |
+| Qwen3.5-Omni | thinker-only, ci-50, c=8, stream=True, video_fps=1 | 50        | 0      | 10.514         | 10.332           | 15.499        | 17.005        | 8.1495           | 8.1984             | 10.8445         | 12.2999         | 0.6                  | 7.0                | 340                 | 11275.0            | 563752              | 0.744          | local H20 GPU6, max_tokens=256, max_frames=128, max_pixels=401408              |
 """
 
 from __future__ import annotations
