@@ -10,6 +10,7 @@ cases to the server local to that container.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import logging
 import math
@@ -19,6 +20,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +56,33 @@ ANSWER_RE = re.compile(
 )
 LETTER_RE = re.compile(r"\b([ABCD])\b", re.IGNORECASE)
 TIMESTAMP_LOOP_RE = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})(?:\s+\1){2,}")
+VLLM_TIMING_RE = re.compile(
+    r"\[(?P<request_id>chatcmpl-[^\]]+)\]\s+TIMING\s+"
+    r"stage=(?P<stage>\S+)\s+ms=(?P<ms>[0-9.]+)\s+"
+    r"since_start_ms=(?P<since_start_ms>[0-9.]+)(?P<extras>.*)$"
+)
+VLLM_INPUT_PREPROCESSOR_RE = re.compile(
+    r"thinker input_preprocessor finished,\s+rid:\s+"
+    r"(?P<request_id>\S+),\s+cost:(?P<ms>[0-9.]+)"
+)
+VLLM_HFPREP_RE = re.compile(
+    r"HFPREP_PROFILE\s+(?P<kind>\w+):\s+(?P<fields>.*)$"
+)
+VLLM_PROCESSOR_STATS_RE = re.compile(
+    r"Qwen3OmniNextProcessor preprocessing stats:\s+(?P<fields>.*)$"
+)
+VLLM_MM_ENCODER_RE = re.compile(
+    r"encode all mm inputs done,\s+cost:\s+(?P<ms>[0-9.]+)\s+ms,.*"
+    r"\(request_id,\s+item_cnt\):\s+(?P<items>\{.*\})"
+)
+VLLM_REQUEST_FINISHED_RE = re.compile(
+    r"Request\s+(?P<request_id>chatcmpl-\S+)\s+finished,\s+"
+    r"output length:\s+(?P<output_length>\d+),\s+reason:\s+(?P<reason>\S+),"
+)
+VLLM_KV_RE = re.compile(
+    r"(?P<key>[A-Za-z_][\w.-]*)="
+    r"(?P<value>\[[^\]]*\]|\{[^}]*\}|\([^)]*\)|\"[^\"]*\"|'[^']*'|[^ ]+)"
+)
 
 
 @dataclass(frozen=True)
@@ -377,6 +406,12 @@ def _vllm_payload(args: argparse.Namespace, sample: VideoAMMESample) -> dict[str
         "enable_audio_output": False,
         "use_audio_in_video": False,
     }
+    if args.video_fps is not None:
+        payload["video_fps"] = args.video_fps
+    if args.video_max_frames is not None:
+        payload["video_max_frames"] = args.video_max_frames
+    if args.video_max_pixels is not None:
+        payload["video_max_pixels"] = args.video_max_pixels
     return payload
 
 
@@ -610,6 +645,283 @@ def _percentile(values: list[float], pct: float) -> float | None:
     if lo == hi:
         return round(ordered[int(idx)], 4)
     return round(ordered[lo] * (hi - idx) + ordered[hi] * (idx - lo), 4)
+
+
+def _coerce_vllm_value(raw: str) -> Any:
+    raw = raw.strip().rstrip(",")
+    if raw.endswith("ms"):
+        with suppress(ValueError):
+            return round(float(raw[:-2]), 3)
+    if raw.lower() in {"true", "false"}:
+        return raw.lower() == "true"
+    if raw.lower() in {"none", "null"}:
+        return None
+    if raw and raw[0] in "[{\"'":
+        with suppress(Exception):
+            return ast.literal_eval(raw)
+    with suppress(ValueError):
+        return int(raw)
+    with suppress(ValueError):
+        return float(raw)
+    return raw
+
+
+def _parse_vllm_kv_fields(text: str) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    for match in VLLM_KV_RE.finditer(text):
+        fields[match.group("key")] = _coerce_vllm_value(match.group("value"))
+    return fields
+
+
+def _parse_vllm_processor_stats(text: str) -> dict[str, Any]:
+    fields: dict[str, Any] = {"raw": text}
+    for name, count, seconds in re.findall(
+        r"(\w+)_items=(\d+)\s+\(([0-9.]+)s\)", text
+    ):
+        fields[f"{name}_items"] = int(count)
+        fields[f"{name}_ms"] = round(float(seconds) * 1000, 3)
+    for name, seconds in re.findall(r"(\w+)=([0-9.]+)s", text):
+        if name.endswith("_items"):
+            continue
+        fields[f"{name}_ms"] = round(float(seconds) * 1000, 3)
+    return fields
+
+
+def _vllm_request_entry(
+    requests: dict[str, dict[str, Any]], request_id: str
+) -> dict[str, Any]:
+    return requests.setdefault(
+        request_id,
+        {
+            "timings": [],
+            "events": [],
+            "scheduler_events": [],
+            "finished": None,
+        },
+    )
+
+
+def _add_vllm_event(
+    requests: dict[str, dict[str, Any]],
+    request_id: str,
+    *,
+    stage: str,
+    ms: float | None,
+    kind: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    event: dict[str, Any] = {
+        "stage": stage,
+        "kind": kind,
+        "metadata": dict(metadata or {}),
+    }
+    if ms is not None:
+        event["ms"] = round(float(ms), 3)
+    _vllm_request_entry(requests, request_id)["events"].append(event)
+
+
+def _aggregate_vllm_profile_rows(
+    requests: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    bucket: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for request in requests.values():
+        for event in request.get("events", []):
+            if "ms" not in event:
+                continue
+            bucket[(str(event["stage"]), str(event["kind"]))].append(float(event["ms"]))
+
+    rows: list[dict[str, Any]] = []
+    for (stage, kind), durations in bucket.items():
+        durations.sort()
+        rows.append(
+            {
+                "stage": stage,
+                "kind": kind,
+                "count": len(durations),
+                "total_ms": round(sum(durations), 3),
+                "avg_ms": round(sum(durations) / len(durations), 3),
+                "p50_ms": _percentile(durations, 50),
+                "p95_ms": _percentile(durations, 95),
+                "max_ms": round(durations[-1], 3),
+            }
+        )
+    rows.sort(key=lambda row: (-float(row["total_ms"]), row["stage"], row["kind"]))
+    return rows
+
+
+def _add_vllm_derived_events(requests: dict[str, dict[str, Any]]) -> None:
+    for request in requests.values():
+        timings_by_stage = {
+            timing.get("stage"): timing for timing in request.get("timings", [])
+        }
+        first_output = timings_by_stage.get("engine.thinker_first_output")
+        final_output = timings_by_stage.get("engine.thinker_final_output")
+        if not first_output or not final_output:
+            continue
+
+        first_since = first_output.get("since_start_ms")
+        final_since = final_output.get("since_start_ms")
+        if not isinstance(first_since, (int, float)) or not isinstance(
+            final_since, (int, float)
+        ):
+            continue
+
+        decode_ms = round(float(final_since) - float(first_since), 3)
+        if decode_ms < 0:
+            continue
+
+        request["events"].append(
+            {
+                "stage": "engine.thinker_decode_after_first",
+                "kind": "derived",
+                "ms": decode_ms,
+                "metadata": {
+                    "from": "engine.thinker_first_output",
+                    "to": "engine.thinker_final_output",
+                },
+            }
+        )
+
+
+def parse_vllm_server_profile(log_path: Path) -> dict[str, Any]:
+    """Parse vLLM Qwen3.5-Omni server logs into a request-level profile."""
+    requests: dict[str, dict[str, Any]] = {}
+    unattributed_events: list[dict[str, Any]] = []
+    current_request_id: str | None = None
+
+    if not log_path.is_file():
+        return {
+            "source_log": str(log_path),
+            "request_count": 0,
+            "requests": {},
+            "stage_breakdown": [],
+            "unattributed_events": [],
+        }
+
+    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        timing = VLLM_TIMING_RE.search(line)
+        if timing:
+            request_id = timing.group("request_id")
+            current_request_id = request_id
+            metadata = _parse_vllm_kv_fields(timing.group("extras"))
+            event = {
+                "stage": timing.group("stage"),
+                "kind": "server_timing",
+                "ms": round(float(timing.group("ms")), 3),
+                "since_start_ms": round(float(timing.group("since_start_ms")), 3),
+                "metadata": metadata,
+            }
+            request = _vllm_request_entry(requests, request_id)
+            request["timings"].append(event)
+            request["events"].append(event)
+            if event["stage"] == "http.total":
+                current_request_id = None
+            continue
+
+        input_preprocessor = VLLM_INPUT_PREPROCESSOR_RE.search(line)
+        if input_preprocessor:
+            request_id = input_preprocessor.group("request_id")
+            _add_vllm_event(
+                requests,
+                request_id,
+                stage="engine.input_preprocessor",
+                ms=float(input_preprocessor.group("ms")),
+                kind="engine",
+            )
+            current_request_id = request_id
+            continue
+
+        hfprep = VLLM_HFPREP_RE.search(line)
+        if hfprep:
+            fields = _parse_vllm_kv_fields(hfprep.group("fields"))
+            total_ms = fields.get("total")
+            event = {
+                "stage": f"hfprep.{hfprep.group('kind')}",
+                "kind": "processor",
+                "metadata": fields,
+            }
+            if isinstance(total_ms, (int, float)):
+                event["ms"] = round(float(total_ms), 3)
+            if current_request_id is None:
+                unattributed_events.append(event)
+            else:
+                _vllm_request_entry(requests, current_request_id)["events"].append(event)
+            continue
+
+        processor_stats = VLLM_PROCESSOR_STATS_RE.search(line)
+        if processor_stats:
+            fields = _parse_vllm_processor_stats(processor_stats.group("fields"))
+            total_ms = fields.get("total_preprocess_ms")
+            event = {
+                "stage": "qwen_processor.preprocess",
+                "kind": "processor",
+                "metadata": fields,
+            }
+            if isinstance(total_ms, (int, float)):
+                event["ms"] = round(float(total_ms), 3)
+            if current_request_id is None:
+                unattributed_events.append(event)
+            else:
+                _vllm_request_entry(requests, current_request_id)["events"].append(event)
+            continue
+
+        mm_encoder = VLLM_MM_ENCODER_RE.search(line)
+        if mm_encoder:
+            with suppress(Exception):
+                item_counts = ast.literal_eval(mm_encoder.group("items"))
+                if isinstance(item_counts, dict):
+                    for request_id, item_count in item_counts.items():
+                        _add_vllm_event(
+                            requests,
+                            str(request_id),
+                            stage="engine.mm_encoder",
+                            ms=float(mm_encoder.group("ms")),
+                            kind="engine",
+                            metadata={"item_count": item_count},
+                        )
+                    continue
+            if current_request_id is not None:
+                _add_vllm_event(
+                    requests,
+                    current_request_id,
+                    stage="engine.mm_encoder",
+                    ms=float(mm_encoder.group("ms")),
+                    kind="engine",
+                    metadata={"raw_items": mm_encoder.group("items")},
+                )
+            continue
+
+        if "SCHED_STEP" in line and current_request_id is not None:
+            _vllm_request_entry(requests, current_request_id)["scheduler_events"].append(
+                {"raw": line.split("SCHED_STEP", 1)[1].strip()}
+            )
+            continue
+
+        finished = VLLM_REQUEST_FINISHED_RE.search(line)
+        if finished:
+            request_id = finished.group("request_id")
+            _vllm_request_entry(requests, request_id)["finished"] = {
+                "output_length": int(finished.group("output_length")),
+                "reason": finished.group("reason"),
+            }
+            current_request_id = request_id
+
+    _add_vllm_derived_events(requests)
+    return {
+        "source_log": str(log_path),
+        "request_count": len(requests),
+        "requests": requests,
+        "stage_breakdown": _aggregate_vllm_profile_rows(requests),
+        "unattributed_events": unattributed_events,
+    }
+
+
+def vllm_profile_summary(profile: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_count": profile.get("request_count", 0),
+        "stage_breakdown": profile.get("stage_breakdown", []),
+        "unattributed_events": profile.get("unattributed_events", []),
+    }
 
 
 def wait_for_container_health(
@@ -949,6 +1261,7 @@ def build_alignment_report(
     vllm_result: dict[str, Any],
     sglang_log_path: Path,
     profile_report_path: Path,
+    vllm_profile_report_path: Path | None = None,
 ) -> dict[str, Any]:
     s_records = {r["case_id"]: r for r in sglang_result.get("records", [])}
     v_records = {r["case_id"]: r for r in vllm_result.get("records", [])}
@@ -990,6 +1303,9 @@ def build_alignment_report(
             "stage_breakdown": profile.get("stage_breakdown", []),
             "hop_breakdown": profile.get("hop_breakdown", []),
         }
+    vllm_profile = {}
+    if vllm_profile_report_path is not None and vllm_profile_report_path.is_file():
+        vllm_profile = vllm_profile_summary(_load_result(vllm_profile_report_path))
     return {
         "summary": {
             "sglang_eval_accuracy": s_acc,
@@ -1008,6 +1324,7 @@ def build_alignment_report(
         "sglang_summary": sglang_result.get("summary", {}),
         "vllm_summary": vllm_result.get("summary", {}),
         "profile": profile_summary,
+        "vllm_profile": vllm_profile,
     }
 
 
@@ -1046,6 +1363,7 @@ def run_orchestrate(args: argparse.Namespace) -> dict[str, Any]:
     sglang_result_path = f"{container_run_dir}/sglang/results.json"
     sglang_events_dir = f"{container_run_dir}/sglang/events"
     sglang_profile_path = f"{container_run_dir}/sglang/profile_report.json"
+    vllm_profile_path = f"{container_run_dir}/vllm/profile_report.json"
 
     if args.skip_vllm:
         LOGGER.warning("Skipping vLLM reference run by request")
@@ -1063,6 +1381,12 @@ def run_orchestrate(args: argparse.Namespace) -> dict[str, Any]:
                 _client_command(args, engine="vllm", output_path=vllm_result_path),
                 timeout_s=args.client_timeout_s,
             )
+        try:
+            vllm_profile = parse_vllm_server_profile(vllm_dir / "server.log")
+            _write_json(Path(_host_path(vllm_profile_path)), vllm_profile)
+            LOGGER.info("vLLM profile written to %s", _host_path(vllm_profile_path))
+        except Exception as exc:  # noqa: BLE001 - benchmark output is still useful.
+            LOGGER.warning("Failed to render vLLM profile: %s", exc)
 
     if args.skip_sglang:
         LOGGER.warning("Skipping SGLang run by request")
@@ -1107,16 +1431,35 @@ def run_orchestrate(args: argparse.Namespace) -> dict[str, Any]:
 
     host_vllm_result_path = Path(_host_path(vllm_result_path))
     host_sglang_result_path = Path(_host_path(sglang_result_path))
+    host_vllm_profile_path = Path(_host_path(vllm_profile_path))
     if host_vllm_result_path.is_file() and host_sglang_result_path.is_file():
         report = build_alignment_report(
             sglang_result=_load_result(host_sglang_result_path),
             vllm_result=_load_result(host_vllm_result_path),
             sglang_log_path=sglang_dir / "server.log",
             profile_report_path=Path(_host_path(sglang_profile_path)),
+            vllm_profile_report_path=host_vllm_profile_path,
         )
         _write_json(host_run_dir / "alignment_report.json", report)
         LOGGER.info("Alignment report written to %s", host_run_dir / "alignment_report.json")
         return report
+
+    single_engine_report: dict[str, Any] = {"manifest": manifest}
+    if host_vllm_result_path.is_file():
+        single_engine_report["vllm_summary"] = _load_result(host_vllm_result_path).get(
+            "summary", {}
+        )
+    if host_vllm_profile_path.is_file():
+        single_engine_report["vllm_profile"] = vllm_profile_summary(
+            _load_result(host_vllm_profile_path)
+        )
+    if host_sglang_result_path.is_file():
+        single_engine_report["sglang_summary"] = _load_result(
+            host_sglang_result_path
+        ).get("summary", {})
+    if len(single_engine_report) > 1:
+        LOGGER.info("Run artifacts written to %s", host_run_dir)
+        return single_engine_report
 
     LOGGER.info("Run artifacts written to %s", host_run_dir)
     return {"manifest": manifest}

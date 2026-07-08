@@ -368,7 +368,7 @@ class Qwen3OmniPreprocessor:
             extract_audio_from_video_flag = bool(use_audio_in_video and raw_videos)
 
             _emit_preprocess_event(payload, "preprocess_media_load_start")
-            try:
+            try: # decode / 抽帧 / resize 之后就可以给 hf process
                 images, videos_result, audios_result = await asyncio.gather(
                     ensure_image_list_async(raw_images),
                     ensure_video_list_async(
@@ -490,7 +490,7 @@ class Qwen3OmniPreprocessor:
 
         _emit_preprocess_event(payload, "preprocess_hf_processor_start")
         try:
-            hf_inputs = self.processor(
+            hf_inputs = self.processor( # HF multimodal processor preprocessing，提取完就可以给 encoder
                 text=prompt_text,
                 images=images or None,
                 videos=videos or None,

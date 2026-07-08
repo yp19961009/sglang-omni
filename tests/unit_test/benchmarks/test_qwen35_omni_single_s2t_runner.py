@@ -6,12 +6,15 @@ from benchmarks.eval.qwen35_omni_single_s2t import (
     VideoAMMESample,
     _client_profile_paths,
     _sglang_server_command,
+    _vllm_payload,
     _vllm_server_command,
     build_alignment_report,
     build_parser,
     build_cases,
     client_stdout_payload,
     parse_prediction,
+    parse_vllm_server_profile,
+    vllm_profile_summary,
 )
 
 
@@ -76,6 +79,28 @@ def test_build_cases_short_defaults_to_ten_eval_samples_with_cache_probes():
         "eval_003_002-1",
     ]
     assert cases[-1].case_id == "eval_010_009-1"
+
+
+def test_vllm_payload_forwards_video_sampling_options():
+    args = Namespace(
+        model_name="qwen35-omni-s2t",
+        prompt="Answer with one option.",
+        temperature=0.0,
+        top_p=0.8,
+        top_k=1,
+        max_tokens=4,
+        seed=0,
+        video_fps=2.0,
+        video_max_frames=128,
+        video_max_pixels=401408,
+    )
+
+    payload = _vllm_payload(args, _sample("001-1"))
+
+    assert payload["video_fps"] == 2.0
+    assert payload["video_max_frames"] == 128
+    assert payload["video_max_pixels"] == 401408
+    assert payload["messages"][0]["content"][0]["video_url"].endswith("001-1.mp4")
 
 
 def test_parse_prediction_prefers_answer_tag_then_option_text_fallback():
@@ -251,6 +276,59 @@ def test_vllm_reference_command_uses_installed_package_cwd_and_disables_mtp():
     assert "--mm-processor-cache-type lru" in command
 
 
+def test_parse_vllm_server_profile_extracts_request_breakdown(tmp_path: Path):
+    log_path = tmp_path / "server.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "INFO [qwen_omni_v35_server.py:420] [chatcmpl-abc123] TIMING stage=http.request_json ms=0.070 since_start_ms=0.091 content_length=692",
+                "INFO [qwen_omni_v35_server.py:420] [chatcmpl-abc123] TIMING stage=build_prompt.process_mm_info ms=6110.834 since_start_ms=7237.020 audios=1 images=0 videos=1 video_kwargs=['do_sample_frames']",
+                "INFO [qwen3_omni_next.py:394] Qwen3OmniNextProcessor preprocessing stats: audio_items=1 (0.012s), image_items=0 (0.000s), video_items=1 (0.150s), total_preprocess=0.162s, replace_multimodal_special_tokens=0.002s",
+                "INFO [processing.py:2482] HFPREP_PROFILE apply: total=840.5ms cached_hf=824.2ms prompt_updates=16.4ms is_update_applied=False",
+                "INFO [async_llm.py:707] thinker input_preprocessor finished, rid: chatcmpl-abc123, cost:5664.1",
+                "[0/1][pid=1144] INFO [gpu_model_runner.py:2936] encode all mm inputs done, cost: 367.483642578125 ms, (request_id, item_cnt): {'chatcmpl-abc123': 2}",
+                "INFO [qwen_omni_v35_server.py:420] [chatcmpl-abc123] TIMING stage=engine.thinker_first_output ms=7340.500 since_start_ms=20245.100 prompt_tokens=8138 output_tokens=1 finished=False",
+                "INFO [qwen_omni_v35_server.py:420] [chatcmpl-abc123] TIMING stage=engine.thinker_final_output ms=7573.070 since_start_ms=20498.100 prompt_tokens=8138 output_tokens=4 finish_reason=stop",
+                "[EngineCore_DP0][pid=777] INFO [scheduler.py:1212] SCHED_STEP prefill_reqs=1(8138 tok) decode_reqs=0(0 tok) encoder_reqs=1 total=8138",
+                "[EngineCore_DP0][pid=777] INFO [scheduler.py:2330] Request chatcmpl-abc123 finished, output length: 4, reason: stop, stop reason: None",
+                "INFO [qwen_omni_v35_server.py:420] [chatcmpl-abc123] TIMING stage=http.total ms=20498.742 since_start_ms=20498.742",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    profile = parse_vllm_server_profile(log_path)
+    stages = {row["stage"]: row for row in profile["stage_breakdown"]}
+
+    assert profile["request_count"] == 1
+    assert stages["http.total"]["total_ms"] == 20498.742
+    assert stages["build_prompt.process_mm_info"]["total_ms"] == 6110.834
+    assert stages["engine.input_preprocessor"]["total_ms"] == 5664.1
+    assert stages["hfprep.apply"]["total_ms"] == 840.5
+    assert stages["engine.mm_encoder"]["total_ms"] == 367.484
+    assert stages["engine.thinker_first_output"]["total_ms"] == 7340.5
+    assert stages["engine.thinker_final_output"]["total_ms"] == 7573.07
+    assert stages["engine.thinker_decode_after_first"]["total_ms"] == 253.0
+    request = profile["requests"]["chatcmpl-abc123"]
+    assert request["finished"] == {"output_length": 4, "reason": "stop"}
+    assert len(request["scheduler_events"]) == 1
+
+
+def test_vllm_profile_summary_keeps_breakdown_and_unattributed_events():
+    profile = {
+        "request_count": 1,
+        "stage_breakdown": [{"stage": "http.total", "total_ms": 1.0}],
+        "unattributed_events": [{"stage": "hfprep.apply"}],
+        "requests": {"chatcmpl-abc123": {}},
+    }
+
+    assert vllm_profile_summary(profile) == {
+        "request_count": 1,
+        "stage_breakdown": [{"stage": "http.total", "total_ms": 1.0}],
+        "unattributed_events": [{"stage": "hfprep.apply"}],
+    }
+
+
 def test_alignment_report_compares_predictions(tmp_path: Path):
     sglang_result = {
         "summary": {"eval_accuracy": 1.0, "timestamp_loop_cases": []},
@@ -286,15 +364,22 @@ def test_alignment_report_compares_predictions(tmp_path: Path):
     }
     log_path = tmp_path / "server.log"
     log_path.write_text("", encoding="utf-8")
+    vllm_profile_path = tmp_path / "vllm_profile.json"
+    vllm_profile_path.write_text(
+        '{"request_count": 1, "stage_breakdown": [{"stage": "http.total", "total_ms": 2.0}], "unattributed_events": []}',
+        encoding="utf-8",
+    )
 
     report = build_alignment_report(
         sglang_result=sglang_result,
         vllm_result=vllm_result,
         sglang_log_path=log_path,
         profile_report_path=tmp_path / "missing_profile.json",
+        vllm_profile_report_path=vllm_profile_path,
     )
 
     assert report["summary"]["eval_accuracy_delta"] == 1.0
     assert report["summary"]["prediction_matches"] == 0
     assert report["diffs"][0]["sglang_predicted"] == "A"
     assert report["diffs"][0]["vllm_predicted"] == "B"
+    assert report["vllm_profile"]["request_count"] == 1
