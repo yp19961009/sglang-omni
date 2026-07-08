@@ -67,13 +67,14 @@ class ThinkerModelRunner(ModelRunner):
         if not schedule_batch.forward_mode.is_extend():
             return None
 
-        omni_result = self._inject_multimodal_embeds(forward_batch, schedule_batch)
-        if omni_result is not None and omni_result[0] is not None:
-            input_embeds, ds_embeds, vis_masks = omni_result
-            return self._forward_with_omni_embeds(
-                forward_batch, input_embeds, ds_embeds, vis_masks
-            )
-        return None
+        with torch.inference_mode():
+            omni_result = self._inject_multimodal_embeds(forward_batch, schedule_batch)
+            if omni_result is not None and omni_result[0] is not None:
+                input_embeds, ds_embeds, vis_masks = omni_result
+                return self._forward_with_omni_embeds(
+                    forward_batch, input_embeds, ds_embeds, vis_masks
+                )
+            return None
 
     def requested_capture_hidden_mode_prefill(
         self, schedule_batch: Any, requests: list
