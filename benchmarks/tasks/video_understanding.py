@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import json
 import logging
 import os
 import random
@@ -52,6 +53,7 @@ class VideoMMERecord(TypedDict):
     is_correct: bool
     is_success: bool
     is_mc_fallback: bool
+    text_ttft_s: float | None
     error: str
 
 
@@ -102,6 +104,75 @@ def _apply_chat_completion_response(
     return True
 
 
+def _apply_usage(result: RequestResult, usage: dict[str, Any] | None) -> None:
+    if not usage:
+        return
+    result.prompt_tokens = usage.get("prompt_tokens", 0) or result.prompt_tokens
+    result.completion_tokens = (
+        usage.get("completion_tokens", 0) or result.completion_tokens
+    )
+
+
+async def _apply_streaming_chat_completion_response(
+    result: RequestResult,
+    response: aiohttp.ClientResponse,
+    *,
+    start_time: float,
+) -> bool:
+    text_chunks: list[str] = []
+    usage: dict[str, Any] | None = None
+    buffer = ""
+
+    async for raw_chunk in response.content.iter_any():
+        if not raw_chunk:
+            continue
+        buffer += raw_chunk.decode("utf-8")
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            line = line.strip()
+            if not line or not line.startswith("data:"):
+                continue
+
+            data = line[len("data:") :].strip()
+            if data == "[DONE]":
+                continue
+
+            try:
+                body = json.loads(data)
+            except json.JSONDecodeError as exc:
+                result.error = f"Invalid streaming chunk: {exc}"
+                return False
+
+            chunk_usage = body.get("usage")
+            if isinstance(chunk_usage, dict):
+                usage = chunk_usage
+
+            choices = body.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            content = delta.get("content")
+            if content is None:
+                continue
+            if not isinstance(content, str):
+                content = str(content)
+            if content == "":
+                continue
+
+            if result.text_ttft_s is None:
+                result.text_ttft_s = time.perf_counter() - start_time
+            text_chunks.append(content)
+
+    result.text = "".join(text_chunks)
+    _apply_usage(result, usage)
+    if result.completion_tokens <= 0 and text_chunks:
+        # SGLang emits one content delta per generated token. Use that as a
+        # fallback when the streaming final chunk does not include usage.
+        result.completion_tokens = len(text_chunks)
+    result.is_success = True
+    return True
+
+
 def make_video_send_fn(
     model_name: str,
     api_url: str,
@@ -116,6 +187,7 @@ def make_video_send_fn(
     enable_audio_input: bool = False,
     audio_output_dir: str | None = None,
     fixed_prompt: str | None = None,
+    stream: bool = False,
 ) -> SendFn:
     modalities = ["text", "audio"] if audio_output_dir else ["text"]
 
@@ -136,8 +208,10 @@ def make_video_send_fn(
             "modalities": modalities,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "stream": False,
+            "stream": stream,
         }
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
         if enable_audio_input:
             assert isinstance(sample, VideoAMMESample)
             payload["audios"] = [sample.audio_path]
@@ -158,15 +232,25 @@ def make_video_send_fn(
         try:
             async with session.post(api_url, json=payload) as response:
                 response.raise_for_status()
-                body = await response.json()
-
-            if not _apply_chat_completion_response(
-                result,
-                body,
-                audio_output_dir=audio_output_dir,
-                sample_id=sample.sample_id,
-            ):
-                return result
+                if stream:
+                    if audio_output_dir:
+                        result.error = "Streaming Video-MME benchmark supports text output only"
+                        return result
+                    if not await _apply_streaming_chat_completion_response(
+                        result,
+                        response,
+                        start_time=start_time,
+                    ):
+                        return result
+                else:
+                    body = await response.json()
+                    if not _apply_chat_completion_response(
+                        result,
+                        body,
+                        audio_output_dir=audio_output_dir,
+                        sample_id=sample.sample_id,
+                    ):
+                        return result
 
             elapsed = time.perf_counter() - start_time
             result.engine_time_s = elapsed
@@ -226,6 +310,11 @@ def build_videomme_result_records(
             "is_correct": False,
             "is_success": False,
             "is_mc_fallback": False,
+            "text_ttft_s": (
+                round(result.text_ttft_s, 4)
+                if result.text_ttft_s is not None
+                else None
+            ),
             "error": result.error,
         }
 
