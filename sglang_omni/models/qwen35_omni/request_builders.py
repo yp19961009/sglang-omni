@@ -6,7 +6,6 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-import xxhash
 
 from sglang_omni.models.qwen3_omni import request_builders as qwen3_builders
 from sglang_omni.models.qwen3_omni.payload_types import Qwen3OmniPipelineState
@@ -230,28 +229,6 @@ def build_sglang_thinker_request(
             if k not in ("capture_model_output_keys", "media_cache_keys")
         }
     capture_keys = thinker_inputs.get("capture_model_output_keys", ())
-    media_cache_keys = thinker_inputs.get("media_cache_keys", {})
-    pad_values: dict[str, int] = {}
-    if media_cache_keys and thinker_config is not None:
-        token_id_map: dict[int, int] = {}
-        for modality, orig_token_id in [
-            ("image", thinker_config.image_token_id),
-            ("video", thinker_config.video_token_id),
-            ("audio", thinker_config.audio_token_id),
-        ]:
-            cache_key = media_cache_keys.get(modality)
-            if cache_key is None:
-                continue
-            h = xxhash.xxh3_64(cache_key.encode()).intdigest()
-            pad_val = vocab_size + h % (1 << 62)
-            pad_values[modality] = pad_val
-            token_id_map[int(orig_token_id)] = pad_val
-        if token_id_map:
-            input_ids = input_ids.clone()
-            for orig_id, pad_val in token_id_map.items():
-                input_ids[input_ids == orig_id] = pad_val
-        if pad_values:
-            model_inputs["pad_values"] = pad_values
     model_inputs.pop("attention_mask", None)
     input_ids_list = input_ids.to(dtype=torch.long).tolist()
 

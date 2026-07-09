@@ -67,7 +67,7 @@ Speed
 | ---------- | ------------------------ | --------- | ------ | -------------- | ---------------- | ------------- | ------------- | ------------------------------ | --------------- | ---------------- | ------------------ | ------------------- | -------------- | ---------------------------------------------------- |
 | Qwen3-Omni | thinker-only, ci-50, c=8 | 50        | 0      | 133.245        | 137.354          | 155.201       | 159.106       | 0.3                            | 43              | 2172             | 21684              | 1084218             | 0.058          | local v1 sweep [H200, ci-50, c=8, max_tokens=256]   |
 
-Local Qwen3.5-Omni S2T Result (this workspace, 2026-07-08)
+Local Qwen3.5-Omni S2T Result (this workspace, 2026-07-08/09)
 
 Accuracy
 
@@ -76,6 +76,7 @@ Accuracy
 | Qwen3.5-Omni | thinker-only, ci-50, c=8                            | 72.00%   | 36/50   | 0      | 0           | local H20 GPU6, qwen35_s2t_align/sglang-qwen35-videoamme-c8-20260708-183040                   |
 | Qwen3.5-Omni | thinker-only, ci-50, c=8, stream=True, video_fps=1  | 64.00%   | 32/50   | 0      | 0           | local H20 GPU6, qwen35_s2t_align/sglang-qwen35-videoamme-c8-fps1-ttft-20260708-185632         |
 | Qwen3.5-Omni | thinker-only, ci-50, c=8, video_fps=1, server TTFT  | 66.00%   | 33/50   | 0      | 0           | local H20 GPU7, qwen35_s2t_align/sglang-videoamme-c8-fps1-postmedia-20260709-081734/ci50_c8  |
+| Qwen3.5-Omni | thinker-only, ci-50, c=8, video_fps=1, no qwen35 cache metadata | 66.00% | 33/50 | 0 | 0 | local H20 GPU7, qwen35_s2t_align/sglang-videoamme-c8-no-cachemeta-20260709-085815/ci50_c8 |
 
 Speed
 
@@ -83,34 +84,53 @@ Speed
 | ------------ | ------------------------ | --------- | ------ | -------------- | ---------------- | ------------- | ------------- | -------------------- | ------------------ | ------------------- | ------------------ | ------------------- | -------------- | ------------------------------------------------------------------------------ |
 | Qwen3.5-Omni | thinker-only, ci-50, c=8 | 50        | 0      | 15.389         | 14.565           | 23.419        | 33.100        | 0.4                  | 7.0                | 345                 | 14763.0            | 738170              | 0.505          | local H20 GPU6, max_tokens=256, fps=2, max_frames=128, max_pixels=401408       |
 | Qwen3.5-Omni | thinker-only, ci-50, c=8, video_fps=1 | 50 | 0 | 9.854 | 10.025 | 13.968 | 17.006 | 0.7 | 7.3 | 364 | 11275.0 | 563752 | 0.778 | local H20 GPU7, max_tokens=256, max_frames=128, max_pixels=401408, server TTFT profile |
+| Qwen3.5-Omni | thinker-only, ci-50, c=8, video_fps=1, no qwen35 cache metadata | 50 | 0 | 9.829 | 9.729 | 14.504 | 15.531 | 0.7 | 7.1 | 357 | 11275.0 | 563752 | 0.795 | local H20 GPU7, max_tokens=256, max_frames=128, max_pixels=401408, qwen35 cache metadata removed |
 
 Server-Side First-Token TTFT / Speed (video_fps=1)
 
 Warmup sample: `002-1` outside the measured profile window; measured set:
 Video-AMME ci-50; max_concurrency=8; non-streaming HTTP responses; thinker CUDA
 graph on; thinker torch.compile on; radix cache disabled; max_tokens=256;
-max_frames=128; max_pixels=401408.
+max_frames=128; max_pixels=401408. The no-cache-metadata run removes qwen35
+`media_cache_keys` / fake media token id propagation while keeping radix cache
+disabled.
 
-| Model        | Config                   | completed | failed | accuracy | latency_mean_s | latency_median_s | latency_p95_s | latency_p99_s | throughput_qps | output_tokens_total | prompt_tokens_total | Source                                                                                      |
-| ------------ | ------------------------ | --------- | ------ | -------- | -------------- | ---------------- | ------------- | ------------- | -------------- | ------------------- | ------------------- | ------------------------------------------------------------------------------------------- |
-| Qwen3.5-Omni | thinker-only, ci-50, c=8 | 50        | 0      | 66.00%   | 9.854          | 10.025           | 13.968        | 17.006        | 0.778          | 364                 | 563752              | local H20 GPU7, qwen35_s2t_align/sglang-videoamme-c8-fps1-postmedia-20260709-081734/ci50_c8 |
+| Model        | Config                                             | completed | failed | accuracy | latency_mean_s | latency_median_s | latency_p95_s | latency_p99_s | throughput_qps | output_tokens_total | prompt_tokens_total | Source                                                                                      |
+| ------------ | -------------------------------------------------- | --------- | ------ | -------- | -------------- | ---------------- | ------------- | ------------- | -------------- | ------------------- | ------------------- | ------------------------------------------------------------------------------------------- |
+| Qwen3.5-Omni | thinker-only, ci-50, c=8                           | 50        | 0      | 66.00%   | 9.854          | 10.025           | 13.968        | 17.006        | 0.778          | 364                 | 563752              | local H20 GPU7, qwen35_s2t_align/sglang-videoamme-c8-fps1-postmedia-20260709-081734/ci50_c8 |
+| Qwen3.5-Omni | thinker-only, ci-50, c=8, no qwen35 cache metadata | 50        | 0      | 66.00%   | 9.829          | 9.729            | 14.504        | 15.531        | 0.795          | 357                 | 563752              | local H20 GPU7, qwen35_s2t_align/sglang-videoamme-c8-no-cachemeta-20260709-085815/ci50_c8 |
 
-| Metric                    | count | mean_ms  | p50_ms   | p95_ms    | max_ms    |
-| ------------------------- | ----- | -------- | -------- | --------- | --------- |
-| request_to_first_token    | 50    | 7810.796 | 7745.798 | 11222.975 | 12080.812 |
-| post_media_to_first_token | 50    | 6073.107 | 6658.167 | 8614.775  | 8858.777  |
-| prefill_to_first_token    | 50    | 1329.771 | 1339.071 | 1994.968  | 2065.155  |
+First-token profiler summary:
 
-| Stage         | Interval                                                   | avg_ms   | p50_ms   | p95_ms   | max_ms   |
-| ------------- | ---------------------------------------------------------- | -------- | -------- | -------- | -------- |
-| preprocessing | stage_input_received->stage_complete                       | 2035.973 | 1710.155 | 4519.683 | 5982.146 |
-| preprocessing | preprocess_media_load_start->preprocess_media_load_end     | 515.858  | 504.705  | 759.564  | 849.651  |
-| preprocessing | preprocess_hf_processor_start->preprocess_hf_processor_end | 268.152  | 288.980  | 325.965  | 334.985  |
-| image_encoder | stage_input_received->stage_complete                       | 2484.427 | 2374.044 | 4314.467 | 5039.534 |
-| audio_encoder | stage_input_received->stage_complete                       | 3258.032 | 3195.976 | 5602.437 | 7134.064 |
-| mm_aggregate  | stage_input_received->stage_complete                       | 3264.520 | 3195.684 | 5602.417 | 7134.757 |
-| thinker       | scheduler_prefill_start->scheduler_first_emit              | 1329.771 | 1339.070 | 1994.968 | 2065.155 |
-| decode        | stage_input_received->stage_complete                       | 1.605    | 0.615    | 1.407    | 34.441   |
+| Run                       | Metric                    | count | mean_ms  | p50_ms   | p95_ms    | max_ms    |
+| ------------------------- | ------------------------- | ----- | -------- | -------- | --------- | --------- |
+| server TTFT baseline      | request_to_first_token    | 50    | 7810.796 | 7745.798 | 11222.975 | 12080.812 |
+| server TTFT baseline      | post_media_to_first_token | 50    | 6073.107 | 6658.167 | 8614.775  | 8858.777  |
+| server TTFT baseline      | prefill_to_first_token    | 50    | 1329.771 | 1339.071 | 1994.968  | 2065.155  |
+| no qwen35 cache metadata  | request_to_first_token    | 50    | 8020.857 | 7623.649 | 11630.533 | 11934.907 |
+| no qwen35 cache metadata  | post_media_to_first_token | 50    | 6137.068 | 6478.907 | 8421.332  | 9031.351  |
+| no qwen35 cache metadata  | prefill_to_first_token    | 50    | 1244.348 | 1330.549 | 1622.105  | 1795.375  |
+
+Stage profile summary:
+
+| Run                       | Stage         | Interval                                                   | avg_ms   | p50_ms   | p95_ms   | max_ms   |
+| ------------------------- | ------------- | ---------------------------------------------------------- | -------- | -------- | -------- | -------- |
+| server TTFT baseline      | preprocessing | stage_input_received->stage_complete                       | 2035.973 | 1710.155 | 4519.683 | 5982.146 |
+| server TTFT baseline      | preprocessing | preprocess_media_load_start->preprocess_media_load_end     | 515.858  | 504.705  | 759.564  | 849.651  |
+| server TTFT baseline      | preprocessing | preprocess_hf_processor_start->preprocess_hf_processor_end | 268.152  | 288.980  | 325.965  | 334.985  |
+| server TTFT baseline      | image_encoder | stage_input_received->stage_complete                       | 2484.427 | 2374.044 | 4314.467 | 5039.534 |
+| server TTFT baseline      | audio_encoder | stage_input_received->stage_complete                       | 3258.032 | 3195.976 | 5602.437 | 7134.064 |
+| server TTFT baseline      | mm_aggregate  | stage_input_received->stage_complete                       | 3264.520 | 3195.684 | 5602.417 | 7134.757 |
+| server TTFT baseline      | thinker       | scheduler_prefill_start->scheduler_first_emit              | 1329.771 | 1339.070 | 1994.968 | 2065.155 |
+| server TTFT baseline      | decode        | stage_input_received->stage_complete                       | 1.605    | 0.615    | 1.407    | 34.441   |
+| no qwen35 cache metadata  | preprocessing | stage_input_received->stage_complete                       | 2191.674 | 1667.591 | 4674.976 | 6120.545 |
+| no qwen35 cache metadata  | preprocessing | preprocess_media_load_start->preprocess_media_load_end     | 518.366  | 512.874  | 751.186  | 834.064  |
+| no qwen35 cache metadata  | preprocessing | preprocess_hf_processor_start->preprocess_hf_processor_end | 289.592  | 305.867  | 354.259  | 400.634  |
+| no qwen35 cache metadata  | image_encoder | stage_input_received->stage_complete                       | 2510.664 | 2438.798 | 4196.444 | 5827.525 |
+| no qwen35 cache metadata  | audio_encoder | stage_input_received->stage_complete                       | 2927.244 | 3188.097 | 4747.820 | 6467.760 |
+| no qwen35 cache metadata  | mm_aggregate  | stage_input_received->stage_complete                       | 3293.897 | 3392.545 | 4747.876 | 6467.785 |
+| no qwen35 cache metadata  | thinker       | scheduler_prefill_start->scheduler_first_emit              | 1244.348 | 1330.549 | 1622.105 | 1795.375 |
+| no qwen35 cache metadata  | decode        | stage_input_received->stage_complete                       | 0.975    | 0.556    | 1.619    | 15.917   |
 
 Streaming TTFT / Speed (video_fps=1)
 
