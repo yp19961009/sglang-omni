@@ -864,18 +864,35 @@ class OmniScheduler:
             if rid in skip_rids:
                 continue
             req_output = mr_output.outputs[rid]
-            emitted_any = False
+            if self._is_first_generated_token(sched_req.data, req_output):
+                self._emit_first_token_event(rid)
             for msg in self._stream_output_builder(rid, sched_req.data, req_output):
-                if not emitted_any:
-                    if rid not in self._first_emit_done:
-                        self._first_emit_done.add(rid)
-                        _emit_event(
-                            request_id=rid,
-                            stage=None,
-                            event_name="scheduler_first_emit",
-                        )
-                    emitted_any = True
                 self.outbox.put(msg)
+
+    def _is_first_generated_token(self, req_data: Any, req_output: Any) -> bool:
+        """Return true when this model output contains the first sampled token.
+
+        Text-only Qwen3/3.5 requests may not forward per-token stream chunks to
+        the decode stage unless client streaming is enabled, but the scheduler
+        still observes token ids as they are sampled. This detector keeps the
+        first-token profiler event independent from downstream streaming.
+        """
+        if getattr(req_output, "data", None) is None:
+            return False
+        req = getattr(req_data, "req", None)
+        if req is not None and int(getattr(req, "is_chunked", 0) or 0) > 0:
+            return False
+        return True
+
+    def _emit_first_token_event(self, request_id: str) -> None:
+        if request_id in self._first_emit_done:
+            return
+        self._first_emit_done.add(request_id)
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name="scheduler_first_emit",
+        )
 
     @staticmethod
     def _make_batch_result(batch, mr_output):

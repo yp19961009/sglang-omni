@@ -9,6 +9,7 @@ from pathlib import Path
 
 from sglang_omni.profiler.views import (
     build_report,
+    first_token_ttft,
     hop_breakdown,
     reconstruct_timelines,
     stage_breakdown,
@@ -378,7 +379,48 @@ def test_stage_breakdown_uses_prefill_start_not_queue_enter(
     assert all("scheduler_queue_enter->" not in r.interval_name for r in rows)
 
 
-def test_build_report_returns_all_three_views(tmp_path: Path) -> None:
+def test_first_token_ttft_reports_request_and_prefill_durations(
+    tmp_path: Path,
+) -> None:
+    events = [
+        _ev("r1", "preprocessing", "stage_input_received", 1_000_000),
+        _ev("r1", "preprocessing", "preprocess_hf_processor_start", 4_000_000),
+        _ev("r1", "preprocessing", "stage_complete", 6_000_000),
+        _ev("r1", "thinker", "scheduler_prefill_start", 10_000_000),
+        _ev("r1", "thinker", "scheduler_first_emit", 15_000_000),
+    ]
+    _write_events(tmp_path / "events_x.jsonl", events)
+    rows = first_token_ttft(source=tmp_path)
+
+    assert rows == [
+        {
+            "request_id": "r1",
+            "stage": "thinker",
+            "request_to_first_token_ms": 14.0,
+            "post_media_to_first_token_ms": 11.0,
+            "prefill_to_first_token_ms": 5.0,
+        }
+    ]
+
+    report = build_report(tmp_path)
+    assert report["first_token_ttft"] == rows
+    assert report["first_token_ttft_summary"]["request_to_first_token"] == {
+        "count": 1,
+        "mean_ms": 14.0,
+        "p50_ms": 14.0,
+        "p95_ms": 14.0,
+        "max_ms": 14.0,
+    }
+    assert report["first_token_ttft_summary"]["post_media_to_first_token"] == {
+        "count": 1,
+        "mean_ms": 11.0,
+        "p50_ms": 11.0,
+        "p95_ms": 11.0,
+        "max_ms": 11.0,
+    }
+
+
+def test_build_report_returns_all_views(tmp_path: Path) -> None:
     events = [
         _ev("r1", "coordinator", "request_admission", 0),
         _ev("r1", "encoder", "stage_input_received", 100, from_stage="coordinator"),
@@ -402,3 +444,5 @@ def test_build_report_returns_all_three_views(tmp_path: Path) -> None:
     assert any(
         r["src"] == "encoder" and r["dst"] == "thinker" for r in rep["hop_breakdown"]
     )
+    assert "first_token_ttft" in rep
+    assert "first_token_ttft_summary" in rep

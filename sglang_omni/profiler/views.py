@@ -387,17 +387,159 @@ def hop_breakdown(
 
 
 # ---------------------------------------------------------------------------
+# View 4: first generated token TTFT
+# ---------------------------------------------------------------------------
+
+
+def _first_event(
+    events: list[dict[str, Any]],
+    *,
+    name: str,
+    stage: str | None = None,
+) -> dict[str, Any] | None:
+    for ev in events:
+        if ev.get("event_name") != name:
+            continue
+        if stage is not None and ev.get("stage") != stage:
+            continue
+        return ev
+    return None
+
+
+def _first_event_before_or_at(
+    events: list[dict[str, Any]],
+    *,
+    name: str,
+    stage: str | None = None,
+    close_ns: int,
+) -> dict[str, Any] | None:
+    matched: dict[str, Any] | None = None
+    for ev in events:
+        if ev.get("event_name") != name:
+            continue
+        if stage is not None and ev.get("stage") != stage:
+            continue
+        if int(ev.get("timestamp_ns", 0)) > close_ns:
+            break
+        matched = ev
+    return matched
+
+
+def first_token_ttft(
+    timelines: dict[str, RequestTimeline] | None = None,
+    *,
+    source: str | Path | Iterable[str | Path] | None = None,
+) -> list[dict[str, Any]]:
+    """Return per-request first generated token timings.
+
+    ``scheduler_first_emit`` is emitted by the AR scheduler when the first
+    sampled token is observed, before detokenization and before client SSE
+    delivery. ``request_to_first_token_ms`` anchors at the first profiler event
+    for the request, ``post_media_to_first_token_ms`` starts after media load /
+    frame extraction / resize and before the HF processor, while
+    ``prefill_to_first_token_ms`` isolates the thinker prefill/first-token
+    portion.
+    """
+    if timelines is None:
+        if source is None:
+            raise ValueError("first_token_ttft requires timelines or source")
+        timelines = reconstruct_timelines(source)
+
+    rows: list[dict[str, Any]] = []
+    for rid, tl in timelines.items():
+        token_ev = _first_event(tl.events, name="scheduler_first_emit")
+        if token_ev is None or tl.t0_ns is None:
+            continue
+
+        stage = str(token_ev.get("stage") or "unknown")
+        token_ns = int(token_ev.get("timestamp_ns", 0))
+        prefill_ev = _first_event_before_or_at(
+            tl.events,
+            name="scheduler_prefill_start",
+            stage=stage,
+            close_ns=token_ns,
+        )
+        prefill_ms = None
+        if prefill_ev is not None:
+            prefill_ms = (token_ns - int(prefill_ev["timestamp_ns"])) / 1e6
+
+        post_media_ev = _first_event_before_or_at(
+            tl.events,
+            name="preprocess_hf_processor_start",
+            close_ns=token_ns,
+        )
+        post_media_ms = None
+        if post_media_ev is not None:
+            post_media_ms = (token_ns - int(post_media_ev["timestamp_ns"])) / 1e6
+
+        rows.append(
+            {
+                "request_id": rid,
+                "stage": stage,
+                "request_to_first_token_ms": round((token_ns - tl.t0_ns) / 1e6, 3),
+                "post_media_to_first_token_ms": (
+                    round(post_media_ms, 3) if post_media_ms is not None else None
+                ),
+                "prefill_to_first_token_ms": (
+                    round(prefill_ms, 3) if prefill_ms is not None else None
+                ),
+            }
+        )
+    rows.sort(key=lambda r: r["request_to_first_token_ms"])
+    return rows
+
+
+def _metric_summary(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {}
+    ordered = sorted(values)
+    return {
+        "count": len(ordered),
+        "mean_ms": round(sum(ordered) / len(ordered), 3),
+        "p50_ms": round(_percentile(ordered, 0.50), 3),
+        "p95_ms": round(_percentile(ordered, 0.95), 3),
+        "max_ms": round(ordered[-1], 3),
+    }
+
+
+def first_token_ttft_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    request_values = [
+        float(row["request_to_first_token_ms"])
+        for row in rows
+        if row.get("request_to_first_token_ms") is not None
+    ]
+    prefill_values = [
+        float(row["prefill_to_first_token_ms"])
+        for row in rows
+        if row.get("prefill_to_first_token_ms") is not None
+    ]
+    post_media_values = [
+        float(row["post_media_to_first_token_ms"])
+        for row in rows
+        if row.get("post_media_to_first_token_ms") is not None
+    ]
+    return {
+        "request_to_first_token": _metric_summary(request_values),
+        "post_media_to_first_token": _metric_summary(post_media_values),
+        "prefill_to_first_token": _metric_summary(prefill_values),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Report helpers
 # ---------------------------------------------------------------------------
 
 
 def build_report(source: str | Path | Iterable[str | Path]) -> dict[str, Any]:
-    """Return all three views as a single dict for JSON serialization."""
+    """Return every profiler view as a single dict for JSON serialization."""
     timelines = reconstruct_timelines(source)
+    token_ttft_rows = first_token_ttft(timelines)
     return {
         "timelines": {rid: tl.to_relative() for rid, tl in timelines.items()},
         "stage_breakdown": [row.to_dict() for row in stage_breakdown(timelines)],
         "hop_breakdown": [row.to_dict() for row in hop_breakdown(timelines)],
+        "first_token_ttft": token_ttft_rows,
+        "first_token_ttft_summary": first_token_ttft_summary(token_ttft_rows),
         "request_count": len(timelines),
     }
 

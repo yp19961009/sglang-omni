@@ -74,7 +74,7 @@ Supporting events used for finer-grained breakdown:
 | Stage | `stage_stream_chunk_sent` | Each stream chunk (metadata `to_stage`, `chunk_id`, `modality`) |
 | Stage | `stage_stream_chunk_received` | Each stream chunk materialized and ready for the receiver scheduler, including coordinator terminal chunks |
 | AR scheduler | `scheduler_queue_enter` | Built request entered the scheduler queue |
-| AR scheduler | `scheduler_first_emit` | First `stream_output_builder` emission per request |
+| AR scheduler | `scheduler_first_emit` | First sampled token observed by the scheduler per request |
 
 Custom callsites can call `sglang_omni.profiler.event_recorder.emit(...)` to
 add domain-specific events. Events from inactive recorders are no-ops, so
@@ -155,7 +155,7 @@ python -m sglang_omni.profiler /tmp/profiles/demo-run/events --format table
 python -m sglang_omni.profiler /tmp/profiles/demo-run/events --format json --out report.json
 ```
 
-The CLI / `build_report` returns three views derived from the same event
+The CLI / `build_report` returns four views derived from the same event
 stream:
 
 1. **Timeline** — per-request event list with `t_rel_ms` anchored at
@@ -170,6 +170,12 @@ stream:
    `stage_stream_chunk_sent` / `stage_stream_chunk_received` durations per
    (source, destination, kind). Terminal stage stream chunks are paired the
    same way with destination `coordinator`.
+4. **First-token TTFT** — per-request timing to `scheduler_first_emit`.
+   `request_to_first_token_ms` starts from the first profiler event for the
+   request; `post_media_to_first_token_ms` starts from
+   `preprocess_hf_processor_start`, after media loading / frame extraction /
+   resize and before the HF processor; `prefill_to_first_token_ms` starts from
+   the same-stage `scheduler_prefill_start`.
 
 Hop pairs match across processes by `(request_id, source_stage, dest_stage,
 chunk_id?)`, so a single request's path through subprocesses can be

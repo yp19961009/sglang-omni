@@ -75,18 +75,111 @@ Accuracy
 | ------------ | --------------------------------------------------- | -------- | ------- | ------ | ----------- | --------------------------------------------------------------------------------------------- |
 | Qwen3.5-Omni | thinker-only, ci-50, c=8                            | 72.00%   | 36/50   | 0      | 0           | local H20 GPU6, qwen35_s2t_align/sglang-qwen35-videoamme-c8-20260708-183040                   |
 | Qwen3.5-Omni | thinker-only, ci-50, c=8, stream=True, video_fps=1  | 64.00%   | 32/50   | 0      | 0           | local H20 GPU6, qwen35_s2t_align/sglang-qwen35-videoamme-c8-fps1-ttft-20260708-185632         |
+| Qwen3.5-Omni | thinker-only, ci-50, c=8, video_fps=1, server TTFT  | 66.00%   | 33/50   | 0      | 0           | local H20 GPU7, qwen35_s2t_align/sglang-videoamme-c8-fps1-postmedia-20260709-081734/ci50_c8  |
 
 Speed
 
 | Model        | Config                   | completed | failed | latency_mean_s | latency_median_s | latency_p95_s | latency_p99_s | output_tok_per_req_s | output_tokens_mean | output_tokens_total | prompt_tokens_mean | prompt_tokens_total | throughput_qps | Source                                                                         |
 | ------------ | ------------------------ | --------- | ------ | -------------- | ---------------- | ------------- | ------------- | -------------------- | ------------------ | ------------------- | ------------------ | ------------------- | -------------- | ------------------------------------------------------------------------------ |
 | Qwen3.5-Omni | thinker-only, ci-50, c=8 | 50        | 0      | 15.389         | 14.565           | 23.419        | 33.100        | 0.4                  | 7.0                | 345                 | 14763.0            | 738170              | 0.505          | local H20 GPU6, max_tokens=256, fps=2, max_frames=128, max_pixels=401408       |
+| Qwen3.5-Omni | thinker-only, ci-50, c=8, video_fps=1 | 50 | 0 | 9.854 | 10.025 | 13.968 | 17.006 | 0.7 | 7.3 | 364 | 11275.0 | 563752 | 0.778 | local H20 GPU7, max_tokens=256, max_frames=128, max_pixels=401408, server TTFT profile |
+
+Server-Side First-Token TTFT / Speed (video_fps=1)
+
+Warmup sample: `002-1` outside the measured profile window; measured set:
+Video-AMME ci-50; max_concurrency=8; non-streaming HTTP responses; thinker CUDA
+graph on; thinker torch.compile on; radix cache disabled; max_tokens=256;
+max_frames=128; max_pixels=401408.
+
+| Model        | Config                   | completed | failed | accuracy | latency_mean_s | latency_median_s | latency_p95_s | latency_p99_s | throughput_qps | output_tokens_total | prompt_tokens_total | Source                                                                                      |
+| ------------ | ------------------------ | --------- | ------ | -------- | -------------- | ---------------- | ------------- | ------------- | -------------- | ------------------- | ------------------- | ------------------------------------------------------------------------------------------- |
+| Qwen3.5-Omni | thinker-only, ci-50, c=8 | 50        | 0      | 66.00%   | 9.854          | 10.025           | 13.968        | 17.006        | 0.778          | 364                 | 563752              | local H20 GPU7, qwen35_s2t_align/sglang-videoamme-c8-fps1-postmedia-20260709-081734/ci50_c8 |
+
+| Metric                    | count | mean_ms  | p50_ms   | p95_ms    | max_ms    |
+| ------------------------- | ----- | -------- | -------- | --------- | --------- |
+| request_to_first_token    | 50    | 7810.796 | 7745.798 | 11222.975 | 12080.812 |
+| post_media_to_first_token | 50    | 6073.107 | 6658.167 | 8614.775  | 8858.777  |
+| prefill_to_first_token    | 50    | 1329.771 | 1339.071 | 1994.968  | 2065.155  |
+
+| Stage         | Interval                                                   | avg_ms   | p50_ms   | p95_ms   | max_ms   |
+| ------------- | ---------------------------------------------------------- | -------- | -------- | -------- | -------- |
+| preprocessing | stage_input_received->stage_complete                       | 2035.973 | 1710.155 | 4519.683 | 5982.146 |
+| preprocessing | preprocess_media_load_start->preprocess_media_load_end     | 515.858  | 504.705  | 759.564  | 849.651  |
+| preprocessing | preprocess_hf_processor_start->preprocess_hf_processor_end | 268.152  | 288.980  | 325.965  | 334.985  |
+| image_encoder | stage_input_received->stage_complete                       | 2484.427 | 2374.044 | 4314.467 | 5039.534 |
+| audio_encoder | stage_input_received->stage_complete                       | 3258.032 | 3195.976 | 5602.437 | 7134.064 |
+| mm_aggregate  | stage_input_received->stage_complete                       | 3264.520 | 3195.684 | 5602.417 | 7134.757 |
+| thinker       | scheduler_prefill_start->scheduler_first_emit              | 1329.771 | 1339.070 | 1994.968 | 2065.155 |
+| decode        | stage_input_received->stage_complete                       | 1.605    | 0.615    | 1.407    | 34.441   |
 
 Streaming TTFT / Speed (video_fps=1)
 
 | Model        | Config                                             | completed | failed | latency_mean_s | latency_median_s | latency_p95_s | latency_p99_s | text_ttft_mean_s | text_ttft_median_s | text_ttft_p95_s | text_ttft_p99_s | output_tok_per_req_s | output_tokens_mean | output_tokens_total | prompt_tokens_mean | prompt_tokens_total | throughput_qps | Source                                                                         |
 | ------------ | -------------------------------------------------- | --------- | ------ | -------------- | ---------------- | ------------- | ------------- | ---------------- | ------------------ | --------------- | --------------- | -------------------- | ------------------ | ------------------- | ------------------ | ------------------- | -------------- | ------------------------------------------------------------------------------ |
 | Qwen3.5-Omni | thinker-only, ci-50, c=8, stream=True, video_fps=1 | 50        | 0      | 10.514         | 10.332           | 15.499        | 17.005        | 8.1495           | 8.1984             | 10.8445         | 12.2999         | 0.6                  | 7.0                | 340                 | 11275.0            | 563752              | 0.744          | local H20 GPU6, max_tokens=256, max_frames=128, max_pixels=401408              |
+
+Single Request First-Token TTFT / Speed (video_fps=1)
+
+Warmup sample: `002-1`; measured sample: `001-1`; single concurrency;
+thinker CUDA graph on; thinker torch.compile on; radix cache disabled;
+max_tokens=256; max_frames=128; max_pixels=401408.
+
+Metric notes:
+
+- `latency_mean_s` is client-side end-to-end request latency for the measured
+  request.
+- `request_to_first_token_ms` is server-side profiler time from the first
+  recorded request event, typically coordinator admission or preprocessing input
+  receipt, to `scheduler_first_emit`, the first sampled token observed by the
+  thinker scheduler. It includes preprocessing, media load / video decode /
+  frame sampling / resize, HF processor, cross-process payload transfer,
+  image/audio encoder, multimodal aggregation, thinker request build, and
+  thinker prefill to first token. It does not include client-side HTTP time,
+  detokenization/decode stage output, SSE delivery, or later tokens.
+- `post_media_to_first_token_ms` starts from `preprocess_hf_processor_start`,
+  after media loading / video decode / frame sampling / resize and before the HF
+  processor, then ends at the same first sampled token event.
+- `prefill_to_first_token_ms` starts from thinker `scheduler_prefill_start` and
+  isolates the thinker prefill-to-first-token portion.
+- Stage profile rows with `stage_input_received->stage_complete` are stage wall
+  times. Aggregation stages can include waiting for upstream encoder results;
+  for example `mm_aggregate` is not pure compute time.
+
+| Model        | Config                                      | completed | failed | latency_mean_s | output_tokens_total | prompt_tokens_total | request_to_first_token_ms | post_media_to_first_token_ms | prefill_to_first_token_ms | Source                                                                                       |
+| ------------ | ------------------------------------------- | --------- | ------ | -------------- | ------------------- | ------------------- | ------------------------- | ---------------------------- | ------------------------ | -------------------------------------------------------------------------------------------- |
+| Qwen3.5-Omni | thinker-only, sample=001-1, warmup=002-1    | 1         | 0      | 1.978          | 4                   | 8698                | 1959.392                  | 1483.578                     | 401.589                  | local H20 GPU7, qwen35_s2t_align/sglang-single-001-1-fps1-postmedia-20260709-080452          |
+
+Single Request Stage Profile (video_fps=1, sample=001-1)
+
+| Stage         | Interval                                                   | total_ms |
+| ------------- | ---------------------------------------------------------- | -------- |
+| preprocessing | stage_input_received->stage_complete                       | 738.749  |
+| preprocessing | preprocess_media_load_start->preprocess_media_load_end     | 473.605  |
+| preprocessing | preprocess_hf_processor_start->preprocess_hf_processor_end | 231.383  |
+| image_encoder | stage_input_received->stage_complete                       | 517.433  |
+| audio_encoder | stage_input_received->stage_complete                       | 516.063  |
+| mm_aggregate  | stage_input_received->stage_complete                       | 516.008  |
+| thinker       | scheduler_prefill_start->scheduler_first_emit              | 401.589  |
+| decode        | stage_input_received->stage_complete                       | 0.392    |
+
+Single Request Critical Path To First Token (video_fps=1, sample=001-1)
+
+This table reconciles `post_media_to_first_token_ms` with the stage profile.
+It starts at `preprocess_hf_processor_start` and follows the critical path to
+`scheduler_first_emit`. Stage wall times are not directly additive because
+encoder stages run in parallel and `mm_aggregate` waits for upstream results.
+
+| Segment                                                      | delta_ms |
+| ------------------------------------------------------------ | -------- |
+| preprocess_hf_processor_start -> preprocess_hf_processor_end | 231.383  |
+| preprocess_hf_processor_end -> preprocessing stage_complete  | 31.870   |
+| preprocessing stage_complete -> audio_encoder input          | 293.475  |
+| audio_encoder input -> audio_encoder stage_complete          | 516.063  |
+| audio_encoder stage_complete -> mm_aggregate stage_complete  | 0.558    |
+| mm_aggregate stage_complete -> thinker input                 | 0.114    |
+| thinker input -> scheduler_prefill_start                     | 8.526    |
+| scheduler_prefill_start -> scheduler_first_emit              | 401.589  |
+| **post_media_to_first_token_ms**                             | **1483.578** |
 """
 
 from __future__ import annotations

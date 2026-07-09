@@ -216,6 +216,22 @@ def _log_client_profile(
                 ["src", "dst", "kind", "count", "total_ms", "avg_ms", "p95_ms"],
             ).rstrip(),
         )
+    first_token_rows = report.get("first_token_ttft", [])
+    if first_token_rows:
+        LOGGER.info(
+            "[%s] first_token_ttft:\n%s",
+            engine,
+            format_table(
+                first_token_rows,
+                [
+                    "request_id",
+                    "stage",
+                    "request_to_first_token_ms",
+                    "post_media_to_first_token_ms",
+                    "prefill_to_first_token_ms",
+                ],
+            ).rstrip(),
+        )
 
 
 def _find_snapshot(root: Path, repo_dir: str) -> Path:
@@ -575,6 +591,10 @@ def run_client(args: argparse.Namespace) -> dict[str, Any]:
             "request_count": profile_report.get("request_count"),
             "stage_breakdown": profile_report.get("stage_breakdown", []),
             "hop_breakdown": profile_report.get("hop_breakdown", []),
+            "first_token_ttft": profile_report.get("first_token_ttft", []),
+            "first_token_ttft_summary": profile_report.get(
+                "first_token_ttft_summary", {}
+            ),
         }
     if args.output:
         _write_json(Path(args.output), result)
