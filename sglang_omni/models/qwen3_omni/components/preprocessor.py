@@ -27,6 +27,8 @@ from sglang_omni.preprocessing import (
     ensure_chat_template,
     ensure_image_list_async,
     ensure_video_list_async,
+    materialize_preprocessed_audio_list,
+    materialize_preprocessed_video_list,
     normalize_messages,
 )
 from sglang_omni.profiler.event_recorder import emit as _emit_event
@@ -300,7 +302,35 @@ class Qwen3OmniPreprocessor:
             messages = inputs.get("messages", [])
             raw_images = inputs.get("images")
             raw_videos = inputs.get("videos") or inputs.get("video")
+            preprocessed_videos = inputs.get("preprocessed_videos")
+            if preprocessed_videos is None:
+                preprocessed_videos = inputs.get("loaded_videos")
+            preprocessed_video_fps = inputs.get("preprocessed_video_fps")
+            if preprocessed_video_fps is None:
+                preprocessed_video_fps = inputs.get("loaded_video_fps")
+            video_source_preprocessed = preprocessed_videos is not None
+            if video_source_preprocessed:
+                if raw_videos is not None:
+                    raise ValueError(
+                        "Provide either videos/video or preprocessed_videos, "
+                        "not both."
+                    )
+                raw_videos = preprocessed_videos
             raw_audios = inputs.get("audio") or inputs.get("audios")
+            preprocessed_audios = inputs.get("preprocessed_audios")
+            if preprocessed_audios is None:
+                preprocessed_audios = inputs.get("loaded_audios")
+            preprocessed_audio_sample_rate = inputs.get("preprocessed_audio_sample_rate")
+            if preprocessed_audio_sample_rate is None:
+                preprocessed_audio_sample_rate = inputs.get("loaded_audio_sample_rate")
+            audio_source_preprocessed = preprocessed_audios is not None
+            if audio_source_preprocessed:
+                if raw_audios is not None:
+                    raise ValueError(
+                        "Provide either audio/audios or preprocessed_audios, "
+                        "not both."
+                    )
+                raw_audios = preprocessed_audios
             audio_target_sr = int(inputs.get("audio_target_sr", 16000))
             video_fps = inputs.get("video_fps", self.default_video_fps)
             video_max_frames = inputs.get(
@@ -352,8 +382,16 @@ class Qwen3OmniPreprocessor:
             _emit_preprocess_event(payload, "preprocess_cache_key_start")
             try:
                 image_cache_key = compute_image_cache_key(raw_images)
-                raw_audio_cache_key = compute_audio_cache_key(raw_audios)
-                video_cache_key = compute_video_cache_key(raw_videos)
+                raw_audio_cache_key = (
+                    None
+                    if audio_source_preprocessed
+                    else compute_audio_cache_key(raw_audios)
+                )
+                video_cache_key = (
+                    None
+                    if video_source_preprocessed
+                    else compute_video_cache_key(raw_videos)
+                )
             finally:
                 _emit_preprocess_event(payload, "preprocess_cache_key_end")
 
@@ -363,15 +401,26 @@ class Qwen3OmniPreprocessor:
                     len(raw_audios) if isinstance(raw_audios, list) else 1
                 )
 
-            # Use async versions for concurrent loading
-            # If we need audio from video, extract it during video loading to avoid duplicate downloads
+            # Use async versions for concurrent loading. If videos are already
+            # decoded/sampled/resized, only materialize the provided tensor/spec and
+            # skip the expensive media reader path.
             extract_audio_from_video_flag = bool(use_audio_in_video and raw_videos)
+            if video_source_preprocessed and extract_audio_from_video_flag:
+                raise ValueError(
+                    "use_audio_in_video is not supported with preprocessed_videos; "
+                    "pass explicit audios instead."
+                )
 
             _emit_preprocess_event(payload, "preprocess_media_load_start")
-            try: # decode / 抽帧 / resize 之后就可以给 hf process
-                images, videos_result, audios_result = await asyncio.gather(
-                    ensure_image_list_async(raw_images),
-                    ensure_video_list_async(
+            try:
+                video_task = (
+                    asyncio.to_thread(
+                        materialize_preprocessed_video_list,
+                        raw_videos,
+                        default_fps=preprocessed_video_fps,
+                    )
+                    if video_source_preprocessed
+                    else ensure_video_list_async(
                         raw_videos,
                         fps=resolved_video_fps,
                         max_frames=resolved_video_max_frames,
@@ -380,8 +429,22 @@ class Qwen3OmniPreprocessor:
                         total_pixels=resolved_video_total_pixels,
                         extract_audio=extract_audio_from_video_flag,
                         audio_target_sr=audio_target_sr,
-                    ),
-                    ensure_audio_list_async(raw_audios, target_sr=audio_target_sr),
+                    )
+                )
+                audio_task = (
+                    asyncio.to_thread(
+                        materialize_preprocessed_audio_list,
+                        raw_audios,
+                        target_sr=audio_target_sr,
+                        default_sample_rate=preprocessed_audio_sample_rate,
+                    )
+                    if audio_source_preprocessed
+                    else ensure_audio_list_async(raw_audios, target_sr=audio_target_sr)
+                )
+                images, videos_result, audios_result = await asyncio.gather(
+                    ensure_image_list_async(raw_images),
+                    video_task,
+                    audio_task,
                 )
             finally:
                 _emit_preprocess_event(payload, "preprocess_media_load_end")
@@ -434,6 +497,10 @@ class Qwen3OmniPreprocessor:
             resolved_video_total_pixels = None
             resolved_video_seconds_per_chunk = None
             resolved_video_position_id_per_seconds = None
+            preprocessed_video_fps = None
+            video_source_preprocessed = False
+            preprocessed_audio_sample_rate = None
+            audio_source_preprocessed = False
 
         _emit_preprocess_event(payload, "preprocess_prompt_start")
         try:

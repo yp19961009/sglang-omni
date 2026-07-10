@@ -28,6 +28,8 @@ _LAZY_EXPORTS = {
     "ensure_video_list_async": "sglang_omni.preprocessing.video",
     "ImageMediaIO": "sglang_omni.preprocessing.image",
     "load_chat_template": "sglang_omni.preprocessing.text",
+    "materialize_preprocessed_audio_list": "sglang_omni.preprocessing.audio",
+    "materialize_preprocessed_video_list": "sglang_omni.preprocessing.video",
     "normalize_messages": "sglang_omni.preprocessing.text",
     "VideoMediaIO": "sglang_omni.preprocessing.video",
 }
@@ -49,6 +51,8 @@ __all__ = [
     "get_global_resource_connector",
     "ImageMediaIO",
     "load_chat_template",
+    "materialize_preprocessed_audio_list",
+    "materialize_preprocessed_video_list",
     "MultiModalResourceConnector",
     "MediaIO",
     "normalize_messages",

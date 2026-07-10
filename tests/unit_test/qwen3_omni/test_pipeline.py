@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from types import SimpleNamespace
 
@@ -279,6 +280,69 @@ def test_qwen_preprocess_pretokenized_builds_thinker_state_from_ids() -> None:
     assert state.prompt["attention_mask"].tolist() == [1, 1, 1]
     assert state.encoder_inputs["image_encoder"]["_skip"] is True
     assert state.encoder_inputs["audio_encoder"]["_skip"] is True
+
+
+def test_qwen_preprocess_accepts_preprocessed_media(monkeypatch) -> None:
+    from sglang_omni.models.qwen3_omni.components import preprocessor as pre_mod
+
+    calls = {}
+
+    def fake_video(videos, *, default_fps=None):
+        calls["video"] = (videos, default_fps)
+        return ["video-array"], [float(default_fps)], None
+
+    def fake_audio(audios, *, target_sr=16000, default_sample_rate=None):
+        calls["audio"] = (audios, target_sr, default_sample_rate)
+        return ["audio-array"]
+
+    class FakeProcessor:
+        def apply_chat_template(self, messages, **kwargs):
+            calls["messages"] = messages
+            return "prompt"
+
+        def __call__(self, *, videos=None, audio=None, **kwargs):
+            calls["processor_videos"] = videos
+            calls["processor_audio"] = audio
+            return {
+                "input_ids": torch.tensor([[1, 2]], dtype=torch.long),
+                "attention_mask": torch.ones(1, 2, dtype=torch.long),
+            }
+
+    monkeypatch.setattr(pre_mod, "materialize_preprocessed_video_list", fake_video)
+    monkeypatch.setattr(pre_mod, "materialize_preprocessed_audio_list", fake_audio)
+
+    pre = object.__new__(pre_mod.Qwen3OmniPreprocessor)
+    pre.max_seq_len = None
+    pre.default_video_fps = None
+    pre.default_video_max_frames = None
+    pre.default_video_min_pixels = None
+    pre.default_video_max_pixels = None
+    pre.default_video_total_pixels = None
+    pre.processor = FakeProcessor()
+
+    payload = StagePayload(
+        request_id="req-preprocessed",
+        request=OmniRequest(
+            inputs={
+                "messages": [{"role": "user", "content": "hi"}],
+                "preprocessed_videos": [{"path": "/tmp/video.pt"}],
+                "preprocessed_video_fps": 1.5,
+                "preprocessed_audios": [{"path": "/tmp/audio.pt"}],
+                "preprocessed_audio_sample_rate": 8000,
+            },
+            params={"max_new_tokens": 4},
+        ),
+        data=None,
+    )
+
+    out = asyncio.run(pre._call_impl(payload))
+
+    assert calls["video"] == ([{"path": "/tmp/video.pt"}], 1.5)
+    assert calls["audio"] == ([{"path": "/tmp/audio.pt"}], 16000, 8000)
+    assert calls["processor_videos"] == ["video-array"]
+    assert calls["processor_audio"] == ["audio-array"]
+    state = Qwen3OmniPipelineState.from_dict(out.data)
+    assert state.prompt["input_ids"].tolist() == [1, 2]
 
 
 def test_qwen_talker_to_code2wav_projection_keeps_only_request_latch() -> None:

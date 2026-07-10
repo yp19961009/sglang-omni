@@ -66,6 +66,20 @@ class ChatCompletionRequest(BaseModel):
     # Audio input (sglang-omni extension)
     # Can be a list of audio file paths (local paths or URLs)
     audios: list[str] | None = None
+    # Already decoded/resampled audio input. Each item may be a JSON spec such
+    # as {"audio": ..., "sample_rate": 16000}, {"data": base64, "shape": [N],
+    # "dtype": "float32"}, or {"path": ".pt/.npy"}.
+    preprocessed_audios: Any | None = Field(
+        default=None,
+        validation_alias=AliasChoices("preprocessed_audios", "loaded_audios"),
+    )
+    preprocessed_audio_sample_rate: int | list[int] | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "preprocessed_audio_sample_rate",
+            "loaded_audio_sample_rate",
+        ),
+    )
 
     # Image input (sglang-omni extension)
     # Can be a list of image file paths (local paths or URLs)
@@ -74,6 +88,20 @@ class ChatCompletionRequest(BaseModel):
     # Video input (sglang-omni extension)
     # Can be a list of video file paths (local paths or URLs)
     videos: list[str] | None = None
+    # Already decoded/sampled/resized video input. Each item may be a JSON
+    # spec such as {"frames": ..., "sample_fps": 1.0}, {"data": base64,
+    # "shape": [T, C, H, W], "dtype": "float32"}, or {"path": ".pt/.npy"}.
+    preprocessed_videos: Any | None = Field(
+        default=None,
+        validation_alias=AliasChoices("preprocessed_videos", "loaded_videos"),
+    )
+    preprocessed_video_fps: float | list[float] | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "preprocessed_video_fps",
+            "loaded_video_fps",
+        ),
+    )
     video_fps: float | None = None
     video_max_frames: int | None = None
     video_min_pixels: int | None = None

@@ -276,6 +276,27 @@ async def benchmark(args: argparse.Namespace) -> dict:
     return results
 
 
+def _add_preprocessed_media_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--preprocessed-video-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory of predecoded/sampled/resized video .pt files. When set, "
+            "send preprocessed_videos instead of raw video paths."
+        ),
+    )
+    parser.add_argument(
+        "--preprocessed-audio-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory of predecoded 16 kHz audio .pt files. When set, send "
+            "preprocessed_audios instead of raw audio paths."
+        ),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Video-AMME benchmark for video + audio question models."
@@ -287,6 +308,7 @@ def main() -> None:
             f"Defaults to {_VIDEOAMME_DEFAULT_REPO}."
         ),
     )
+    _add_preprocessed_media_args(parser)
     args = parser.parse_args()
 
     wait_for_service(args.base_url or f"http://{args.host}:{args.port}")

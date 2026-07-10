@@ -13,6 +13,7 @@ from typing import Any
 
 import av
 import librosa
+import numpy as np
 import torch
 from qwen_vl_utils import vision_process as qwen_vision
 from torchvision.transforms import InterpolationMode
@@ -287,6 +288,198 @@ async def ensure_video_list_async(
             extracted_audios if extract_audio else None,
         )
     return normalized, None, extracted_audios if extract_audio else None
+
+
+_PREPROCESSED_VIDEO_SPEC_KEYS = frozenset(
+    {"array", "data", "frames", "npy_path", "path", "pt_path", "tensor", "video"}
+)
+
+
+def _as_fps_list(value: Any, count: int) -> list[float] | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().tolist()
+    elif isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        values = [float(item) for item in value]
+    else:
+        values = [float(value)]
+    if not values:
+        return None
+    if len(values) < count:
+        values.extend([values[-1]] * (count - len(values)))
+    return values[:count]
+
+
+def _to_video_tensor(
+    value: Any,
+    *,
+    dtype: str | None = None,
+    shape: list[int] | tuple[int, ...] | None = None,
+    layout: str | None = None,
+) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu()
+        if dtype is not None:
+            torch_dtype = getattr(torch, str(dtype), None)
+            if isinstance(torch_dtype, torch.dtype):
+                tensor = tensor.to(dtype=torch_dtype)
+    else:
+        np_dtype = np.dtype(dtype) if dtype is not None else None
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            if np_dtype is None:
+                np_dtype = np.dtype("float32")
+            array = np.frombuffer(value, dtype=np_dtype)
+        else:
+            if np_dtype is None and isinstance(value, list):
+                np_dtype = np.dtype("float32")
+            array = np.asarray(value, dtype=np_dtype)
+        if shape is not None:
+            array = array.reshape(tuple(int(dim) for dim in shape))
+        if not array.flags.writeable:
+            array = array.copy()
+        tensor = torch.from_numpy(array)
+
+    if layout is not None:
+        normalized_layout = str(layout).upper()
+        if normalized_layout == "THWC":
+            tensor = tensor.permute(0, 3, 1, 2)
+        elif normalized_layout == "TCHW":
+            pass
+        else:
+            raise ValueError(
+                "preprocessed video layout must be 'TCHW' or 'THWC', "
+                f"got {layout!r}"
+            )
+
+    if tensor.ndim != 4:
+        raise ValueError(
+            "preprocessed video tensors must have shape (T, C, H, W) "
+            "or layout='THWC' with shape (T, H, W, C); "
+            f"got shape={tuple(tensor.shape)}"
+        )
+    return tensor.contiguous()
+
+
+def _load_preprocessed_video_path(path: str | Path) -> tuple[Any, float | None]:
+    video_path = Path(path)
+    suffix = video_path.suffix.lower()
+    if suffix in {".pt", ".pth"}:
+        try:
+            loaded = torch.load(video_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            loaded = torch.load(video_path, map_location="cpu")
+    elif suffix == ".npy":
+        loaded = np.load(video_path)
+    elif suffix == ".npz":
+        archive = np.load(video_path)
+        fps = None
+        for fps_key in ("sample_fps", "fps"):
+            if fps_key in archive:
+                fps = float(np.asarray(archive[fps_key]).reshape(-1)[0])
+                break
+        for data_key in ("video", "frames", "tensor", "array", "arr_0"):
+            if data_key in archive:
+                return archive[data_key], fps
+        raise ValueError(f"npz preprocessed video file has no video array: {video_path}")
+    else:
+        raise ValueError(
+            "preprocessed video path must point to .pt/.pth/.npy/.npz, "
+            f"got {video_path}"
+        )
+
+    if isinstance(loaded, dict):
+        fps = loaded.get("sample_fps", loaded.get("fps"))
+        for key in ("video", "frames", "tensor", "array"):
+            if key in loaded:
+                return loaded[key], float(fps) if fps is not None else None
+        raise ValueError(f"preprocessed video file has no video tensor: {video_path}")
+    if isinstance(loaded, (tuple, list)) and len(loaded) == 2:
+        return loaded[0], float(loaded[1])
+    return loaded, None
+
+
+def _materialize_preprocessed_video_item(
+    item: Any,
+    *,
+    default_fps: float | None = None,
+) -> tuple[torch.Tensor, float | None]:
+    if isinstance(item, dict):
+        fps = item.get("sample_fps", item.get("fps", default_fps))
+        layout = item.get("layout")
+        dtype = item.get("dtype")
+        shape = item.get("shape")
+        path_value = item.get("path", item.get("pt_path", item.get("npy_path")))
+        if path_value is not None:
+            loaded_value, loaded_fps = _load_preprocessed_video_path(path_value)
+            if fps is None:
+                fps = loaded_fps
+            return (
+                _to_video_tensor(loaded_value, dtype=dtype, shape=shape, layout=layout),
+                float(fps) if fps is not None else None,
+            )
+        if "data" in item:
+            raw = base64.b64decode(item["data"])
+            return (
+                _to_video_tensor(raw, dtype=dtype, shape=shape, layout=layout),
+                float(fps) if fps is not None else None,
+            )
+        for key in ("video", "frames", "tensor", "array"):
+            if key in item:
+                return (
+                    _to_video_tensor(item[key], dtype=dtype, shape=shape, layout=layout),
+                    float(fps) if fps is not None else None,
+                )
+        raise ValueError(
+            "preprocessed video spec must contain one of "
+            f"{sorted(_PREPROCESSED_VIDEO_SPEC_KEYS)}"
+        )
+
+    if isinstance(item, (str, Path)):
+        loaded_value, loaded_fps = _load_preprocessed_video_path(item)
+        fps = default_fps if default_fps is not None else loaded_fps
+        return _to_video_tensor(loaded_value), float(fps) if fps is not None else None
+
+    return _to_video_tensor(item), default_fps
+
+
+def materialize_preprocessed_video_list(
+    videos: Any,
+    *,
+    default_fps: float | list[float] | tuple[float, ...] | None = None,
+) -> tuple[list[Any], list[float] | None, None]:
+    """Normalize already decoded/sampled/resized videos for HF processors.
+
+    The returned video tensors are shaped ``(T, C, H, W)`` on CPU, matching
+    ``load_video_path`` output. JSON callers should pass each video as a spec,
+    for example ``{"frames": ..., "sample_fps": 1.0}``, ``{"data": base64,
+    "shape": [T, C, H, W], "dtype": "float32"}``, or ``{"path":
+    "/tmp/video.pt"}``. Python callers may pass torch tensors directly.
+    """
+    if videos is None:
+        return [], None, None
+    if isinstance(videos, (dict, str, Path, torch.Tensor, np.ndarray)):
+        items = [videos]
+    else:
+        items = list(videos)
+
+    default_fps_values = _as_fps_list(default_fps, len(items))
+    normalized: list[Any] = []
+    sample_fps: list[float | None] = []
+    for idx, item in enumerate(items):
+        item_default_fps = default_fps_values[idx] if default_fps_values else None
+        tensor, fps = _materialize_preprocessed_video_item(
+            item,
+            default_fps=item_default_fps,
+        )
+        normalized.append(tensor)
+        sample_fps.append(fps)
+
+    if sample_fps and all(fps is not None for fps in sample_fps):
+        return normalized, [float(fps) for fps in sample_fps if fps is not None], None
+    return normalized, None, None
 
 
 def _extract_audio_from_path(video_path: Path, target_sr: int) -> Any | None:

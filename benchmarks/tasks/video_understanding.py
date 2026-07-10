@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import random
+import re
 import struct
 import time
 from typing import Any, TypedDict
@@ -173,6 +174,57 @@ async def _apply_streaming_chat_completion_response(
     return True
 
 
+def _safe_cache_key(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+
+
+def _cache_tag(value: float | int | None) -> str:
+    if value is None:
+        return "none"
+    return str(value).replace(".", "p")
+
+
+def _preprocessed_video_spec(
+    sample: VideoMMESample | VideoAMMESample,
+    *,
+    preprocessed_video_dir: str | None,
+    video_fps: float | None,
+    video_max_frames: int | None,
+    video_max_pixels: int | None,
+) -> dict[str, str] | None:
+    if not preprocessed_video_dir:
+        return None
+
+    video_key = sample.video_id or sample.sample_id
+    filename = (
+        f"{_safe_cache_key(video_key)}_fps{_cache_tag(video_fps)}_"
+        f"frames{_cache_tag(video_max_frames)}_px{_cache_tag(video_max_pixels)}.pt"
+    )
+    path = os.path.join(preprocessed_video_dir, filename)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Missing preprocessed video cache for sample {sample.sample_id}: {path}"
+        )
+    return {"path": path}
+
+
+def _preprocessed_audio_spec(
+    sample: VideoAMMESample,
+    *,
+    preprocessed_audio_dir: str | None,
+) -> dict[str, str] | None:
+    if not preprocessed_audio_dir:
+        return None
+
+    filename = f"{_safe_cache_key(sample.sample_id)}_sr16000.pt"
+    path = os.path.join(preprocessed_audio_dir, filename)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Missing preprocessed audio cache for sample {sample.sample_id}: {path}"
+        )
+    return {"path": path}
+
+
 def make_video_send_fn(
     model_name: str,
     api_url: str,
@@ -184,6 +236,8 @@ def make_video_send_fn(
     video_min_pixels: int | None = None,
     video_max_pixels: int | None = None,
     video_total_pixels: int | None = None,
+    preprocessed_video_dir: str | None = None,
+    preprocessed_audio_dir: str | None = None,
     enable_audio_input: bool = False,
     audio_output_dir: str | None = None,
     fixed_prompt: str | None = None,
@@ -201,35 +255,53 @@ def make_video_send_fn(
             text=prompt[:60],
         )
 
-        payload: dict[str, Any] = {
-            "model": model_name,
-            "messages": [{"role": "user", "content": prompt}],
-            "videos": [sample.video_path],
-            "modalities": modalities,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stream": stream,
-        }
-        if stream:
-            payload["stream_options"] = {"include_usage": True}
-        if enable_audio_input:
-            assert isinstance(sample, VideoAMMESample)
-            payload["audios"] = [sample.audio_path]
-        if audio_output_dir:
-            payload["audio"] = {"format": "wav"}
-        if video_fps is not None:
-            payload["video_fps"] = video_fps
-        if video_max_frames is not None:
-            payload["video_max_frames"] = video_max_frames
-        if video_min_pixels is not None:
-            payload["video_min_pixels"] = video_min_pixels
-        if video_max_pixels is not None:
-            payload["video_max_pixels"] = video_max_pixels
-        if video_total_pixels is not None:
-            payload["video_total_pixels"] = video_total_pixels
-
         start_time = time.perf_counter()
         try:
+            preprocessed_video = _preprocessed_video_spec(
+                sample,
+                preprocessed_video_dir=preprocessed_video_dir,
+                video_fps=video_fps,
+                video_max_frames=video_max_frames,
+                video_max_pixels=video_max_pixels,
+            )
+            payload: dict[str, Any] = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "modalities": modalities,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "stream": stream,
+            }
+            if preprocessed_video is None:
+                payload["videos"] = [sample.video_path]
+            else:
+                payload["preprocessed_videos"] = [preprocessed_video]
+            if stream:
+                payload["stream_options"] = {"include_usage": True}
+            if enable_audio_input:
+                assert isinstance(sample, VideoAMMESample)
+                preprocessed_audio = _preprocessed_audio_spec(
+                    sample,
+                    preprocessed_audio_dir=preprocessed_audio_dir,
+                )
+                if preprocessed_audio is None:
+                    payload["audios"] = [sample.audio_path]
+                else:
+                    payload["preprocessed_audios"] = [preprocessed_audio]
+            if audio_output_dir:
+                payload["audio"] = {"format": "wav"}
+            if preprocessed_video is None:
+                if video_fps is not None:
+                    payload["video_fps"] = video_fps
+                if video_max_frames is not None:
+                    payload["video_max_frames"] = video_max_frames
+                if video_min_pixels is not None:
+                    payload["video_min_pixels"] = video_min_pixels
+                if video_max_pixels is not None:
+                    payload["video_max_pixels"] = video_max_pixels
+                if video_total_pixels is not None:
+                    payload["video_total_pixels"] = video_total_pixels
+
             async with session.post(api_url, json=payload) as response:
                 response.raise_for_status()
                 if stream:
@@ -258,7 +330,7 @@ def make_video_send_fn(
                 result.rtf = elapsed / result.audio_duration_s
             if result.completion_tokens > 0 and result.engine_time_s > 0:
                 result.tok_per_s = result.completion_tokens / result.engine_time_s
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
             result.error = str(exc)
         finally:
             result.latency_s = time.perf_counter() - start_time

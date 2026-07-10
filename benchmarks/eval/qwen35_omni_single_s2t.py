@@ -378,29 +378,114 @@ def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", text.lower())).strip()
 
 
+def _preprocessed_video_cache_path(
+    args: argparse.Namespace,
+    sample: VideoAMMESample,
+) -> Path | None:
+    cache_dir = getattr(args, "preprocessed_video_dir", None)
+    if not cache_dir:
+        return None
+    video_key = sample.video_id or sample.sample_id
+    safe_video_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", video_key)
+    fps_tag = "none" if args.video_fps is None else str(args.video_fps).replace(".", "p")
+    frames_tag = (
+        "none" if args.video_max_frames is None else str(args.video_max_frames)
+    )
+    pixels_tag = (
+        "none" if args.video_max_pixels is None else str(args.video_max_pixels)
+    )
+    filename = f"{safe_video_key}_fps{fps_tag}_frames{frames_tag}_px{pixels_tag}.pt"
+    return Path(cache_dir) / filename
+
+
+def _preprocessed_video_spec(
+    args: argparse.Namespace,
+    sample: VideoAMMESample,
+) -> dict[str, Any] | None:
+    cache_path = _preprocessed_video_cache_path(args, sample)
+    if cache_path is None:
+        return None
+    if not cache_path.exists():
+        from sglang_omni.preprocessing.video import load_video_path
+
+        import torch
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        video, sampled_fps = load_video_path(
+            sample.video_path,
+            fps=args.video_fps,
+            max_frames=args.video_max_frames,
+            max_pixels=args.video_max_pixels,
+        )
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        torch.save({"video": video, "sample_fps": float(sampled_fps)}, tmp_path)
+        tmp_path.replace(cache_path)
+    return {"path": str(cache_path)}
+
+
+def _preprocessed_audio_cache_path(
+    args: argparse.Namespace,
+    sample: VideoAMMESample,
+) -> Path | None:
+    cache_dir = getattr(args, "preprocessed_audio_dir", None)
+    if not cache_dir:
+        return None
+    safe_sample_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", sample.sample_id)
+    return Path(cache_dir) / f"{safe_sample_id}_sr16000.pt"
+
+
+def _preprocessed_audio_spec(
+    args: argparse.Namespace,
+    sample: VideoAMMESample,
+) -> dict[str, Any] | None:
+    cache_path = _preprocessed_audio_cache_path(args, sample)
+    if cache_path is None:
+        return None
+    if not cache_path.exists():
+        from sglang_omni.preprocessing.audio import load_audio_path
+
+        import torch
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        audio = load_audio_path(sample.audio_path, target_sr=16000)
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        torch.save({"audio": audio, "sample_rate": 16000}, tmp_path)
+        tmp_path.replace(cache_path)
+    return {"path": str(cache_path)}
+
+
 def _sglang_payload(args: argparse.Namespace, sample: VideoAMMESample) -> dict[str, Any]:
+    preprocessed_video = _preprocessed_video_spec(args, sample)
+    preprocessed_audio = _preprocessed_audio_spec(args, sample)
     payload: dict[str, Any] = {
         "model": args.model_name,
         "messages": [{"role": "user", "content": args.prompt}],
-        "videos": [sample.video_path],
-        "audios": [sample.audio_path],
         "modalities": ["text"],
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "stream": False,
     }
+    if preprocessed_video is None:
+        payload["videos"] = [sample.video_path]
+    else:
+        payload["preprocessed_videos"] = [preprocessed_video]
+    if preprocessed_audio is None:
+        payload["audios"] = [sample.audio_path]
+    else:
+        payload["preprocessed_audios"] = [preprocessed_audio]
     if args.top_p is not None:
         payload["top_p"] = args.top_p
     if args.top_k is not None:
         payload["top_k"] = args.top_k
     if args.seed is not None:
         payload["seed"] = args.seed
-    if args.video_fps is not None:
-        payload["video_fps"] = args.video_fps
-    if args.video_max_frames is not None:
-        payload["video_max_frames"] = args.video_max_frames
-    if args.video_max_pixels is not None:
-        payload["video_max_pixels"] = args.video_max_pixels
+    if preprocessed_video is None:
+        if args.video_fps is not None:
+            payload["video_fps"] = args.video_fps
+        if args.video_max_frames is not None:
+            payload["video_max_frames"] = args.video_max_frames
+        if args.video_max_pixels is not None:
+            payload["video_max_pixels"] = args.video_max_pixels
     return payload
 
 
@@ -581,6 +666,8 @@ def run_client(args: argparse.Namespace) -> dict[str, Any]:
             "video_fps": args.video_fps,
             "video_max_frames": args.video_max_frames,
             "video_max_pixels": args.video_max_pixels,
+            "preprocessed_video_dir": args.preprocessed_video_dir,
+            "preprocessed_audio_dir": args.preprocessed_audio_dir,
         },
         "summary": summarize_records(records),
         "records": records,
@@ -1172,6 +1259,10 @@ def _client_command(args: argparse.Namespace, *, engine: str, output_path: str) 
         pieces.extend(["--video-max-frames", str(args.video_max_frames)])
     if args.video_max_pixels is not None:
         pieces.extend(["--video-max-pixels", str(args.video_max_pixels)])
+    if getattr(args, "preprocessed_video_dir", None):
+        pieces.extend(["--preprocessed-video-dir", args.preprocessed_video_dir])
+    if getattr(args, "preprocessed_audio_dir", None):
+        pieces.extend(["--preprocessed-audio-dir", args.preprocessed_audio_dir])
     return "cd /myapp/sglang-omni && " + " ".join(
         _shell_quote(piece) for piece in pieces
     )
@@ -1506,6 +1597,22 @@ def add_client_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--video-fps", type=float, default=2.0)
     parser.add_argument("--video-max-frames", type=int, default=128)
     parser.add_argument("--video-max-pixels", type=int, default=401408)
+    parser.add_argument(
+        "--preprocessed-video-dir",
+        default=None,
+        help=(
+            "For SGLang only: store/load decoded, sampled, resized video tensors "
+            "as .pt files and send them via preprocessed_videos instead of paths."
+        ),
+    )
+    parser.add_argument(
+        "--preprocessed-audio-dir",
+        default=None,
+        help=(
+            "For SGLang only: store/load decoded 16 kHz audio waveforms as .pt "
+            "files and send them via preprocessed_audios instead of paths."
+        ),
+    )
     parser.add_argument("--timeout-s", type=int, default=300)
     parser.add_argument("--sleep-s", type=float, default=0.0)
     parser.add_argument(
@@ -1569,6 +1676,22 @@ def add_orchestrate_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--video-fps", type=float, default=2.0)
     parser.add_argument("--video-max-frames", type=int, default=128)
     parser.add_argument("--video-max-pixels", type=int, default=401408)
+    parser.add_argument(
+        "--preprocessed-video-dir",
+        default=None,
+        help=(
+            "For SGLang client runs only: store/load decoded, sampled, resized "
+            "video tensors and send them via preprocessed_videos."
+        ),
+    )
+    parser.add_argument(
+        "--preprocessed-audio-dir",
+        default=None,
+        help=(
+            "For SGLang client runs only: store/load decoded 16 kHz audio "
+            "waveforms and send them via preprocessed_audios."
+        ),
+    )
     parser.add_argument("--profile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sglang-thinker-cuda-graph", choices=("on", "off"), default="on")
     parser.add_argument("--sglang-thinker-torch-compile", choices=("on", "off"), default="off")

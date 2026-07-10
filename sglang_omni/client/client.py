@@ -608,20 +608,40 @@ def _extract_inputs(request: GenerateRequest) -> Any:
 
     # Check if we have audios, images, or videos in metadata
     audios = request.metadata.get("audios")
+    preprocessed_audios = request.metadata.get("preprocessed_audios")
+    if preprocessed_audios is None:
+        preprocessed_audios = request.metadata.get("loaded_audios")
     images = request.metadata.get("images")
     videos = request.metadata.get("videos")
+    preprocessed_videos = request.metadata.get("preprocessed_videos")
+    if preprocessed_videos is None:
+        preprocessed_videos = request.metadata.get("loaded_videos")
 
     # If we have any media, return a dict with messages and media
     # Otherwise, return just the messages list (for backward compatibility)
-    if audios or images or videos:
+    if (
+        audios
+        or preprocessed_audios is not None
+        or images
+        or videos
+        or preprocessed_videos is not None
+    ):
         result = {"messages": messages}
         if images:
             result["images"] = images
         if audios:
             result["audios"] = audios
+        if preprocessed_audios is not None:
+            result["preprocessed_audios"] = preprocessed_audios
         if videos:
             result["videos"] = videos
+        if preprocessed_videos is not None:
+            result["preprocessed_videos"] = preprocessed_videos
         for key in (
+            "preprocessed_audio_sample_rate",
+            "loaded_audio_sample_rate",
+            "preprocessed_video_fps",
+            "loaded_video_fps",
             "video_fps",
             "video_max_frames",
             "video_min_pixels",

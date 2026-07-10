@@ -116,6 +116,8 @@ class VideoEvalConfig:
     video_min_pixels: int | None = None
     video_max_pixels: int | None = None
     video_total_pixels: int | None = None
+    preprocessed_video_dir: str | None = None
+    preprocessed_audio_dir: str | None = None
     output_dir: str | None = None
     max_concurrency: int = 1
     warmup: int = 0
@@ -171,6 +173,8 @@ async def run_video_eval(
         video_min_pixels=config.video_min_pixels,
         video_max_pixels=config.video_max_pixels,
         video_total_pixels=config.video_total_pixels,
+        preprocessed_video_dir=config.preprocessed_video_dir,
+        preprocessed_audio_dir=config.preprocessed_audio_dir,
         enable_audio_input=enable_audio_input,
         audio_output_dir=audio_output_dir,
         fixed_prompt=fixed_prompt,
@@ -206,6 +210,8 @@ async def run_video_eval(
             "video_min_pixels": config.video_min_pixels,
             "video_max_pixels": config.video_max_pixels,
             "video_total_pixels": config.video_total_pixels,
+            "preprocessed_video_dir": config.preprocessed_video_dir,
+            "preprocessed_audio_dir": config.preprocessed_audio_dir,
             "max_concurrency": config.max_concurrency,
             "warmup": config.warmup,
             "enable_audio": config.enable_audio,
@@ -246,6 +252,8 @@ def video_eval_config_from_args(args: argparse.Namespace) -> VideoEvalConfig:
         video_min_pixels=args.video_min_pixels,
         video_max_pixels=args.video_max_pixels,
         video_total_pixels=args.video_total_pixels,
+        preprocessed_video_dir=getattr(args, "preprocessed_video_dir", None),
+        preprocessed_audio_dir=getattr(args, "preprocessed_audio_dir", None),
         output_dir=args.output_dir,
         max_concurrency=args.max_concurrency,
         warmup=args.warmup,

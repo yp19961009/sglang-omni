@@ -883,6 +883,11 @@ def _build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
     audios: list[str] | None = None
     if req.audios:
         audios = req.audios
+    if audios and req.preprocessed_audios is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either audios or preprocessed_audios, not both.",
+        )
 
     images: list[str] | None = None
     if req.images:
@@ -891,6 +896,11 @@ def _build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
     videos: list[str] | None = None
     if req.videos:
         videos = req.videos
+    if videos and req.preprocessed_videos is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either videos or preprocessed_videos, not both.",
+        )
 
     # Merge audio config, audios, images, and videos into metadata
     metadata: dict[str, Any] = {}
@@ -898,10 +908,18 @@ def _build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
         metadata["audio_config"] = req.audio
     if audios:
         metadata["audios"] = audios
+    if req.preprocessed_audios is not None:
+        metadata["preprocessed_audios"] = req.preprocessed_audios
+    if req.preprocessed_audio_sample_rate is not None:
+        metadata["preprocessed_audio_sample_rate"] = req.preprocessed_audio_sample_rate
     if images:
         metadata["images"] = images
     if videos:
         metadata["videos"] = videos
+    if req.preprocessed_videos is not None:
+        metadata["preprocessed_videos"] = req.preprocessed_videos
+    if req.preprocessed_video_fps is not None:
+        metadata["preprocessed_video_fps"] = req.preprocessed_video_fps
     if req.video_fps is not None:
         metadata["video_fps"] = req.video_fps
     if req.video_max_frames is not None:

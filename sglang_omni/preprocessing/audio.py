@@ -280,6 +280,197 @@ async def ensure_audio_list_async(
     return normalized
 
 
+_PREPROCESSED_AUDIO_SPEC_KEYS = frozenset(
+    {
+        "array",
+        "audio",
+        "data",
+        "npy_path",
+        "path",
+        "pt_path",
+        "samples",
+        "tensor",
+        "waveform",
+    }
+)
+
+
+def _as_sample_rate_list(value: Any, count: int) -> list[int] | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().tolist()
+    elif isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        rates = [int(rate) for rate in value]
+    else:
+        rates = [int(value)]
+    if not rates:
+        return None
+    if len(rates) < count:
+        rates.extend([rates[-1]] * (count - len(rates)))
+    return rates[:count]
+
+
+def _to_audio_array(
+    value: Any,
+    *,
+    dtype: str | None = None,
+    shape: list[int] | tuple[int, ...] | None = None,
+) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        array = value.detach().cpu().numpy()
+        if dtype is not None:
+            array = array.astype(np.dtype(dtype), copy=False)
+    else:
+        np_dtype = np.dtype(dtype) if dtype is not None else None
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            if np_dtype is None:
+                np_dtype = np.dtype("float32")
+            array = np.frombuffer(value, dtype=np_dtype)
+        else:
+            if np_dtype is None and isinstance(value, list):
+                np_dtype = np.dtype("float32")
+            array = np.asarray(value, dtype=np_dtype)
+    if shape is not None:
+        array = array.reshape(tuple(int(dim) for dim in shape))
+    if array.ndim == 2:
+        if array.shape[0] <= 8 and array.shape[0] <= array.shape[1]:
+            array = array.mean(axis=0)
+        elif array.shape[1] <= 8:
+            array = array.mean(axis=1)
+        else:
+            array = array.reshape(-1)
+    elif array.ndim > 2:
+        array = array.reshape(-1)
+    if not array.flags.writeable:
+        array = array.copy()
+    return array.astype(np.float32, copy=False)
+
+
+def _extract_audio_sample_rate(mapping: dict[str, Any], default: int | None) -> int | None:
+    value = mapping.get(
+        "sample_rate",
+        mapping.get("sampling_rate", mapping.get("sr", default)),
+    )
+    return int(value) if value is not None else None
+
+
+def _load_preprocessed_audio_path(path: str | Path) -> tuple[Any, int | None]:
+    audio_path = Path(path)
+    suffix = audio_path.suffix.lower()
+    if suffix in {".pt", ".pth"}:
+        try:
+            loaded = torch.load(audio_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            loaded = torch.load(audio_path, map_location="cpu")
+    elif suffix == ".npy":
+        return np.load(audio_path), None
+    elif suffix == ".npz":
+        archive = np.load(audio_path)
+        sample_rate = None
+        for rate_key in ("sample_rate", "sampling_rate", "sr"):
+            if rate_key in archive:
+                sample_rate = int(np.asarray(archive[rate_key]).reshape(-1)[0])
+                break
+        for data_key in ("audio", "samples", "waveform", "array", "arr_0"):
+            if data_key in archive:
+                return archive[data_key], sample_rate
+        raise ValueError(f"npz preprocessed audio file has no audio array: {audio_path}")
+    else:
+        raise ValueError(
+            "preprocessed audio path must point to .pt/.pth/.npy/.npz, "
+            f"got {audio_path}"
+        )
+
+    if isinstance(loaded, dict):
+        sample_rate = _extract_audio_sample_rate(loaded, None)
+        for key in ("audio", "samples", "waveform", "array", "tensor"):
+            if key in loaded:
+                return loaded[key], sample_rate
+        raise ValueError(f"preprocessed audio file has no audio array: {audio_path}")
+    if isinstance(loaded, (tuple, list)) and len(loaded) == 2:
+        return loaded[0], int(loaded[1])
+    return loaded, None
+
+
+def _materialize_preprocessed_audio_item(
+    item: Any,
+    *,
+    target_sr: int,
+    default_sample_rate: int | None = None,
+) -> np.ndarray:
+    source_sr = default_sample_rate
+    dtype = None
+    shape = None
+    value = item
+    if isinstance(item, dict):
+        source_sr = _extract_audio_sample_rate(item, default_sample_rate)
+        dtype = item.get("dtype")
+        shape = item.get("shape")
+        path_value = item.get("path", item.get("pt_path", item.get("npy_path")))
+        if path_value is not None:
+            value, loaded_sr = _load_preprocessed_audio_path(path_value)
+            if source_sr is None:
+                source_sr = loaded_sr
+        elif "data" in item:
+            value = base64.b64decode(item["data"])
+        else:
+            for key in ("audio", "samples", "waveform", "array", "tensor"):
+                if key in item:
+                    value = item[key]
+                    break
+            else:
+                raise ValueError(
+                    "preprocessed audio spec must contain one of "
+                    f"{sorted(_PREPROCESSED_AUDIO_SPEC_KEYS)}"
+                )
+    elif isinstance(item, (str, Path)):
+        value, loaded_sr = _load_preprocessed_audio_path(item)
+        if source_sr is None:
+            source_sr = loaded_sr
+
+    audio = _to_audio_array(value, dtype=dtype, shape=shape)
+    if source_sr is not None:
+        audio = _resample_linear(audio, int(source_sr), int(target_sr))
+    return audio.astype(np.float32, copy=False)
+
+
+def materialize_preprocessed_audio_list(
+    audios: Any,
+    *,
+    target_sr: int = 16000,
+    default_sample_rate: int | list[int] | tuple[int, ...] | None = None,
+) -> list[Any]:
+    """Normalize already decoded audio waveforms for HF processors.
+
+    The returned arrays are mono float32 waveforms at ``target_sr``. JSON callers
+    may pass specs such as ``{"audio": ..., "sample_rate": 16000}``, ``{"data":
+    base64, "shape": [N], "dtype": "float32"}``, or ``{"path": ".pt/.npy"}``.
+    Python callers may pass numpy arrays or torch tensors directly.
+    """
+    if audios is None:
+        return []
+    if isinstance(audios, (dict, str, Path, torch.Tensor, np.ndarray)):
+        items = [audios]
+    else:
+        items = list(audios)
+
+    default_rates = _as_sample_rate_list(default_sample_rate, len(items))
+    normalized: list[Any] = []
+    for idx, item in enumerate(items):
+        item_default_rate = default_rates[idx] if default_rates else None
+        normalized.append(
+            _materialize_preprocessed_audio_item(
+                item,
+                target_sr=int(target_sr),
+                default_sample_rate=item_default_rate,
+            )
+        )
+    return normalized
+
+
 def build_audio_mm_inputs(hf_inputs: dict[str, Any]) -> dict[str, Any]:
     """Extract standard audio tensors from HF processor outputs."""
     feature_attention_mask = hf_inputs.get("feature_attention_mask")

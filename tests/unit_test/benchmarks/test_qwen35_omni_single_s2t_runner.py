@@ -5,6 +5,9 @@ from pathlib import Path
 from benchmarks.eval.qwen35_omni_single_s2t import (
     VideoAMMESample,
     _client_profile_paths,
+    _preprocessed_audio_cache_path,
+    _preprocessed_video_cache_path,
+    _sglang_payload,
     _sglang_server_command,
     _vllm_payload,
     _vllm_server_command,
@@ -101,6 +104,42 @@ def test_vllm_payload_forwards_video_sampling_options():
     assert payload["video_max_frames"] == 128
     assert payload["video_max_pixels"] == 401408
     assert payload["messages"][0]["content"][0]["video_url"].endswith("001-1.mp4")
+
+
+def test_sglang_payload_can_use_preprocessed_video_and_audio_dirs(tmp_path):
+    args = Namespace(
+        model_name="qwen35-omni-s2t",
+        prompt="Answer with one option.",
+        temperature=0.0,
+        top_p=0.8,
+        top_k=1,
+        max_tokens=4,
+        seed=0,
+        video_fps=1.0,
+        video_max_frames=128,
+        video_max_pixels=401408,
+        preprocessed_video_dir=str(tmp_path / "video"),
+        preprocessed_audio_dir=str(tmp_path / "audio"),
+    )
+    sample = _sample("001-1")
+    video_cache_path = _preprocessed_video_cache_path(args, sample)
+    audio_cache_path = _preprocessed_audio_cache_path(args, sample)
+    assert video_cache_path is not None
+    assert audio_cache_path is not None
+    video_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    video_cache_path.write_bytes(b"cached-video")
+    audio_cache_path.write_bytes(b"cached-audio")
+
+    payload = _sglang_payload(args, sample)
+
+    assert payload["preprocessed_videos"] == [{"path": str(video_cache_path)}]
+    assert payload["preprocessed_audios"] == [{"path": str(audio_cache_path)}]
+    assert "videos" not in payload
+    assert "audios" not in payload
+    assert "video_fps" not in payload
+    assert "video_max_frames" not in payload
+    assert "video_max_pixels" not in payload
 
 
 def test_parse_prediction_prefers_answer_tag_then_option_text_fallback():
