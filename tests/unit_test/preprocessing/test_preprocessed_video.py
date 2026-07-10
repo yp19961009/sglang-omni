@@ -9,6 +9,8 @@ import torch
 
 from sglang_omni.client.client import _extract_inputs
 from sglang_omni.client.types import GenerateRequest, Message
+from sglang_omni.preprocessing import audio as audio_mod
+from sglang_omni.preprocessing import video as video_mod
 from sglang_omni.preprocessing.audio import materialize_preprocessed_audio_list
 from sglang_omni.preprocessing.video import materialize_preprocessed_video_list
 from sglang_omni.serve.protocol import ChatCompletionRequest
@@ -126,3 +128,49 @@ def test_materialize_preprocessed_audio_file_spec(tmp_path) -> None:
 
     assert len(audios) == 1
     assert np.allclose(audios[0], audio)
+
+
+def test_preprocessed_video_path_can_reuse_loaded_object(tmp_path, monkeypatch) -> None:
+    video_path = tmp_path / "video.pt"
+    video_path.touch()
+    frames = torch.ones((2, 3, 4, 5), dtype=torch.float32)
+    calls = 0
+
+    def fake_load(_path):
+        nonlocal calls
+        calls += 1
+        return frames, 1.0
+
+    video_mod._load_preprocessed_video_path_cached.cache_clear()
+    monkeypatch.setattr(video_mod, "_load_preprocessed_video_path", fake_load)
+    spec = {"path": str(video_path), "reuse_loaded": True}
+
+    first, _, _ = materialize_preprocessed_video_list(spec)
+    second, _, _ = materialize_preprocessed_video_list(spec)
+
+    assert calls == 1
+    assert first[0].data_ptr() == second[0].data_ptr()
+    video_mod._load_preprocessed_video_path_cached.cache_clear()
+
+
+def test_preprocessed_audio_path_can_reuse_loaded_object(tmp_path, monkeypatch) -> None:
+    audio_path = tmp_path / "audio.pt"
+    audio_path.touch()
+    audio = np.ones(16000, dtype=np.float32)
+    calls = 0
+
+    def fake_load(_path):
+        nonlocal calls
+        calls += 1
+        return audio, 16000
+
+    audio_mod._load_preprocessed_audio_path_cached.cache_clear()
+    monkeypatch.setattr(audio_mod, "_load_preprocessed_audio_path", fake_load)
+    spec = {"path": str(audio_path), "reuse_loaded": True}
+
+    first = materialize_preprocessed_audio_list(spec)
+    second = materialize_preprocessed_audio_list(spec)
+
+    assert calls == 1
+    assert np.shares_memory(first[0], second[0])
+    audio_mod._load_preprocessed_audio_path_cached.cache_clear()

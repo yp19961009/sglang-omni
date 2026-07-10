@@ -2,6 +2,8 @@
 
 import asyncio
 
+import pytest
+
 from benchmarks.dataset.videomme import VideoAMMESample
 from benchmarks.tasks.video_understanding import make_video_send_fn
 
@@ -46,7 +48,10 @@ def _sample() -> VideoAMMESample:
     )
 
 
-def test_video_send_fn_can_send_preprocessed_videoamme_payload(tmp_path):
+@pytest.mark.parametrize("reuse_loaded", [False, True])
+def test_video_send_fn_can_send_preprocessed_videoamme_payload(
+    tmp_path, reuse_loaded
+):
     video_dir = tmp_path / "videos"
     audio_dir = tmp_path / "audios"
     video_dir.mkdir()
@@ -64,6 +69,7 @@ def test_video_send_fn_can_send_preprocessed_videoamme_payload(tmp_path):
         video_max_pixels=401408,
         preprocessed_video_dir=str(video_dir),
         preprocessed_audio_dir=str(audio_dir),
+        reuse_preprocessed_media=reuse_loaded,
         enable_audio_input=True,
         fixed_prompt="Prompt",
     )
@@ -72,8 +78,13 @@ def test_video_send_fn_can_send_preprocessed_videoamme_payload(tmp_path):
     result = asyncio.run(send_fn(session, _sample()))
 
     assert result.is_success
-    assert session.payload["preprocessed_videos"] == [{"path": str(video_path)}]
-    assert session.payload["preprocessed_audios"] == [{"path": str(audio_path)}]
+    expected_video = {"path": str(video_path)}
+    expected_audio = {"path": str(audio_path)}
+    if reuse_loaded:
+        expected_video["reuse_loaded"] = True
+        expected_audio["reuse_loaded"] = True
+    assert session.payload["preprocessed_videos"] == [expected_video]
+    assert session.payload["preprocessed_audios"] == [expected_audio]
     assert "videos" not in session.payload
     assert "audios" not in session.payload
     assert "video_fps" not in session.payload

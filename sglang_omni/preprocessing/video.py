@@ -8,6 +8,7 @@ import base64
 import logging
 import os
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -401,6 +402,27 @@ def _load_preprocessed_video_path(path: str | Path) -> tuple[Any, float | None]:
     return loaded, None
 
 
+@lru_cache(maxsize=4)
+def _load_preprocessed_video_path_cached(
+    path: str,
+    mtime_ns: int,
+    size: int,
+) -> tuple[Any, float | None]:
+    # mtime and size are part of the key so replacing an artifact invalidates it.
+    del mtime_ns, size
+    return _load_preprocessed_video_path(path)
+
+
+def _load_preprocessed_video_path_reused(
+    path: str | Path,
+) -> tuple[Any, float | None]:
+    resolved = Path(path).resolve()
+    stat = resolved.stat()
+    return _load_preprocessed_video_path_cached(
+        str(resolved), stat.st_mtime_ns, stat.st_size
+    )
+
+
 def _materialize_preprocessed_video_item(
     item: Any,
     *,
@@ -412,8 +434,14 @@ def _materialize_preprocessed_video_item(
         dtype = item.get("dtype")
         shape = item.get("shape")
         path_value = item.get("path", item.get("pt_path", item.get("npy_path")))
+        reuse_loaded = bool(item.get("reuse_loaded", False))
         if path_value is not None:
-            loaded_value, loaded_fps = _load_preprocessed_video_path(path_value)
+            loader = (
+                _load_preprocessed_video_path_reused
+                if reuse_loaded
+                else _load_preprocessed_video_path
+            )
+            loaded_value, loaded_fps = loader(path_value)
             if fps is None:
                 fps = loaded_fps
             return (
@@ -456,7 +484,8 @@ def materialize_preprocessed_video_list(
     ``load_video_path`` output. JSON callers should pass each video as a spec,
     for example ``{"frames": ..., "sample_fps": 1.0}``, ``{"data": base64,
     "shape": [T, C, H, W], "dtype": "float32"}``, or ``{"path":
-    "/tmp/video.pt"}``. Python callers may pass torch tensors directly.
+    "/tmp/video.pt", "reuse_loaded": true}``. ``reuse_loaded`` keeps a bounded
+    in-process CPU copy for repeated requests. Python callers may pass tensors.
     """
     if videos is None:
         return [], None, None

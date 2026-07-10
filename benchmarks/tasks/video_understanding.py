@@ -191,7 +191,8 @@ def _preprocessed_video_spec(
     video_fps: float | None,
     video_max_frames: int | None,
     video_max_pixels: int | None,
-) -> dict[str, str] | None:
+    reuse_loaded: bool = False,
+) -> dict[str, Any] | None:
     if not preprocessed_video_dir:
         return None
 
@@ -205,14 +206,18 @@ def _preprocessed_video_spec(
         raise FileNotFoundError(
             f"Missing preprocessed video cache for sample {sample.sample_id}: {path}"
         )
-    return {"path": path}
+    spec: dict[str, Any] = {"path": path}
+    if reuse_loaded:
+        spec["reuse_loaded"] = True
+    return spec
 
 
 def _preprocessed_audio_spec(
     sample: VideoAMMESample,
     *,
     preprocessed_audio_dir: str | None,
-) -> dict[str, str] | None:
+    reuse_loaded: bool = False,
+) -> dict[str, Any] | None:
     if not preprocessed_audio_dir:
         return None
 
@@ -222,7 +227,10 @@ def _preprocessed_audio_spec(
         raise FileNotFoundError(
             f"Missing preprocessed audio cache for sample {sample.sample_id}: {path}"
         )
-    return {"path": path}
+    spec: dict[str, Any] = {"path": path}
+    if reuse_loaded:
+        spec["reuse_loaded"] = True
+    return spec
 
 
 def make_video_send_fn(
@@ -238,6 +246,7 @@ def make_video_send_fn(
     video_total_pixels: int | None = None,
     preprocessed_video_dir: str | None = None,
     preprocessed_audio_dir: str | None = None,
+    reuse_preprocessed_media: bool = False,
     enable_audio_input: bool = False,
     audio_output_dir: str | None = None,
     fixed_prompt: str | None = None,
@@ -263,6 +272,7 @@ def make_video_send_fn(
                 video_fps=video_fps,
                 video_max_frames=video_max_frames,
                 video_max_pixels=video_max_pixels,
+                reuse_loaded=reuse_preprocessed_media,
             )
             payload: dict[str, Any] = {
                 "model": model_name,
@@ -283,6 +293,7 @@ def make_video_send_fn(
                 preprocessed_audio = _preprocessed_audio_spec(
                     sample,
                     preprocessed_audio_dir=preprocessed_audio_dir,
+                    reuse_loaded=reuse_preprocessed_media,
                 )
                 if preprocessed_audio is None:
                     payload["audios"] = [sample.audio_path]

@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import struct
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -395,6 +396,27 @@ def _load_preprocessed_audio_path(path: str | Path) -> tuple[Any, int | None]:
     return loaded, None
 
 
+@lru_cache(maxsize=4)
+def _load_preprocessed_audio_path_cached(
+    path: str,
+    mtime_ns: int,
+    size: int,
+) -> tuple[Any, int | None]:
+    # mtime and size are part of the key so replacing an artifact invalidates it.
+    del mtime_ns, size
+    return _load_preprocessed_audio_path(path)
+
+
+def _load_preprocessed_audio_path_reused(
+    path: str | Path,
+) -> tuple[Any, int | None]:
+    resolved = Path(path).resolve()
+    stat = resolved.stat()
+    return _load_preprocessed_audio_path_cached(
+        str(resolved), stat.st_mtime_ns, stat.st_size
+    )
+
+
 def _materialize_preprocessed_audio_item(
     item: Any,
     *,
@@ -411,7 +433,12 @@ def _materialize_preprocessed_audio_item(
         shape = item.get("shape")
         path_value = item.get("path", item.get("pt_path", item.get("npy_path")))
         if path_value is not None:
-            value, loaded_sr = _load_preprocessed_audio_path(path_value)
+            loader = (
+                _load_preprocessed_audio_path_reused
+                if bool(item.get("reuse_loaded", False))
+                else _load_preprocessed_audio_path
+            )
+            value, loaded_sr = loader(path_value)
             if source_sr is None:
                 source_sr = loaded_sr
         elif "data" in item:
@@ -446,8 +473,9 @@ def materialize_preprocessed_audio_list(
     """Normalize already decoded audio waveforms for HF processors.
 
     The returned arrays are mono float32 waveforms at ``target_sr``. JSON callers
-    may pass specs such as ``{"audio": ..., "sample_rate": 16000}``, ``{"data":
-    base64, "shape": [N], "dtype": "float32"}``, or ``{"path": ".pt/.npy"}``.
+    may pass specs such as ``{"audio": ..., "sample_rate": 16000}``,
+    ``{"data": base64, "shape": [N], "dtype": "float32"}``, or
+    ``{"path": ".pt/.npy", "reuse_loaded": true}`` for bounded CPU reuse.
     Python callers may pass numpy arrays or torch tensors directly.
     """
     if audios is None:

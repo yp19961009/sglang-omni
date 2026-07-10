@@ -118,6 +118,7 @@ class VideoEvalConfig:
     video_total_pixels: int | None = None
     preprocessed_video_dir: str | None = None
     preprocessed_audio_dir: str | None = None
+    reuse_preprocessed_media: bool = False
     output_dir: str | None = None
     max_concurrency: int = 1
     warmup: int = 0
@@ -175,6 +176,7 @@ async def run_video_eval(
         video_total_pixels=config.video_total_pixels,
         preprocessed_video_dir=config.preprocessed_video_dir,
         preprocessed_audio_dir=config.preprocessed_audio_dir,
+        reuse_preprocessed_media=config.reuse_preprocessed_media,
         enable_audio_input=enable_audio_input,
         audio_output_dir=audio_output_dir,
         fixed_prompt=fixed_prompt,
@@ -212,6 +214,7 @@ async def run_video_eval(
             "video_total_pixels": config.video_total_pixels,
             "preprocessed_video_dir": config.preprocessed_video_dir,
             "preprocessed_audio_dir": config.preprocessed_audio_dir,
+            "reuse_preprocessed_media": config.reuse_preprocessed_media,
             "max_concurrency": config.max_concurrency,
             "warmup": config.warmup,
             "enable_audio": config.enable_audio,
@@ -254,6 +257,9 @@ def video_eval_config_from_args(args: argparse.Namespace) -> VideoEvalConfig:
         video_total_pixels=args.video_total_pixels,
         preprocessed_video_dir=getattr(args, "preprocessed_video_dir", None),
         preprocessed_audio_dir=getattr(args, "preprocessed_audio_dir", None),
+        reuse_preprocessed_media=getattr(
+            args, "reuse_preprocessed_media", False
+        ),
         output_dir=args.output_dir,
         max_concurrency=args.max_concurrency,
         warmup=args.warmup,

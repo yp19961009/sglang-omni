@@ -295,6 +295,14 @@ def _add_preprocessed_media_args(parser: argparse.ArgumentParser) -> None:
             "preprocessed_audios instead of raw audio paths."
         ),
     )
+    parser.add_argument(
+        "--reuse-preprocessed-media",
+        action="store_true",
+        help=(
+            "Keep path-backed preprocessed video/audio objects in the "
+            "preprocessor CPU process for reuse across repeated requests."
+        ),
+    )
 
 
 def main() -> None:
