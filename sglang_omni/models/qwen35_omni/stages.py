@@ -63,10 +63,14 @@ def create_image_encoder_executor(
     *,
     device: str = "cuda",
     dtype: str | None = None,
+    dedup_same_batch: bool = True,
 ):
     from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
     model = Qwen35OmniImageEncoder(model_path=model_path, device=device, dtype=dtype)
+    logger.info(
+        "Qwen3.5 image encoder same-batch dedup enabled=%s", dedup_same_batch
+    )
 
     def _encode(payload: StagePayload) -> StagePayload:
         _emit_event(
@@ -101,6 +105,7 @@ def create_image_encoder_executor(
             return qwen3_stages._batch_image_encoder_payloads(
                 payloads,
                 model=model,
+                dedup_same_batch=dedup_same_batch,
             )
         finally:
             for p in payloads:

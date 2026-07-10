@@ -374,6 +374,7 @@ def _batch_image_encoder_payloads(
     *,
     model: Any,
     cache: StageOutputCache | None = None,
+    dedup_same_batch: bool = True,
 ) -> list[StagePayload]:
     results: list[StagePayload | None] = [None] * len(payloads)
     active: list[tuple[int, StagePayload, Any, Any]] = []
@@ -414,7 +415,11 @@ def _batch_image_encoder_payloads(
             continue
 
         cache_key = request.cache_key
-        if cache_key is not None and cache_key in active_cache_keys:
+        if (
+            dedup_same_batch
+            and cache_key is not None
+            and cache_key in active_cache_keys
+        ):
             duplicate_waiters.setdefault(cache_key, []).append((idx, payload, state))
             _trace_encoder_cache(
                 IMAGE_STAGE,
@@ -427,7 +432,7 @@ def _batch_image_encoder_payloads(
             continue
 
         active.append((idx, payload, state, request))
-        if cache_key is not None:
+        if dedup_same_batch and cache_key is not None:
             active_cache_keys.add(cache_key)
             active_cache_leaders[cache_key] = payload.request_id
 

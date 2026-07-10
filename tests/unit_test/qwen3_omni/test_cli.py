@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import inspect
+
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -10,6 +12,7 @@ import typer
 from sglang_omni.cli.serve import (
     apply_cuda_graph_cli_overrides,
     apply_encoder_mem_reserve_cli_override,
+    apply_image_encoder_batch_dedup_cli_override,
     apply_parallelism_cli_overrides,
     apply_partial_start_cli_overrides,
     apply_torch_compile_cli_overrides,
@@ -21,6 +24,8 @@ from sglang_omni.models.qwen3_omni.config import (
     Qwen3OmniSpeechColocatedPipelineConfig,
     Qwen3OmniSpeechPipelineConfig,
 )
+from sglang_omni.models.qwen35_omni import stages as qwen35_stages
+from sglang_omni.models.qwen35_omni.config import Qwen35OmniPipelineConfig
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 
 
@@ -405,3 +410,43 @@ def test_partial_start_cli_rejects_unsupported_config_with_stable_message():
         match="--talker-partial-start is not supported by Qwen3OmniPipelineConfig",
     ):
         apply_partial_start_cli_overrides(config, talker_partial_start="on")
+
+
+def test_qwen35_cli_can_disable_image_encoder_same_batch_dedup():
+    config = Qwen35OmniPipelineConfig(model_path="dummy")
+
+    result = apply_image_encoder_batch_dedup_cli_override(
+        config,
+        disable_image_encoder_batch_dedup=True,
+    )
+
+    image_stage = _stage(result, "image_encoder")
+    assert image_stage.factory_args["dedup_same_batch"] is False
+    resolved = resolve_stage_factory_args(image_stage, result)
+    assert resolved["dedup_same_batch"] is False
+
+
+def test_qwen35_image_encoder_same_batch_dedup_stays_enabled_by_default():
+    config = Qwen35OmniPipelineConfig(model_path="dummy")
+
+    result = apply_image_encoder_batch_dedup_cli_override(
+        config,
+        disable_image_encoder_batch_dedup=False,
+    )
+
+    image_stage = _stage(result, "image_encoder")
+    assert "dedup_same_batch" not in image_stage.factory_args
+    parameter = inspect.signature(
+        qwen35_stages.create_image_encoder_executor
+    ).parameters["dedup_same_batch"]
+    assert parameter.default is True
+
+
+def test_image_encoder_same_batch_dedup_flag_rejects_qwen3():
+    config = Qwen3OmniPipelineConfig(model_path="dummy")
+
+    with pytest.raises(typer.BadParameter, match="supports only Qwen3.5-Omni"):
+        apply_image_encoder_batch_dedup_cli_override(
+            config,
+            disable_image_encoder_batch_dedup=True,
+        )

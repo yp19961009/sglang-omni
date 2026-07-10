@@ -1333,3 +1333,63 @@ def test_qwen_sglang_request_hashes_media_tokens_without_changing_mrope_ids(
     assert pad_values["audio"] >= 256
     assert int(req_data.input_ids[1]) == pad_values["audio"]
     assert captured["input_ids"].tolist() == input_ids.tolist()
+
+
+class _CountingImageEncoder:
+    spatial_merge_size = 1
+
+    def __init__(self) -> None:
+        self.video_rows: list[int] = []
+
+    def __call__(self, **inputs):
+        grid = inputs["video_grid_thw"]
+        self.video_rows.append(int(grid.shape[0]))
+        counts = grid.prod(dim=-1).to(dtype=torch.long)
+        total_tokens = int(counts.sum().item())
+        return {
+            "video_grid_thw": grid,
+            "video_token_counts": counts,
+            "video_embeds": torch.ones((total_tokens, 2)),
+            "deepstack_visual_embeds_video": None,
+        }
+
+
+def _duplicate_video_encoder_payload(request_id: str) -> StagePayload:
+    state = Qwen3OmniPipelineState(
+        encoder_inputs={
+            "image_encoder": {
+                "pixel_values_videos": torch.ones((1, 3)),
+                "video_grid_thw": torch.ones((1, 3), dtype=torch.long),
+                "cache_key": "same-video",
+            }
+        }
+    )
+    return StagePayload(
+        request_id=request_id,
+        request=OmniRequest(inputs={}),
+        data=state.to_dict(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("dedup_same_batch", "expected_video_rows"),
+    [(True, 1), (False, 2)],
+)
+def test_image_encoder_same_batch_dedup_toggle(
+    dedup_same_batch: bool,
+    expected_video_rows: int,
+) -> None:
+    model = _CountingImageEncoder()
+    payloads = [
+        _duplicate_video_encoder_payload("request-1"),
+        _duplicate_video_encoder_payload("request-2"),
+    ]
+
+    results = qwen_stages._batch_image_encoder_payloads(
+        payloads,
+        model=model,
+        dedup_same_batch=dedup_same_batch,
+    )
+
+    assert len(results) == 2
+    assert model.video_rows == [expected_video_rows]

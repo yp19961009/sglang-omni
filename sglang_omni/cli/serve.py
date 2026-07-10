@@ -29,6 +29,9 @@ _ASYNC_DECODE_FACTORIES = frozenset(
 _QWEN_PARTIAL_START_TALKER_FACTORY = (
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config"
 )
+_QWEN35_IMAGE_ENCODER_FACTORY = (
+    "sglang_omni.models.qwen35_omni.stages.create_image_encoder_executor"
+)
 
 
 def launch_server(*args: object, **kwargs: object) -> object:
@@ -820,6 +823,37 @@ def _apply_stage_factory_args_override(
             stage_runtime_overrides.update(updates)
 
 
+def apply_image_encoder_batch_dedup_cli_override(
+    pipeline_config: PipelineConfig,
+    *,
+    disable_image_encoder_batch_dedup: bool,
+) -> PipelineConfig:
+    if not disable_image_encoder_batch_dedup:
+        return pipeline_config
+
+    matching_stages = _find_matching_stages(
+        pipeline_config,
+        stage_name="image_encoder",
+        reason="image encoder same-batch dedup override",
+    )
+    for stage in matching_stages:
+        if stage.factory != _QWEN35_IMAGE_ENCODER_FACTORY:
+            raise typer.BadParameter(
+                "--disable-image-encoder-batch-dedup currently supports only "
+                "Qwen3.5-Omni; stage 'image_encoder' uses factory "
+                f"{stage.factory!r}"
+            )
+
+    _apply_stage_factory_args_override(
+        pipeline_config,
+        stage_name="image_encoder",
+        updates={"dedup_same_batch": False},
+        reason="image encoder same-batch dedup override",
+        flag_name="--disable-image-encoder-batch-dedup",
+    )
+    return pipeline_config
+
+
 def apply_decode_mode_cli_overrides(
     pipeline_config: PipelineConfig,
     *,
@@ -1048,6 +1082,17 @@ def serve(
             help="GPU ids for image_encoder TP ranks, e.g. '4,5' or '[4, 5]'.",
         ),
     ] = None,
+    disable_image_encoder_batch_dedup: Annotated[
+        bool,
+        typer.Option(
+            "--disable-image-encoder-batch-dedup",
+            "--disable_image_encoder_batch_dedup",
+            help=(
+                "Disable Qwen3.5 image/video encoder reuse for duplicate media "
+                "within one scheduler batch."
+            ),
+        ),
+    ] = False,
     talker_gpu: Annotated[
         int | None,
         typer.Option(
@@ -1246,6 +1291,10 @@ def serve(
         image_encoder_gpus=image_encoder_gpus,
         talker_gpu=talker_gpu,
         code2wav_gpu=code2wav_gpu,
+    )
+    merged_config = apply_image_encoder_batch_dedup_cli_override(
+        merged_config,
+        disable_image_encoder_batch_dedup=disable_image_encoder_batch_dedup,
     )
     merged_config = apply_cuda_graph_cli_overrides(
         merged_config,
