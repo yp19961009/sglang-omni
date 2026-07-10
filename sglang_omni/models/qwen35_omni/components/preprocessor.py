@@ -10,6 +10,9 @@ from typing import Any, Iterable
 import numpy as np
 import torch
 from transformers import AutoImageProcessor, AutoTokenizer, WhisperFeatureExtractor
+from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
+    Qwen3VLVideoProcessor,
+)
 
 from sglang_omni.models.qwen3_omni.components.preprocessor import (
     Qwen3OmniPreprocessor,
@@ -44,6 +47,10 @@ class Qwen35OmniNextProcessor:
             trust_remote_code=True,
             local_files_only=True,
         )
+        self.video_processor = Qwen3VLVideoProcessor.from_pretrained(
+            model_dir,
+            local_files_only=True,
+        )
         self.feature_extractor = WhisperFeatureExtractor.from_pretrained(
             model_dir,
             trust_remote_code=True,
@@ -58,9 +65,9 @@ class Qwen35OmniNextProcessor:
         self.vision_eos_token = self.tokenizer.vision_eos_token
         self.audio_bos_token = self.tokenizer.audio_bos_token
         self.audio_eos_token = self.tokenizer.audio_eos_token
-        self.merge_size = int(getattr(self.image_processor, "merge_size", 2))
+        self.merge_size = int(getattr(self.video_processor, "merge_size", 2))
         self.temporal_patch_size = int(
-            getattr(self.image_processor, "temporal_patch_size", 2)
+            getattr(self.video_processor, "temporal_patch_size", 2)
         )
         self.mm_token_pattern = re.compile(
             "|".join(
@@ -137,6 +144,21 @@ class Qwen35OmniNextProcessor:
     def _process_videos(self, videos: Any, videos_kwargs: dict[str, Any]) -> dict[str, Any]:
         if videos is None:
             return {}
+        video_items = videos if isinstance(videos, list) else [videos]
+        fps_values = self._coerce_fps_values(
+            videos_kwargs.get("fps"), len(video_items)
+        )
+        video_metadata = []
+        for video, fps in zip(video_items, fps_values):
+            num_frames = int(video.shape[0])
+            video_metadata.append(
+                {
+                    "fps": fps,
+                    "frames_indices": torch.arange(num_frames),
+                    "total_num_frames": num_frames,
+                    "video_backend": "preprocessed",
+                }
+            )
         proc_kwargs = {
             k: v
             for k, v in videos_kwargs.items()
@@ -152,16 +174,18 @@ class Qwen35OmniNextProcessor:
             }
         }
         out = dict(
-            self.image_processor(
-                images=None,
-                videos=videos,
+            self.video_processor(
+                videos=video_items,
+                video_metadata=video_metadata,
+                do_sample_frames=False,
+                return_metadata=True,
                 return_tensors="pt",
                 **proc_kwargs,
             )
         )
+        out.pop("video_metadata", None)
         grid = out.get("video_grid_thw")
         if isinstance(grid, torch.Tensor):
-            fps_values = self._coerce_fps_values(videos_kwargs.get("fps"), grid.shape[0])
             seconds = [self.temporal_patch_size / max(float(fps), 1e-6) for fps in fps_values]
             out["video_second_per_grid"] = torch.tensor(seconds, dtype=torch.float32)
         return out
@@ -291,6 +315,9 @@ class Qwen35OmniPreprocessor(Qwen3OmniPreprocessor):
         self.default_video_total_pixels = int(video_total_pixels) if video_total_pixels is not None else None
         self.model_dir = _resolve_local_model_dir(model_path)
         self.processor = Qwen35OmniNextProcessor(self.model_dir)
+        self.video_resize_factor = int(self.processor.video_processor.patch_size) * int(
+            self.processor.video_processor.merge_size
+        )
         self.tokenizer = self.processor.tokenizer
         ensure_chat_template(self.tokenizer, model_path=self.model_dir, fallback_model_paths=())
         if not getattr(self.processor, "chat_template", None) and getattr(

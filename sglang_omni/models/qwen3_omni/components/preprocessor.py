@@ -162,6 +162,7 @@ class Qwen3OmniPreprocessor:
         self.default_video_total_pixels = (
             int(video_total_pixels) if video_total_pixels is not None else None
         )
+        self.video_resize_factor: int | None = None
         self.model_dir = _resolve_local_model_dir(model_path)
         try:
             self.processor = Qwen3OmniMoeProcessor.from_pretrained(
@@ -427,6 +428,7 @@ class Qwen3OmniPreprocessor:
                         min_pixels=resolved_video_min_pixels,
                         max_pixels=resolved_video_max_pixels,
                         total_pixels=resolved_video_total_pixels,
+                        image_factor=getattr(self, "video_resize_factor", None),
                         extract_audio=extract_audio_from_video_flag,
                         audio_target_sr=audio_target_sr,
                     )

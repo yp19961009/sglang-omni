@@ -2,11 +2,15 @@
 from argparse import Namespace
 from pathlib import Path
 
+import torch
+
 from benchmarks.eval.qwen35_omni_single_s2t import (
+    QWEN35_VIDEO_RESIZE_FACTOR,
     VideoAMMESample,
     _client_profile_paths,
     _preprocessed_audio_cache_path,
     _preprocessed_video_cache_path,
+    _preprocessed_video_spec,
     _sglang_payload,
     _sglang_server_command,
     _vllm_payload,
@@ -140,6 +144,35 @@ def test_sglang_payload_can_use_preprocessed_video_and_audio_dirs(tmp_path):
     assert "video_fps" not in payload
     assert "video_max_frames" not in payload
     assert "video_max_pixels" not in payload
+
+
+def test_qwen35_preprocessed_video_cache_uses_model_resize_factor(
+    tmp_path, monkeypatch
+):
+    from sglang_omni.preprocessing import video as video_mod
+
+    captured = {}
+
+    def fake_load_video_path(path, **kwargs):
+        captured["path"] = path
+        captured.update(kwargs)
+        return torch.ones((2, 3, 32, 64)), 1.0
+
+    monkeypatch.setattr(video_mod, "load_video_path", fake_load_video_path)
+    args = Namespace(
+        video_fps=1.0,
+        video_max_frames=128,
+        video_max_pixels=401408,
+        preprocessed_video_dir=str(tmp_path / "video"),
+    )
+    sample = _sample("001-1")
+
+    spec = _preprocessed_video_spec(args, sample)
+
+    assert spec is not None
+    assert captured["image_factor"] == QWEN35_VIDEO_RESIZE_FACTOR
+    cached = torch.load(spec["path"], map_location="cpu", weights_only=False)
+    assert cached["image_factor"] == QWEN35_VIDEO_RESIZE_FACTOR
 
 
 def test_parse_prediction_prefers_answer_tag_then_option_text_fallback():

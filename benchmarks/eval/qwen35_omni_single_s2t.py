@@ -32,6 +32,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 LOGGER = logging.getLogger("qwen35_omni_single_s2t")
+QWEN35_VIDEO_RESIZE_FACTOR = 32
 
 DEFAULT_MODEL_PATH = (
     "/myapp/models/qwen3_5_omni_23b_final_multilingual_all_voice_bf16_0315"
@@ -416,9 +417,17 @@ def _preprocessed_video_spec(
             fps=args.video_fps,
             max_frames=args.video_max_frames,
             max_pixels=args.video_max_pixels,
+            image_factor=QWEN35_VIDEO_RESIZE_FACTOR,
         )
         tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        torch.save({"video": video, "sample_fps": float(sampled_fps)}, tmp_path)
+        torch.save(
+            {
+                "video": video,
+                "sample_fps": float(sampled_fps),
+                "image_factor": QWEN35_VIDEO_RESIZE_FACTOR,
+            },
+            tmp_path,
+        )
         tmp_path.replace(cache_path)
     return {"path": str(cache_path)}
 

@@ -42,6 +42,7 @@ class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, Any | None]]):
         min_pixels: int | None = None,
         max_pixels: int | None = None,
         total_pixels: int | None = None,
+        image_factor: int | None = None,
         image_mode: str = "RGB",
         extract_audio: bool = False,
         audio_target_sr: int = 16000,
@@ -66,6 +67,7 @@ class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, Any | None]]):
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
         self.total_pixels = total_pixels
+        self.image_factor = image_factor
         self.image_mode = image_mode
         self.extract_audio = extract_audio
         self.audio_target_sr = audio_target_sr
@@ -79,6 +81,7 @@ class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, Any | None]]):
             min_pixels=self.min_pixels,
             max_pixels=self.max_pixels,
             total_pixels=self.total_pixels,
+            image_factor=self.image_factor,
         )
 
     def load_bytes(self, data: bytes) -> tuple[torch.Tensor, float, Any | None]:
@@ -135,6 +138,7 @@ async def ensure_video_list_async(
     min_pixels: int | None = None,
     max_pixels: int | None = None,
     total_pixels: int | None = None,
+    image_factor: int | None = None,
     image_mode: str = "RGB",
     resource_connector: Any | None = None,
     extract_audio: bool = False,
@@ -191,6 +195,7 @@ async def ensure_video_list_async(
                 min_pixels=min_pixels,
                 max_pixels=max_pixels,
                 total_pixels=total_pixels,
+                image_factor=image_factor,
                 image_mode=image_mode,
                 extract_audio=extract_audio,
                 audio_target_sr=audio_target_sr,
@@ -208,6 +213,7 @@ async def ensure_video_list_async(
                     min_pixels,
                     max_pixels,
                     total_pixels,
+                    image_factor,
                 )
                 audio_task = loop.run_in_executor(
                     global_thread_pool,
@@ -229,6 +235,7 @@ async def ensure_video_list_async(
                     min_pixels,
                     max_pixels,
                     total_pixels,
+                    image_factor,
                 )
                 return video, sample_fps, None
 
@@ -578,6 +585,7 @@ def load_video_path(
     min_pixels: int | None = None,
     max_pixels: int | None = None,
     total_pixels: int | None = None,
+    image_factor: int | None = None,
 ) -> tuple[torch.Tensor, float]:
     """Load a local video into a torch tensor (T, C, H, W) on CPU."""
     path = Path(path)
@@ -616,8 +624,11 @@ def load_video_path(
                 f"{fallback_exc}"
             ) from fallback_exc
     nframes, _, height, width = video.shape
-    image_factor, default_min_pixels, default_max_pixels, default_total_pixels = (
+    default_image_factor, default_min_pixels, default_max_pixels, default_total_pixels = (
         _qwen_video_pixel_limits()
+    )
+    image_factor = (
+        int(image_factor) if image_factor is not None else default_image_factor
     )
     frame_factor = getattr(qwen_vision, "FRAME_FACTOR", 2)
     min_pixels = ele.get("min_pixels", default_min_pixels)
