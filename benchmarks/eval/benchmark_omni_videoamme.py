@@ -200,6 +200,33 @@ encoder stages run in parallel and `mm_aggregate` waits for upstream results.
 | thinker input -> scheduler_prefill_start                     | 8.526    |
 | scheduler_prefill_start -> scheduler_first_emit              | 401.589  |
 | **post_media_to_first_token_ms**                             | **1483.578** |
+
+Qwen3.5-Omni Four-Stage Optimization Result (H20, 2026-07-11)
+
+Accepted configuration: preprocessed media input, native SGLang vision encoder
+with grouped SDPA, BF16 encoder payloads, segmented SHM relay with mmap reads,
+Hopper FA3 thinker attention, 8192-token chunked prefill, CUDA graph on,
+torch.compile on, radix cache off, image-encoder batch dedup off.
+
+Single-request profile (`002-1` warmup, `001-1` measured):
+
+| Mode               | latency_s | request_to_first_token_ms | post_media_to_first_token_ms | preprocess_ms | hf_processor_ms | image_encoder_ms | audio_encoder_ms | prefill_execute_ms |
+| ------------------ | --------- | ------------------------- | ---------------------------- | ------------- | --------------- | ---------------- | ---------------- | ------------------ |
+| cold media/default | 1.082     | 1057.454                  | 923.235                      | 254.945       | 94.296          | 351.698          | 394.459          | 376.524            |
+| warm media mean    | 0.891     | 865.893                   | 856.121                      | 123.359       | 90.701          | 299.712          | 343.007          | 365.531            |
+
+CI-50 summary:
+
+| concurrency | completed | failed | accuracy | latency_mean_s | latency_p95_s | throughput_qps | request_to_first_token_mean_ms | Source |
+| ----------- | --------- | ------ | -------- | -------------- | ------------- | -------------- | ------------------------------ | ------ |
+| 1           | 50        | 0      | 58.00%   | 1.050          | 1.163         | n/a            | n/a                            | `qwen35_s2t_align/sglang-final-accepted-20260711-025518/ci50-c1.json` |
+| 8           | 50        | 0      | 58.00%   | 5.131          | 7.699         | 1.502          | 4217.125                       | `qwen35_s2t_align/sglang-final-accepted-20260711-025518/ci50-c8` |
+
+Accuracy under concurrency is not deterministic for this branch. Repeated
+identical-request and CI-50 runs can change answer distributions even on the
+pre-optimization `fc34ac` baseline, with radix cache and image batch dedup both
+disabled. Use repeated runs or vLLM alignment to evaluate accuracy changes;
+single c=8 accuracy should not be treated as a stable performance signal.
 """
 
 from __future__ import annotations
