@@ -163,6 +163,7 @@ class Qwen3OmniPreprocessor:
             int(video_total_pixels) if video_total_pixels is not None else None
         )
         self.video_resize_factor: int | None = None
+        self.image_encoder_input_dtype: torch.dtype | None = None
         self.model_dir = _resolve_local_model_dir(model_path)
         try:
             self.processor = Qwen3OmniMoeProcessor.from_pretrained(
@@ -223,6 +224,23 @@ class Qwen3OmniPreprocessor:
                 result.append(msg)
 
         return result
+
+    def _cast_image_encoder_inputs(
+        self, image_encoder_inputs: dict[str, Any]
+    ) -> dict[str, Any]:
+        target_dtype = getattr(self, "image_encoder_input_dtype", None)
+        if target_dtype is None:
+            return image_encoder_inputs
+
+        for key in ("pixel_values", "pixel_values_videos"):
+            value = image_encoder_inputs.get(key)
+            if (
+                isinstance(value, torch.Tensor)
+                and value.is_floating_point()
+                and value.dtype != target_dtype
+            ):
+                image_encoder_inputs[key] = value.to(dtype=target_dtype)
+        return image_encoder_inputs
 
     async def __call__(self, payload: StagePayload) -> StagePayload:
         _emit_event(
@@ -644,6 +662,13 @@ class Qwen3OmniPreprocessor:
         image_encoder_inputs = {
             k: v for k, v in image_encoder_inputs.items() if v is not None
         }
+        _emit_preprocess_event(payload, "preprocess_encoder_cast_start")
+        try:
+            image_encoder_inputs = self._cast_image_encoder_inputs(
+                image_encoder_inputs
+            )
+        finally:
+            _emit_preprocess_event(payload, "preprocess_encoder_cast_end")
         if (
             image_encoder_inputs.get("pixel_values") is not None
             or image_encoder_inputs.get("pixel_values_videos") is not None

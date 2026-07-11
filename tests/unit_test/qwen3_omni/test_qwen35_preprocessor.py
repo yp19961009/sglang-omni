@@ -7,6 +7,7 @@ import torch
 
 from sglang_omni.models.qwen35_omni.components.preprocessor import (
     Qwen35OmniNextProcessor,
+    Qwen35OmniPreprocessor,
 )
 
 
@@ -49,3 +50,19 @@ def test_qwen35_video_processor_uses_presampled_video_path() -> None:
     assert metadata[0]["video_backend"] == "preprocessed"
     assert "video_metadata" not in output
     assert output["video_second_per_grid"].tolist() == pytest.approx([1.6])
+
+
+def test_qwen35_casts_only_floating_encoder_pixels_to_bfloat16() -> None:
+    preprocessor = object.__new__(Qwen35OmniPreprocessor)
+    preprocessor.image_encoder_input_dtype = torch.bfloat16
+    grid = torch.tensor([[2, 4, 4]], dtype=torch.long)
+    inputs = {
+        "pixel_values_videos": torch.randn((8, 16), dtype=torch.float32),
+        "video_grid_thw": grid,
+    }
+
+    output = preprocessor._cast_image_encoder_inputs(inputs)
+
+    assert output is inputs
+    assert output["pixel_values_videos"].dtype == torch.bfloat16
+    assert output["video_grid_thw"] is grid

@@ -318,6 +318,7 @@ class Qwen35OmniPreprocessor(Qwen3OmniPreprocessor):
         self.video_resize_factor = int(self.processor.video_processor.patch_size) * int(
             self.processor.video_processor.merge_size
         )
+        self.image_encoder_input_dtype = torch.bfloat16
         self.tokenizer = self.processor.tokenizer
         ensure_chat_template(self.tokenizer, model_path=self.model_dir, fallback_model_paths=())
         if not getattr(self.processor, "chat_template", None) and getattr(
