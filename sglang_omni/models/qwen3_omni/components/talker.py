@@ -1156,7 +1156,12 @@ class Qwen3OmniTalker(nn.Module):
             sampled = sampled.squeeze(-1)
         return sampled
 
-    def _build_static_sampling_info(self, batch_size: int) -> SamplingBatchInfo:
+    def _build_static_sampling_info(
+        self,
+        batch_size: int,
+        *,
+        vocab_size: int | None = None,
+    ) -> SamplingBatchInfo:
         return SamplingBatchInfo(
             temperatures=self._sampling_temperatures[:batch_size],
             top_ps=self._sampling_top_ps[:batch_size],
@@ -1168,7 +1173,11 @@ class Qwen3OmniTalker(nn.Module):
             need_top_p_sampling=True,
             need_top_k_sampling=True,
             need_min_p_sampling=False,
-            vocab_size=self.config.text_config.vocab_size,
+            vocab_size=(
+                self.config.text_config.vocab_size
+                if vocab_size is None
+                else int(vocab_size)
+            ),
             grammars=[],
             vocab_mask=None,
             apply_mask_func=None,

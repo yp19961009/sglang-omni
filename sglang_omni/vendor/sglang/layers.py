@@ -17,7 +17,7 @@ import torch
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -143,6 +143,7 @@ __all__ = [
     "get_rope",
     "get_layer_id",
     "RMSNorm",
+    "GemmaRMSNorm",
     "SiluAndMul",
     "MergedColumnParallelLinear",
     "QKVParallelLinear",

@@ -9,6 +9,7 @@ from transformers import AutoConfig, PretrainedConfig
 
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang_omni.models.qwen3_omni.hf_config import (
+    Qwen3OmniMoeTalkerCodePredictorConfig,
     Qwen3OmniMoeVisionEncoderConfig,
 )
 
@@ -64,6 +65,86 @@ class Qwen35OmniNextVisionEncoderConfig(Qwen3OmniMoeVisionEncoderConfig):
 
 class Qwen35OmniNextTextConfig(Qwen3NextConfig):
     model_type = "qwen3_omni_next_text"
+
+
+class Qwen35OmniNextTalkerTextConfig(Qwen3NextConfig):
+    """Qwen3Next hybrid/MoE backbone used by the Qwen3.5 talker."""
+
+    model_type = "qwen3_omni_next_talker_text"
+
+
+class Qwen35OmniNextTalkerCodePredictorConfig(Qwen3OmniMoeTalkerCodePredictorConfig):
+    """Dense residual-code predictor with a talker-width input projection."""
+
+    model_type = "qwen3_omni_next_talker_code_predictor"
+
+    def __init__(
+        self,
+        talker_hidden_size: int = 1280,
+        layer_types: list[str] | None = None,
+        partial_rotary_factor: float = 0.25,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.talker_hidden_size = talker_hidden_size
+        self.layer_types = layer_types or ["full_attention"] * self.num_hidden_layers
+        self.partial_rotary_factor = partial_rotary_factor
+
+
+class Qwen35OmniNextTalkerConfig(PretrainedConfig):
+    """Top-level Qwen3.5 talker config parsed from the monolithic checkpoint."""
+
+    model_type = "qwen3_omni_next_talker"
+
+    def __init__(
+        self,
+        text_config: Any | None = None,
+        code_predictor_config: Any | None = None,
+        num_code_groups: int = 16,
+        thinker_hidden_size: int = 2048,
+        accept_hidden_layer: int = 18,
+        codec_pad_id: int = 4196,
+        codec_bos_id: int = 4197,
+        codec_eos_token_id: int = 4198,
+        codec_think_id: int = 4202,
+        codec_nothink_id: int = 4203,
+        codec_think_bos_id: int = 4204,
+        codec_think_eos_id: int = 4205,
+        speaker_id: dict[str, int] | None = None,
+        speaker_system_prompt_id: dict[str, list[int]] | None = None,
+        speaker_embedding_length: int = 50,
+        max_speaker_num: int = 500,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        if isinstance(text_config, dict):
+            text_config = Qwen35OmniNextTalkerTextConfig(**text_config)
+        elif text_config is None:
+            text_config = Qwen35OmniNextTalkerTextConfig()
+        self.text_config = text_config
+
+        if isinstance(code_predictor_config, dict):
+            code_predictor_config = Qwen35OmniNextTalkerCodePredictorConfig(
+                **code_predictor_config
+            )
+        elif code_predictor_config is None:
+            code_predictor_config = Qwen35OmniNextTalkerCodePredictorConfig()
+        self.code_predictor_config = code_predictor_config
+
+        self.num_code_groups = num_code_groups
+        self.thinker_hidden_size = thinker_hidden_size
+        self.accept_hidden_layer = accept_hidden_layer
+        self.codec_pad_id = codec_pad_id
+        self.codec_bos_id = codec_bos_id
+        self.codec_eos_token_id = codec_eos_token_id
+        self.codec_think_id = codec_think_id
+        self.codec_nothink_id = codec_nothink_id
+        self.codec_think_bos_id = codec_think_bos_id
+        self.codec_think_eos_id = codec_think_eos_id
+        self.speaker_id = speaker_id or {}
+        self.speaker_system_prompt_id = speaker_system_prompt_id or {}
+        self.speaker_embedding_length = speaker_embedding_length
+        self.max_speaker_num = max_speaker_num
 
 
 class Qwen35OmniNextThinkerConfig(PretrainedConfig):
@@ -134,6 +215,10 @@ class Qwen35OmniNextConfig(PretrainedConfig):
         elif thinker_config is None:
             thinker_config = Qwen35OmniNextThinkerConfig()
         self.thinker_config = thinker_config
+        if isinstance(talker_config, dict):
+            talker_config = Qwen35OmniNextTalkerConfig(**talker_config)
+        elif talker_config is None:
+            talker_config = Qwen35OmniNextTalkerConfig()
         self.talker_config = talker_config
         self.code2wav_config = code2wav_config
         if not getattr(self, "architectures", None):
@@ -144,6 +229,12 @@ _CONFIGS = (
     ("qwen3_omni_next", Qwen35OmniNextConfig),
     ("qwen3_omni_next_thinker", Qwen35OmniNextThinkerConfig),
     ("qwen3_omni_next_text", Qwen35OmniNextTextConfig),
+    ("qwen3_omni_next_talker", Qwen35OmniNextTalkerConfig),
+    ("qwen3_omni_next_talker_text", Qwen35OmniNextTalkerTextConfig),
+    (
+        "qwen3_omni_next_talker_code_predictor",
+        Qwen35OmniNextTalkerCodePredictorConfig,
+    ),
     ("qwen3_omni_next_audio_encoder", Qwen35OmniNextAudioEncoderConfig),
     ("qwen3_omni_next_vision_encoder", Qwen35OmniNextVisionEncoderConfig),
 )

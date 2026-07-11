@@ -25,6 +25,7 @@ class ModelWorkerConfig:
 _ARCH_CONFIG_MAP: dict[str, tuple[str, str | None]] = {
     "BailingMoeV2ForCausalLM": ("llm_config", None),
     "Qwen3OmniTalker": ("talker_config", "text_config"),
+    "Qwen35OmniNextTalker": ("talker_config", "text_config"),
     "Qwen3OmniThinkerForCausalLM": ("thinker_config", "text_config"),
     "Qwen35OmniNextThinkerForCausalLM": ("thinker_config", "text_config"),
     "Qwen3ASRForConditionalGeneration": ("thinker_config", "text_config"),
@@ -111,6 +112,23 @@ class ModelWorker:
                 return
             text_cfg.thinker_config = thinker_cfg
             text_cfg.architectures = [arch]
+            model_config.hf_config = text_cfg
+            model_config.hf_text_config = text_cfg
+            model_config.num_attention_heads = text_cfg.num_attention_heads
+            model_config.num_key_value_heads = text_cfg.num_key_value_heads
+            model_config.hidden_size = text_cfg.hidden_size
+            model_config.num_hidden_layers = text_cfg.num_hidden_layers
+            model_config.vocab_size = text_cfg.vocab_size
+            return
+        if arch == "Qwen35OmniNextTalker":
+            root_cfg = model_config.hf_config
+            talker_cfg = getattr(root_cfg, "talker_config", None)
+            text_cfg = getattr(talker_cfg, "text_config", None)
+            if talker_cfg is None or text_cfg is None:
+                return
+            text_cfg.talker_config = talker_cfg
+            text_cfg.architectures = [arch]
+            model_config._omni_root_hf_config = root_cfg
             model_config.hf_config = text_cfg
             model_config.hf_text_config = text_cfg
             model_config.num_attention_heads = text_cfg.num_attention_heads
