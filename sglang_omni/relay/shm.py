@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from multiprocessing import shared_memory as _shm
 from typing import Any
@@ -32,6 +33,33 @@ def shm_create_from_tensor(tensor: torch.Tensor) -> _shm.SharedMemory:
     # Uses low-level C memcpy to write directly from source Tensor to SHM
     shm_view[:] = t_np[:]
 
+    return shm
+
+
+def shm_create_from_segments(
+    segments: list[tuple[int, torch.Tensor]], total_size: int
+) -> _shm.SharedMemory:
+    """Create one SHM block and copy tensor byte segments into final offsets."""
+    if total_size <= 0:
+        raise ValueError(f"total_size must be positive, got {total_size}")
+
+    shm = _shm.SharedMemory(create=True, size=total_size)
+    try:
+        shm_view = torch.frombuffer(shm.buf, dtype=torch.uint8)
+        for offset, tensor in segments:
+            flat = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
+            if flat.is_cuda:
+                flat = flat.cpu()
+            end = offset + flat.numel()
+            if offset < 0 or end > total_size:
+                raise ValueError(
+                    f"SHM segment [{offset}, {end}) exceeds total size {total_size}"
+                )
+            shm_view[offset:end].copy_(flat)
+    except Exception:
+        shm.close()
+        shm.unlink()
+        raise
     return shm
 
 
@@ -161,6 +189,63 @@ class ShmRelay(Relay):
         except Exception as e:
             self._sem.release()
             raise e
+
+    async def put_many_async(
+        self,
+        segments: list[tuple[int, torch.Tensor]],
+        total_size: int,
+        request_id: str | None = None,
+        dst_rank: int | None = None,
+    ) -> RelayOperation:
+        """Write pre-positioned tensors directly into one SHM allocation."""
+        del dst_rank
+        if request_id is None:
+            request_id = str(uuid.uuid4())
+
+        await self._sem.acquire()
+        try:
+            shm = shm_create_from_segments(segments, total_size)
+            metadata = {
+                "engine_id": self.engine_id,
+                "transfer_info": {
+                    "shm_name": shm.name,
+                    "size": shm.size,
+                    "req_id": request_id,
+                },
+            }
+            self._sem.release()
+            return ShmPutOperation(metadata, shm)
+        except Exception:
+            self._sem.release()
+            raise
+
+    def map_tensor(
+        self, metadata: Any, request_id: str | None = None
+    ) -> torch.Tensor | None:
+        """Map a CPU SHM transfer as a tensor without copying its bytes."""
+        del request_id
+        if torch.device(self.device).type != "cpu":
+            return None
+
+        transfer_info = metadata["transfer_info"]
+        shm_name = transfer_info["shm_name"]
+        size = int(transfer_info["size"])
+        shm_path = os.path.join("/dev/shm", shm_name.lstrip("/"))
+        if not os.path.exists(shm_path):
+            return None
+
+        existing_shm = _shm.SharedMemory(name=shm_name)
+        try:
+            tensor = torch.from_file(
+                shm_path,
+                shared=True,
+                size=size,
+                dtype=torch.uint8,
+            )
+            existing_shm.unlink()
+            return tensor
+        finally:
+            existing_shm.close()
 
     async def get_async(
         self, metadata: Any, dest_tensor: torch.Tensor, request_id: str = None

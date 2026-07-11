@@ -6,6 +6,7 @@ streaming chunk transfer, and NIXL credit deadlock avoidance.
 
 Extracted from worker/data_plane.py and worker/runtime.py.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -13,6 +14,7 @@ import base64
 import io
 import logging
 import pickle
+import time
 from multiprocessing.reduction import ForkingPickler
 from typing import Any
 from uuid import uuid4
@@ -436,6 +438,7 @@ async def write_payload(
     tensor_ref_policy: TensorRefPolicy | None = None,
 ) -> tuple[dict[str, Any], Any]:
     """Write a StagePayload to relay. Returns (control_plane_metadata, relay_op)."""
+    started_ns = time.perf_counter_ns()
     device = getattr(relay, "device", "cpu")
     transport_device = torch.device(device)
 
@@ -453,6 +456,7 @@ async def write_payload(
         )
     else:
         modified_data, tensor_dict = extract_tensors(payload.data)
+    extracted_ns = time.perf_counter_ns()
 
     payload_no_tensors = StagePayload(
         request_id=payload.request_id,
@@ -460,9 +464,10 @@ async def write_payload(
         data=modified_data,
     )
     metadata_bytes = pickle.dumps(payload_no_tensors)
+    pickled_ns = time.perf_counter_ns()
 
+    tensor_segments: list[tuple[int, torch.Tensor]] = []
     if tensor_dict:
-        tensor_buffers = []
         tensor_info = []
         offset = 0
         for path, tensor in tensor_dict.items():
@@ -470,12 +475,8 @@ async def write_payload(
             if flat.device != transport_device:
                 flat = flat.to(device=transport_device)
             padding = _pad_offset(offset, _dtype_alignment(tensor.dtype))
-            if padding:
-                tensor_buffers.append(
-                    torch.zeros(padding, dtype=torch.uint8, device=transport_device)
-                )
-                offset += padding
-            tensor_buffers.append(flat)
+            offset += padding
+            tensor_segments.append((offset, flat))
             tensor_info.append(
                 {
                     "path": path,
@@ -486,17 +487,55 @@ async def write_payload(
                 }
             )
             offset += flat.numel()
-        all_tensors = torch.cat(tensor_buffers)
     else:
-        all_tensors = torch.zeros(1, dtype=torch.uint8, device=device)
         tensor_info = []
+    packed_ns = time.perf_counter_ns()
 
-    op = await relay.put_async(all_tensors, request_id=request_id)
+    put_many_async = getattr(relay, "put_many_async", None)
+    if tensor_segments and put_many_async is not None:
+        op = await put_many_async(
+            tensor_segments,
+            total_size=offset,
+            request_id=request_id,
+        )
+    else:
+        if tensor_segments:
+            tensor_buffers = []
+            cursor = 0
+            for segment_offset, flat in tensor_segments:
+                padding = segment_offset - cursor
+                if padding:
+                    tensor_buffers.append(
+                        torch.zeros(
+                            padding,
+                            dtype=torch.uint8,
+                            device=transport_device,
+                        )
+                    )
+                tensor_buffers.append(flat)
+                cursor = segment_offset + flat.numel()
+            all_tensors = torch.cat(tensor_buffers)
+        else:
+            all_tensors = torch.zeros(1, dtype=torch.uint8, device=device)
+        op = await relay.put_async(all_tensors, request_id=request_id)
+    relay_put_ns = time.perf_counter_ns()
+
+    write_profile = {
+        "extract_ms": round((extracted_ns - started_ns) / 1_000_000, 3),
+        "pickle_ms": round((pickled_ns - extracted_ns) / 1_000_000, 3),
+        "pack_ms": round((packed_ns - pickled_ns) / 1_000_000, 3),
+        "relay_put_ms": round((relay_put_ns - packed_ns) / 1_000_000, 3),
+        "total_ms": round((relay_put_ns - started_ns) / 1_000_000, 3),
+        "tensor_count": len(tensor_info),
+        "tensor_bytes": int(offset) if tensor_segments else 0,
+        "pickle_bytes": len(metadata_bytes),
+    }
 
     metadata: dict[str, Any] = {
         "relay_info": op.metadata,
         "payload_pickle": base64.b64encode(metadata_bytes).decode("ascii"),
         "tensor_info": tensor_info,
+        "relay_write_profile": write_profile,
     }
     tensor_ref_blobs = collect_tensor_refs(modified_data)
     if tensor_ref_blobs:
@@ -522,11 +561,13 @@ async def read_payload(
     tensor_dict = {}
 
     data_size = relay_info["transfer_info"]["size"]
-    recv_tensor = torch.zeros(data_size, dtype=torch.uint8, device=device)
-    op = await relay.get_async(
-        metadata=relay_info, dest_tensor=recv_tensor, request_id=request_id
+    recv_tensor = await _read_relay_buffer(
+        relay,
+        relay_info=relay_info,
+        data_size=data_size,
+        device=device,
+        request_id=request_id,
     )
-    await op.wait_for_completion()
 
     if tensor_info:
         for info in tensor_info:
@@ -596,14 +637,46 @@ async def read_blob(
     offset = int(metadata.get("tensor_offset", 0))
 
     data_size = relay_info["transfer_info"]["size"]
-    recv_buf = torch.zeros(data_size, dtype=torch.uint8, device=device)
-    op = await relay.get_async(
-        metadata=relay_info, dest_tensor=recv_buf, request_id=key
+    recv_buf = await _read_relay_buffer(
+        relay,
+        relay_info=relay_info,
+        data_size=data_size,
+        device=device,
+        request_id=key,
     )
-    await op.wait_for_completion()
 
     dtype = _dtype_from_str(dtype_str)
     return recv_buf[offset:].view(dtype).reshape(shape)
+
+
+async def _read_relay_buffer(
+    relay: Relay,
+    *,
+    relay_info: dict[str, Any],
+    data_size: int,
+    device: str,
+    request_id: str,
+) -> torch.Tensor:
+    map_tensor = getattr(relay, "map_tensor", None)
+    if map_tensor is not None:
+        mapped = map_tensor(relay_info, request_id=request_id)
+        if mapped is not None:
+            if mapped.dtype != torch.uint8 or mapped.numel() != data_size:
+                raise RuntimeError(
+                    "relay mapped tensor does not match transfer metadata: "
+                    f"dtype={mapped.dtype}, size={mapped.numel()}, "
+                    f"expected dtype=torch.uint8, size={data_size}"
+                )
+            return mapped
+
+    recv_buf = torch.zeros(data_size, dtype=torch.uint8, device=device)
+    op = await relay.get_async(
+        metadata=relay_info,
+        dest_tensor=recv_buf,
+        request_id=request_id,
+    )
+    await op.wait_for_completion()
+    return recv_buf
 
 
 # ---------------------------------------------------------------------------
