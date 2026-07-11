@@ -32,7 +32,9 @@ class SinusoidsPositionEmbedding(nn.Module):
         positional_embedding = torch.cat(
             [torch.sin(scaled_time), torch.cos(scaled_time)], dim=1
         )
-        self.register_buffer("positional_embedding", positional_embedding, persistent=False)
+        self.register_buffer(
+            "positional_embedding", positional_embedding, persistent=False
+        )
 
     def forward(self, seqlen: int) -> torch.Tensor:
         return self.positional_embedding[:seqlen, :]
@@ -60,16 +62,23 @@ class Qwen35OmniNextAudioAttention(nn.Module):
             .unsqueeze(0)
         )
 
-    def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, cu_seqlens: list[int] | torch.Tensor
+    ) -> torch.Tensor:
+        boundaries = (
+            cu_seqlens.tolist() if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
+        )
         outputs = []
-        for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
             if end <= start:
                 continue
             x = hidden_states[start:end]
             q = self._project(self.q_proj, x)
             k = self._project(self.k_proj, x)
             v = self._project(self.v_proj, x)
-            attn = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+            attn = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=0.0, is_causal=False
+            )
             attn = attn.squeeze(0).transpose(0, 1).reshape(x.shape[0], self.embed_dim)
             outputs.append(self.out_proj(attn))
         if not outputs:
@@ -88,7 +97,9 @@ class Qwen35OmniNextAudioEncoderLayer(nn.Module):
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
         self.activation_fn = F.gelu
 
-    def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, cu_seqlens: list[int] | torch.Tensor
+    ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(hidden_states, cu_seqlens)
@@ -120,10 +131,13 @@ class Qwen35OmniNextAudioEncoderModel(nn.Module):
         self.conv2d2 = nn.Conv2d(hidden, hidden, 3, 2, padding=1)
         self.conv2d3 = nn.Conv2d(hidden, hidden, 3, 2, padding=1)
         self.conv2d4 = nn.Conv2d(hidden, hidden, 3, 2, padding=1)
-        conv_freq = (((((self.num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2 + 1) // 2)
+        conv_freq = ((((self.num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2 + 1) // 2
         self.conv_out = nn.Linear(hidden * conv_freq, int(config.d_model), bias=False)
         self.layers = nn.ModuleList(
-            [Qwen35OmniNextAudioEncoderLayer(config) for _ in range(int(config.encoder_layers))]
+            [
+                Qwen35OmniNextAudioEncoderLayer(config)
+                for _ in range(int(config.encoder_layers))
+            ]
         )
         self.ln_post = nn.LayerNorm(int(config.d_model))
         self.proj1 = nn.Linear(int(config.d_model), int(config.d_model), bias=True)
@@ -150,22 +164,34 @@ class Qwen35OmniNextAudioEncoderModel(nn.Module):
         feature_lens: torch.Tensor,
         aftercnn_lens: torch.Tensor,
     ) -> torch.Tensor:
-        chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
+        # Chunk metadata stays on CPU to avoid a device sync in every layer.
+        feature_lens = feature_lens.to(device="cpu", dtype=torch.long)
+        aftercnn_lens = aftercnn_lens.to(device="cpu", dtype=torch.long)
+
+        window = self.n_window * 2
+        chunk_num = torch.div(
+            feature_lens + window - 1,
+            window,
+            rounding_mode="floor",
+        )
         chunk_lengths = torch.tensor(
-            [self.n_window * 2] * int(chunk_num.sum().item()),
+            [window] * int(chunk_num.sum().item()),
             dtype=torch.long,
-            device=feature_lens.device,
         )
         tail_chunk_index = F.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
-        chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
-        chunk_lengths[chunk_lengths == 0] = self.n_window * 2
+        chunk_lengths[tail_chunk_index] = feature_lens % window
+        chunk_lengths[chunk_lengths == 0] = window
 
         chunk_list = input_features.T.split(chunk_lengths.tolist(), dim=0)
-        padded_feature = nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
+        padded_feature = nn.utils.rnn.pad_sequence(
+            chunk_list, batch_first=True
+        ).transpose(1, 2)
         feature_lens_after_cnn = self._get_cnn_output_lengths(chunk_lengths)
         max_len_after_cnn = int(feature_lens_after_cnn.max().item())
         indices = torch.arange(max_len_after_cnn, device=padded_feature.device)
-        padded_mask_after_cnn = indices.unsqueeze(0) < feature_lens_after_cnn.unsqueeze(1)
+        padded_mask_after_cnn = indices.unsqueeze(0) < feature_lens_after_cnn.to(
+            device=padded_feature.device
+        ).unsqueeze(1)
 
         padded_feature = padded_feature.unsqueeze(1)
         if padded_feature.size(0) <= self.conv_chunksize:
@@ -184,27 +210,29 @@ class Qwen35OmniNextAudioEncoderModel(nn.Module):
             padded_embed = torch.cat(chunks, dim=0)
 
         bsz, channels, freq, steps = padded_embed.size()
-        padded_embed = padded_embed.permute(0, 3, 1, 2).contiguous().view(
-            bsz, steps, channels * freq
+        padded_embed = (
+            padded_embed.permute(0, 3, 1, 2)
+            .contiguous()
+            .view(bsz, steps, channels * freq)
         )
         padded_embed = self.conv_out(padded_embed)
         pos = self.positional_embedding.positional_embedding[: padded_embed.shape[1], :]
         padded_embed = padded_embed + pos.unsqueeze(0).to(padded_embed.dtype)
         hidden_states = padded_embed[padded_mask_after_cnn]
 
-        cu_chunk_lens = [0]
+        chunk_attention_lengths: list[int] = []
         window_aftercnn = padded_mask_after_cnn.shape[-1] * (
-            self.n_window_infer // (self.n_window * 2)
+            self.n_window_infer // window
         )
         for cnn_len in aftercnn_lens.tolist():
             num_full_chunks = int(cnn_len) // int(window_aftercnn)
             remainder = int(cnn_len) % int(window_aftercnn)
-            cu_chunk_lens.extend([int(window_aftercnn)] * num_full_chunks)
+            chunk_attention_lengths.extend([int(window_aftercnn)] * num_full_chunks)
             if remainder:
-                cu_chunk_lens.append(remainder)
-        cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(
-            -1, dtype=torch.int32
-        )
+                chunk_attention_lengths.append(remainder)
+        cu_seqlens = [0]
+        for length in chunk_attention_lengths:
+            cu_seqlens.append(cu_seqlens[-1] + length)
 
         for layer in self.layers:
             hidden_states = layer(hidden_states, cu_seqlens)
@@ -251,16 +279,22 @@ class Qwen35OmniAudioEncoder(nn.Module):
                 .contiguous()
             )
         if audio_feature_lengths is None:
-            raise ValueError("audio_feature_lengths or feature_attention_mask is required")
-        audio_feature_lengths = audio_feature_lengths.to(self._device, dtype=torch.long)
-        audio_output_lengths = get_feat_extract_output_lengths(audio_feature_lengths)
+            raise ValueError(
+                "audio_feature_lengths or feature_attention_mask is required"
+            )
+        audio_feature_lengths_cpu = audio_feature_lengths.to(
+            device="cpu", dtype=torch.long
+        )
+        audio_output_lengths_cpu = get_feat_extract_output_lengths(
+            audio_feature_lengths_cpu
+        )
         audio_embeds = self.audio_tower(
             input_features.to(device=self._device, dtype=self.audio_tower.dtype),
-            feature_lens=audio_feature_lengths,
-            aftercnn_lens=audio_output_lengths,
+            feature_lens=audio_feature_lengths_cpu,
+            aftercnn_lens=audio_output_lengths_cpu,
         )
         return {
             "audio_embeds": audio_embeds,
-            "audio_feature_lengths": audio_feature_lengths,
-            "audio_output_lengths": audio_output_lengths,
+            "audio_feature_lengths": audio_feature_lengths_cpu.to(self._device),
+            "audio_output_lengths": audio_output_lengths_cpu.to(self._device),
         }
