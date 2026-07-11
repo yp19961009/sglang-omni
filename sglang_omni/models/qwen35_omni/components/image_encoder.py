@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import copy
+import logging
+import threading
+from types import MethodType
 
 import torch
 import torch.nn as nn
@@ -16,9 +19,35 @@ from sglang_omni.utils import instantiate_module
 
 VISUAL_PREFIX = ("thinker.visual.", "visual.")
 VISUAL_CLASS = hf_modeling.Qwen3OmniMoeVisionEncoder
+VISUAL_BACKENDS = frozenset({"hf", "sglang"})
+NATIVE_VISUAL_ATTENTION_BACKENDS = frozenset({"sdpa", "sdpa_grouped"})
+
+logger = logging.getLogger(__name__)
+
+
+def _normalize_visual_backend(backend: str) -> str:
+    normalized = str(backend).strip().lower()
+    if normalized not in VISUAL_BACKENDS:
+        raise ValueError(
+            f"Unsupported Qwen3.5 vision backend {backend!r}; "
+            f"expected one of {sorted(VISUAL_BACKENDS)}"
+        )
+    return normalized
+
+
+def _normalize_native_visual_attention_backend(backend: str) -> str:
+    normalized = str(backend).strip().lower()
+    if normalized not in NATIVE_VISUAL_ATTENTION_BACKENDS:
+        raise ValueError(
+            f"Unsupported Qwen3.5 native vision attention backend {backend!r}; "
+            f"expected one of {sorted(NATIVE_VISUAL_ATTENTION_BACKENDS)}"
+        )
+    return normalized
 
 
 def _unpack_visual_outputs(outputs: object) -> tuple[torch.Tensor, object | None]:
+    if isinstance(outputs, torch.Tensor):
+        return outputs, None
     if hasattr(outputs, "pooler_output"):
         return outputs.pooler_output, getattr(outputs, "deepstack_features", None)
     if isinstance(outputs, tuple):
@@ -28,7 +57,9 @@ def _unpack_visual_outputs(outputs: object) -> tuple[torch.Tensor, object | None
     raise TypeError(f"Unsupported visual encoder output type: {type(outputs)!r}")
 
 
-def _remap_vision_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def _remap_vision_state_dict(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
     remapped: dict[str, torch.Tensor] = {}
     for name, tensor in state_dict.items():
         mapped = name
@@ -42,7 +73,7 @@ def _remap_vision_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, t
     return remapped
 
 
-def _build_visual(
+def _build_hf_visual(
     model_path: str,
     *,
     thinker_cfg: object,
@@ -71,6 +102,150 @@ def _build_visual(
     return visual
 
 
+def _hf_split_sdpa(
+    self,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    bsz: int,
+    cu_seqlens: torch.Tensor | None = None,
+    **_: object,
+) -> torch.Tensor:
+    """Match HF's per-grid SDPA calls instead of using a boolean block mask."""
+    if bsz != 1:
+        raise ValueError(
+            f"Qwen3.5 vision SDPA expects flattened batch size 1, got {bsz}"
+        )
+    boundaries = [0, q.shape[0]] if cu_seqlens is None else cu_seqlens.cpu().tolist()
+    outputs = []
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        q_part, k_part, v_part = [
+            tensor[start:end].transpose(0, 1).unsqueeze(0) for tensor in (q, k, v)
+        ]
+        output = torch.nn.functional.scaled_dot_product_attention(
+            q_part,
+            k_part,
+            v_part,
+            attn_mask=None,
+            dropout_p=self.dropout,
+            is_causal=False,
+            scale=self.scale,
+        )
+        outputs.append(output.squeeze(0).transpose(0, 1))
+    return torch.cat(outputs, dim=0)
+
+
+def _hf_grouped_sdpa(
+    self,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    bsz: int,
+    cu_seqlens: torch.Tensor | None = None,
+    **kwargs: object,
+) -> torch.Tensor:
+    """Batch equal-length temporal grids while retaining HF SDPA semantics."""
+    if bsz != 1 or cu_seqlens is None:
+        return _hf_split_sdpa(
+            self,
+            q,
+            k,
+            v,
+            bsz=bsz,
+            cu_seqlens=cu_seqlens,
+            **kwargs,
+        )
+
+    boundaries = cu_seqlens.cpu().tolist()
+    lengths = [end - start for start, end in zip(boundaries[:-1], boundaries[1:])]
+    if not lengths or any(length != lengths[0] for length in lengths):
+        return _hf_split_sdpa(
+            self,
+            q,
+            k,
+            v,
+            bsz=bsz,
+            cu_seqlens=cu_seqlens,
+            **kwargs,
+        )
+
+    grid_count = len(lengths)
+    grid_length = lengths[0]
+    q_batch, k_batch, v_batch = [
+        tensor.reshape(grid_count, grid_length, *tensor.shape[1:]).transpose(1, 2)
+        for tensor in (q, k, v)
+    ]
+    output = torch.nn.functional.scaled_dot_product_attention(
+        q_batch,
+        k_batch,
+        v_batch,
+        attn_mask=None,
+        dropout_p=self.dropout,
+        is_causal=False,
+        scale=self.scale,
+    )
+    return output.transpose(1, 2).reshape_as(q)
+
+
+def _build_sglang_visual(
+    model_path: str,
+    *,
+    thinker_cfg: object,
+    torch_dtype: torch.dtype,
+    device: str,
+    attention_backend: str,
+) -> nn.Module:
+    from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
+    from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
+    from sglang.srt.server_args import get_global_server_args
+
+    from sglang_omni.model_runner._sglang_qwen3_vl_patches import (
+        apply_qwen3_vl_hf_parity_patches,
+    )
+
+    apply_qwen3_vl_hf_parity_patches()
+    vision_config = Qwen3VLVisionConfig(**thinker_cfg.vision_config.to_dict())
+    server_args = get_global_server_args()
+    previous_mm_attention_backend = server_args.mm_attention_backend
+    server_args.mm_attention_backend = (
+        "sdpa" if attention_backend == "sdpa_grouped" else attention_backend
+    )
+    try:
+        visual = Qwen3VLMoeVisionModel(
+            vision_config,
+            norm_eps=float(getattr(thinker_cfg.text_config, "rms_norm_eps", 1e-6)),
+            use_data_parallel=True,
+        )
+    finally:
+        server_args.mm_attention_backend = previous_mm_attention_backend
+
+    visual.config = thinker_cfg.vision_config
+    visual.fast_pos_embed_interpolate = MethodType(
+        VISUAL_CLASS.fast_pos_embed_interpolate, visual
+    )
+    if attention_backend in {"sdpa", "sdpa_grouped"}:
+        forward = (
+            _hf_grouped_sdpa if attention_backend == "sdpa_grouped" else _hf_split_sdpa
+        )
+        for block in visual.blocks:
+            block.attn.qkv_backend.forward = MethodType(forward, block.attn.qkv_backend)
+    state_dict = load_weights_by_prefix(
+        model_path,
+        prefix=VISUAL_PREFIX,
+        local_files_only=True,
+    )
+    state_dict = {
+        name.replace(".attn.qkv.", ".attn.qkv_proj."): tensor
+        for name, tensor in state_dict.items()
+    }
+    visual.load_state_dict(state_dict, strict=True)
+    visual.eval()
+    visual = visual.to(device=device, dtype=torch_dtype)
+    # Native dtype/device properties still reference patch_embed.proj.
+    _optimize_patch_embed(visual, keep_conv=True)
+    return visual
+
+
 class Qwen35OmniImageEncoder(nn.Module):
     """Qwen3.5-Omni vision tower extracted as an encoder stage."""
 
@@ -80,22 +255,70 @@ class Qwen35OmniImageEncoder(nn.Module):
         *,
         device: str = "cuda",
         dtype: str | torch.dtype | None = None,
+        backend: str = "hf",
+        attention_backend: str = "sdpa_grouped",
     ) -> None:
         super().__init__()
-        torch_dtype = resolve_dtype(dtype)
-        thinker_cfg = load_thinker_config(model_path)
-        vision_cfg = thinker_cfg.vision_config
+        self._backend = _normalize_visual_backend(backend)
+        self._attention_backend = _normalize_native_visual_attention_backend(
+            attention_backend
+        )
+        self._model_path = model_path
+        self._torch_dtype = resolve_dtype(dtype) or torch.bfloat16
+        self._thinker_cfg = load_thinker_config(model_path)
+        vision_cfg = self._thinker_cfg.vision_config
         self._device = torch.device(device)
-        self.visual = _build_visual(
-            model_path,
-            thinker_cfg=thinker_cfg,
-            torch_dtype=torch_dtype,
-            device=device,
+        self._visual_lock = threading.Lock()
+        self.visual = (
+            _build_hf_visual(
+                model_path,
+                thinker_cfg=self._thinker_cfg,
+                torch_dtype=self._torch_dtype,
+                device=device,
+            )
+            if self._backend == "hf"
+            else None
         )
         self.spatial_merge_size = int(vision_cfg.spatial_merge_size)
         self.out_hidden_size = int(vision_cfg.out_hidden_size)
         self.deepstack_layers = 0
-        self.visual_dtype_bytes = torch.empty((), dtype=self.visual.dtype).element_size()
+        self.visual_dtype_bytes = torch.empty(
+            (), dtype=self._torch_dtype
+        ).element_size()
+        logger.info(
+            "Qwen3.5 image encoder backend=%s attention_backend=%s",
+            self._backend,
+            self._attention_backend,
+        )
+
+    def _ensure_visual(self) -> nn.Module:
+        if self.visual is not None:
+            return self.visual
+        with self._visual_lock:
+            if self.visual is None:
+                self.visual = _build_sglang_visual(
+                    self._model_path,
+                    thinker_cfg=self._thinker_cfg,
+                    torch_dtype=self._torch_dtype,
+                    device=str(self._device),
+                    attention_backend=self._attention_backend,
+                )
+        return self.visual
+
+    def _encode_pixels(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    ) -> tuple[torch.Tensor, object | None, torch.Tensor]:
+        visual = self._ensure_visual()
+        pixel_values = pixel_values.to(device=self._device, dtype=self._torch_dtype)
+        output_grid = grid_thw.to(self._device, dtype=torch.long)
+        visual_grid = (
+            grid_thw.to(device="cpu", dtype=torch.int32)
+            if self._backend == "sglang"
+            else output_grid
+        )
+        visual_outputs = visual(pixel_values, grid_thw=visual_grid)
+        embeds, multiscale = _unpack_visual_outputs(visual_outputs)
+        return embeds, multiscale, output_grid
 
     def forward(
         self,
@@ -109,11 +332,12 @@ class Qwen35OmniImageEncoder(nn.Module):
         outputs: dict[str, torch.Tensor] = {}
         merge = self.spatial_merge_size**2
 
-        if isinstance(pixel_values, torch.Tensor) and isinstance(image_grid_thw, torch.Tensor):
-            image_grid_thw = image_grid_thw.to(self._device, dtype=torch.long)
-            pixel_values = pixel_values.to(device=self._device, dtype=self.visual.dtype)
-            vision_outputs = self.visual(pixel_values, grid_thw=image_grid_thw)
-            image_embeds, image_multiscale = _unpack_visual_outputs(vision_outputs)
+        if isinstance(pixel_values, torch.Tensor) and isinstance(
+            image_grid_thw, torch.Tensor
+        ):
+            image_embeds, image_multiscale, image_grid_thw = self._encode_pixels(
+                pixel_values, image_grid_thw
+            )
             image_counts = image_grid_thw.prod(-1) // merge
             outputs.update(
                 {
@@ -123,13 +347,12 @@ class Qwen35OmniImageEncoder(nn.Module):
                 }
             )
 
-        if isinstance(pixel_values_videos, torch.Tensor) and isinstance(video_grid_thw, torch.Tensor):
-            video_grid_thw = video_grid_thw.to(self._device, dtype=torch.long)
-            pixel_values_videos = pixel_values_videos.to(
-                device=self._device, dtype=self.visual.dtype
+        if isinstance(pixel_values_videos, torch.Tensor) and isinstance(
+            video_grid_thw, torch.Tensor
+        ):
+            video_embeds, video_multiscale, video_grid_thw = self._encode_pixels(
+                pixel_values_videos, video_grid_thw
             )
-            video_outputs = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
-            video_embeds, video_multiscale = _unpack_visual_outputs(video_outputs)
             video_counts = video_grid_thw.prod(-1) // merge
             outputs.update(
                 {

@@ -442,6 +442,17 @@ def test_qwen35_image_encoder_same_batch_dedup_stays_enabled_by_default():
     assert parameter.default is True
 
 
+def test_qwen35_encoder_stages_disable_batch_wait_for_single_request_latency():
+    config = Qwen35OmniPipelineConfig(model_path="dummy")
+
+    image_stage = _stage(config, "image_encoder")
+    audio_stage = _stage(config, "audio_encoder")
+
+    assert image_stage.factory_args["backend"] == "sglang"
+    assert image_stage.factory_args["max_batch_wait_ms"] == 0
+    assert audio_stage.factory_args["max_batch_wait_ms"] == 0
+
+
 def test_image_encoder_same_batch_dedup_flag_rejects_qwen3():
     config = Qwen3OmniPipelineConfig(model_path="dummy")
 

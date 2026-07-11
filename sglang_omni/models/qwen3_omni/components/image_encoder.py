@@ -25,7 +25,7 @@ def _patch_embed_forward(self: nn.Module, hidden_states: torch.Tensor) -> torch.
     return self.linear(hidden_states.to(dtype=self.linear.weight.dtype))
 
 
-def _optimize_patch_embed(visual: nn.Module) -> None:
+def _optimize_patch_embed(visual: nn.Module, *, keep_conv: bool = False) -> None:
     """Replace Conv3d with Linear in PatchEmbed for ~7-15× speedup.
 
     The Conv3d kernel does not slide (kernel_size == stride), so it is
@@ -74,7 +74,8 @@ def _optimize_patch_embed(visual: nn.Module) -> None:
         linear.weight.copy_(conv.weight.view(embed_dim, -1))
         linear.bias.copy_(conv.bias)
 
-    del patch_embed.proj
+    if not keep_conv:
+        del patch_embed.proj
     patch_embed.linear = linear
     patch_embed.forward = types.MethodType(_patch_embed_forward, patch_embed)
     logger.info(

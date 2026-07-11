@@ -64,12 +64,23 @@ def create_image_encoder_executor(
     device: str = "cuda",
     dtype: str | None = None,
     dedup_same_batch: bool = True,
+    backend: str = "hf",
+    attention_backend: str = "sdpa_grouped",
+    max_batch_wait_ms: float = 50,
 ):
     from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
-    model = Qwen35OmniImageEncoder(model_path=model_path, device=device, dtype=dtype)
+    model = Qwen35OmniImageEncoder(
+        model_path=model_path,
+        device=device,
+        dtype=dtype,
+        backend=backend,
+        attention_backend=attention_backend,
+    )
     logger.info(
-        "Qwen3.5 image encoder same-batch dedup enabled=%s", dedup_same_batch
+        "Qwen3.5 image encoder same-batch dedup enabled=%s max_batch_wait_ms=%s",
+        dedup_same_batch,
+        max_batch_wait_ms,
     )
 
     def _encode(payload: StagePayload) -> StagePayload:
@@ -120,7 +131,7 @@ def create_image_encoder_executor(
         _encode,
         batch_compute_fn=_encode_batch,
         max_batch_size=32,
-        max_batch_wait_ms=50,
+        max_batch_wait_ms=max_batch_wait_ms,
         request_cost_fn=qwen3_stages._create_image_encoder_request_cost_fn(model),
         max_batch_cost=qwen3_stages.QWEN3_IMAGE_ENCODER_BATCH_BUDGET_BYTES,
     )
@@ -131,6 +142,7 @@ def create_audio_encoder_executor(
     *,
     device: str = "cuda",
     dtype: str | None = None,
+    max_batch_wait_ms: float = 50,
 ):
     from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
@@ -183,7 +195,7 @@ def create_audio_encoder_executor(
         _encode,
         batch_compute_fn=_encode_batch,
         max_batch_size=32,
-        max_batch_wait_ms=50,
+        max_batch_wait_ms=max_batch_wait_ms,
     )
 
 
