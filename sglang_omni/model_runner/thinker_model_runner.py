@@ -65,6 +65,23 @@ class ThinkerModelRunner(ModelRunner):
                 return True
         return False
 
+    def _sample_next_token_ids(
+        self,
+        logits_output: Any,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+    ) -> Any:
+        # Custom multimodal prefill creates inference tensors. SGLang's sampler
+        # applies temperature in place, so it must run in the same mode.
+        with torch.inference_mode():
+            return super()._sample_next_token_ids(
+                logits_output,
+                forward_batch,
+                schedule_batch,
+                requests,
+            )
+
     def custom_prefill_forward(self, forward_batch, schedule_batch, requests):
         """Run custom prefill when multimodal embeddings must be injected."""
         if not schedule_batch.forward_mode.is_extend():
