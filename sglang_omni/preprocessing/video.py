@@ -26,6 +26,10 @@ from .resource_connector import global_thread_pool
 
 logger = logging.getLogger(__name__)
 
+_PREPROCESSED_MEDIA_CACHE_SIZE = max(
+    0, int(os.getenv("SGLANG_OMNI_PREPROCESSED_MEDIA_CACHE_SIZE", "4"))
+)
+
 
 class VideoDecodeError(RuntimeError):
     """Raised when video decoding fails."""
@@ -409,7 +413,7 @@ def _load_preprocessed_video_path(path: str | Path) -> tuple[Any, float | None]:
     return loaded, None
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=_PREPROCESSED_MEDIA_CACHE_SIZE)
 def _load_preprocessed_video_path_cached(
     path: str,
     mtime_ns: int,

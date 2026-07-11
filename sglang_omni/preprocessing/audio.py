@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import os
 import struct
 from functools import lru_cache
 from pathlib import Path
@@ -15,6 +16,10 @@ import numpy.typing as npt
 import torch
 
 from .base import MediaIO, _is_url
+
+_PREPROCESSED_MEDIA_CACHE_SIZE = max(
+    0, int(os.getenv("SGLANG_OMNI_PREPROCESSED_MEDIA_CACHE_SIZE", "4"))
+)
 
 
 def _decode_audio_bytes_av(data: bytes) -> tuple[np.ndarray, int]:
@@ -396,7 +401,7 @@ def _load_preprocessed_audio_path(path: str | Path) -> tuple[Any, int | None]:
     return loaded, None
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=_PREPROCESSED_MEDIA_CACHE_SIZE)
 def _load_preprocessed_audio_path_cached(
     path: str,
     mtime_ns: int,
