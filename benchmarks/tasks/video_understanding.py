@@ -249,6 +249,8 @@ def make_video_send_fn(
     reuse_preprocessed_media: bool = False,
     enable_audio_input: bool = False,
     audio_output_dir: str | None = None,
+    talker_max_new_tokens: int | None = None,
+    talker_temperature: float | None = None,
     fixed_prompt: str | None = None,
     stream: bool = False,
 ) -> SendFn:
@@ -301,6 +303,10 @@ def make_video_send_fn(
                     payload["preprocessed_audios"] = [preprocessed_audio]
             if audio_output_dir:
                 payload["audio"] = {"format": "wav"}
+                if talker_max_new_tokens is not None:
+                    payload["talker_max_new_tokens"] = talker_max_new_tokens
+                if talker_temperature is not None:
+                    payload["talker_temperature"] = talker_temperature
             if preprocessed_video is None:
                 if video_fps is not None:
                     payload["video_fps"] = video_fps
@@ -317,7 +323,9 @@ def make_video_send_fn(
                 response.raise_for_status()
                 if stream:
                     if audio_output_dir:
-                        result.error = "Streaming Video-MME benchmark supports text output only"
+                        result.error = (
+                            "Streaming Video-MME benchmark supports text output only"
+                        )
                         return result
                     if not await _apply_streaming_chat_completion_response(
                         result,
@@ -394,9 +402,7 @@ def build_videomme_result_records(
             "is_success": False,
             "is_mc_fallback": False,
             "text_ttft_s": (
-                round(result.text_ttft_s, 4)
-                if result.text_ttft_s is not None
-                else None
+                round(result.text_ttft_s, 4) if result.text_ttft_s is not None else None
             ),
             "error": result.error,
         }

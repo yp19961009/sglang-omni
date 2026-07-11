@@ -286,7 +286,7 @@ def _config_from_args(args: argparse.Namespace) -> VideoEvalConfig:
 
 async def benchmark(args: argparse.Namespace) -> dict:
     config = _config_from_args(args)
-    results = await run_videoamme_eval(config)
+    results = await run_videoamme_eval(config, compute_wer=not args.skip_wer)
     print_videomme_accuracy_summary(
         results["summary"],
         config.model,
@@ -344,6 +344,11 @@ def main() -> None:
         ),
     )
     _add_preprocessed_media_args(parser)
+    parser.add_argument(
+        "--skip-wer",
+        action="store_true",
+        help="Skip offline ASR/WER so it is not included in benchmark wall time.",
+    )
     args = parser.parse_args()
 
     wait_for_service(args.base_url or f"http://{args.host}:{args.port}")

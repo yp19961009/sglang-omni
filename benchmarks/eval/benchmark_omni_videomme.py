@@ -63,7 +63,6 @@ Speed (full set)
 | Qwen3-Omni | thinker-only, full-set, c=4 | 2496      | 0      | 15.468         | 16.089           | 18.826        | 19.790        | 7.4                            | 115.0           | 287139           | 13769.0            | 34366523            | 0.258          | PR #411 [H100, c=4, max_tokens=256]                                 |
 """
 
-
 from __future__ import annotations
 
 import argparse
@@ -127,6 +126,8 @@ class VideoEvalConfig:
     disable_tqdm: bool = False
     repo_id: str | None = None
     enable_audio: bool = False
+    talker_max_new_tokens: int | None = None
+    talker_temperature: float | None = None
     stream: bool = False
     asr_device: str = "cuda:0"
     asr_concurrency: int = DEFAULT_ASR_TRANSCRIBE_CONCURRENCY
@@ -179,6 +180,8 @@ async def run_video_eval(
         reuse_preprocessed_media=config.reuse_preprocessed_media,
         enable_audio_input=enable_audio_input,
         audio_output_dir=audio_output_dir,
+        talker_max_new_tokens=config.talker_max_new_tokens,
+        talker_temperature=config.talker_temperature,
         fixed_prompt=fixed_prompt,
         stream=config.stream,
     )
@@ -218,6 +221,8 @@ async def run_video_eval(
             "max_concurrency": config.max_concurrency,
             "warmup": config.warmup,
             "enable_audio": config.enable_audio,
+            "talker_max_new_tokens": config.talker_max_new_tokens,
+            "talker_temperature": config.talker_temperature,
             "stream": config.stream,
             "asr_device": config.asr_device,
             "asr_concurrency": config.asr_concurrency,
@@ -257,9 +262,7 @@ def video_eval_config_from_args(args: argparse.Namespace) -> VideoEvalConfig:
         video_total_pixels=args.video_total_pixels,
         preprocessed_video_dir=getattr(args, "preprocessed_video_dir", None),
         preprocessed_audio_dir=getattr(args, "preprocessed_audio_dir", None),
-        reuse_preprocessed_media=getattr(
-            args, "reuse_preprocessed_media", False
-        ),
+        reuse_preprocessed_media=getattr(args, "reuse_preprocessed_media", False),
         output_dir=args.output_dir,
         max_concurrency=args.max_concurrency,
         warmup=args.warmup,
@@ -267,6 +270,8 @@ def video_eval_config_from_args(args: argparse.Namespace) -> VideoEvalConfig:
         disable_tqdm=args.disable_tqdm,
         timeout_s=args.timeout_s,
         enable_audio=args.enable_audio,
+        talker_max_new_tokens=getattr(args, "talker_max_new_tokens", None),
+        talker_temperature=getattr(args, "talker_temperature", None),
         stream=args.stream,
         asr_device=args.asr_device,
         asr_concurrency=args.asr_concurrency,
@@ -303,6 +308,18 @@ def add_video_eval_args(parser: argparse.ArgumentParser, *, repo_help: str) -> N
         "--enable-audio",
         action="store_true",
         help="Request text+audio output and compute text-audio WER.",
+    )
+    parser.add_argument(
+        "--talker-max-new-tokens",
+        type=int,
+        default=None,
+        help="Maximum codec steps for audio generation.",
+    )
+    parser.add_argument(
+        "--talker-temperature",
+        type=float,
+        default=None,
+        help="Talker sampling temperature; independent of text temperature.",
     )
     parser.add_argument(
         "--stream",
