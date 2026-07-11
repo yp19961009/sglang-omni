@@ -7,11 +7,19 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.utils.common import is_hopper_with_cuda_12_3
+
 from sglang_omni.models.qwen3_omni import stages as qwen3_stages
 from sglang_omni.models.qwen35_omni.bootstrap import create_thinker_scheduler
-from sglang_omni.models.qwen35_omni.components.audio_encoder import Qwen35OmniAudioEncoder
-from sglang_omni.models.qwen35_omni.components.image_encoder import Qwen35OmniImageEncoder
-from sglang_omni.models.qwen35_omni.components.preprocessor import Qwen35OmniPreprocessor
+from sglang_omni.models.qwen35_omni.components.audio_encoder import (
+    Qwen35OmniAudioEncoder,
+)
+from sglang_omni.models.qwen35_omni.components.image_encoder import (
+    Qwen35OmniImageEncoder,
+)
+from sglang_omni.models.qwen35_omni.components.preprocessor import (
+    Qwen35OmniPreprocessor,
+)
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import build_sglang_server_args
@@ -23,6 +31,11 @@ logger = logging.getLogger(__name__)
 IMAGE_STAGE = qwen3_stages.IMAGE_STAGE
 AUDIO_STAGE = qwen3_stages.AUDIO_STAGE
 THINKER_STAGE = qwen3_stages.THINKER_STAGE
+
+
+def _default_thinker_attention_backend() -> str:
+    return "fa3" if is_hopper_with_cuda_12_3() else "triton"
+
 
 load_state = qwen3_stages.load_state
 store_state = qwen3_stages.store_state
@@ -211,16 +224,21 @@ def create_sglang_thinker_executor_from_config(
     encoder_mem_reserve: float = 0.05,
     total_gpu_memory_fraction: float | None = None,
 ):
+    attention_backend = _default_thinker_attention_backend()
     overrides: dict[str, Any] = {
         "disable_cuda_graph": False,
         "enable_mixed_chunk": True,
         "chunked_prefill_size": 8192,
         "max_running_requests": 1,
         "sampling_backend": "pytorch",
-        "attention_backend": "triton",
+        "attention_backend": attention_backend,
     }
     if server_args_overrides:
         overrides.update(server_args_overrides)
+    logger.info(
+        "Qwen3.5 thinker attention backend=%s",
+        overrides["attention_backend"],
+    )
     overrides["tp_size"] = tp_size
     has_explicit_colocated_mem_fraction = (
         total_gpu_memory_fraction is not None
@@ -259,7 +277,9 @@ def create_sglang_thinker_executor_from_config(
         effective_total_gpu_memory_fraction = total_gpu_memory_fraction
         applied_encoder_reserve = encoder_mem_reserve if reserve_applied else 0.0
     else:
-        effective_total_gpu_memory_fraction = memory_contract.effective_total_gpu_memory_fraction
+        effective_total_gpu_memory_fraction = (
+            memory_contract.effective_total_gpu_memory_fraction
+        )
         applied_encoder_reserve = memory_contract.applied_encoder_mem_reserve
 
     pre_load_avail_mem = avail_gpu_mem(gpu_id)
