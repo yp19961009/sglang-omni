@@ -31,6 +31,15 @@ class SGLangARRequestData(ARRequestData):
     tts_pad_embed: Any = None
     tts_eos_embed: Any = None
     thinker_chunks_done: bool = True
+    feedback_only_decode: bool = False
+    interleaved_text_chunk_size: int = 0
+    interleaved_codec_chunk_size: int = 0
+    interleaved_codec_steps: int = 0
+    interleaved_final: bool = False
+    interleaved_drop_next_output: bool = False
+    interleaved_boundary_ready: bool = False
+    interleaved_placeholder_count: int = 0
+    codec_generation_steps: int = 0
 
 
 @dataclass

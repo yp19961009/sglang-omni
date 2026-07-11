@@ -71,6 +71,20 @@ def test_qwen_talker_decode_input_consumes_feedback_and_text_or_pad() -> None:
     assert len(pad_req.data.pending_text_queue) == 0
 
 
+def test_qwen_talker_feedback_only_decode_skips_text_and_pad() -> None:
+    sched_req = _sched_req(
+        pending_feedback_queue=deque([torch.tensor([1.0, 2.0])]),
+        pending_text_queue=deque(),
+        tts_pad_embed=torch.tensor([7.0, 8.0]),
+        thinker_chunks_done=True,
+        feedback_only_decode=True,
+    )
+
+    assert QwenTalkerModelRunner._data_has_next_decode_input(sched_req.data)
+    assert torch.equal(_take_decode_input(sched_req), torch.tensor([1.0, 2.0]))
+    assert len(sched_req.data.pending_feedback_queue) == 0
+
+
 def test_qwen_talker_decode_input_consumes_device_text_queue() -> None:
     """Preserves FIFO decode semantics for tensor-backed future text rows."""
     text_req = _sched_req(

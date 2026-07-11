@@ -22,6 +22,10 @@ from sglang_omni.models.qwen35_omni.components.preprocessor import (
 )
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.generation_batch_policy import (
+    build_generation_batch_overrides,
+    validate_generation_batch_policy,
+)
 from sglang_omni.scheduling.sglang_backend import build_sglang_server_args
 from sglang_omni.utils.gpu_memory import format_bytes_gib, get_process_gpu_memory_bytes
 from sglang_omni.utils.misc import avail_gpu_mem
@@ -227,6 +231,7 @@ def create_sglang_thinker_executor_from_config(
     attention_backend = _default_thinker_attention_backend()
     overrides: dict[str, Any] = {
         "disable_cuda_graph": False,
+        "disable_radix_cache": True,
         "enable_mixed_chunk": True,
         "chunked_prefill_size": 8192,
         "max_running_requests": 1,
@@ -316,3 +321,76 @@ def create_sglang_thinker_executor_from_config(
         f" post_load_process_mem={format_bytes_gib(post_load_process_mem)}"
     )
     return scheduler
+
+
+def create_talker_ar_executor_from_config(
+    model_path: str,
+    *,
+    gpu_id: int = 0,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    nccl_port: int | None = None,
+    talker_max_seq_len: int = 32768,
+    server_args_overrides: dict[str, Any] | None = None,
+    speech_enabled: bool = True,
+    feedback_enabled: bool = True,
+    weight_prefix: str = "talker.",
+    total_gpu_memory_fraction: float | None = None,
+    enable_partial_start: bool = True,
+    partial_start_min_chunks: int = 4,
+):
+    """Create the Qwen3.5 talker AR stage with 4x4 streaming interleave."""
+    del speech_enabled
+    from sglang_omni.models.qwen35_omni.bootstrap import create_talker_scheduler
+
+    attention_backend = _default_thinker_attention_backend()
+    overrides = build_generation_batch_overrides(
+        max_running_requests=32,
+        server_args_overrides=server_args_overrides,
+        disable_cuda_graph=True,
+        sampling_backend="pytorch",
+        attention_backend=attention_backend,
+    )
+    overrides["tp_size"] = tp_size
+    qwen3_stages._apply_colocated_ar_memory_contract(
+        overrides,
+        stage_name="talker_ar",
+        total_gpu_memory_fraction=total_gpu_memory_fraction,
+    )
+    server_args = build_sglang_server_args(
+        model_path,
+        context_length=talker_max_seq_len,
+        **overrides,
+    )
+    for attr, default in (
+        ("enable_hisparse", False),
+        ("enable_priority_scheduling", False),
+        ("disable_priority_preemption", True),
+    ):
+        if not hasattr(server_args, attr):
+            setattr(server_args, attr, default)
+    validate_generation_batch_policy(
+        model_name="Qwen3.5-Omni talker_ar",
+        server_args=server_args,
+    )
+    logger.info(
+        "sglang_ar_startup stage=talker_ar gpu_id=%s tp_rank=%s/%s "
+        "context_length=%s cuda_graph=%s attention_backend=%s",
+        gpu_id,
+        tp_rank,
+        tp_size,
+        talker_max_seq_len,
+        not server_args.disable_cuda_graph,
+        server_args.attention_backend,
+    )
+    return create_talker_scheduler(
+        server_args,
+        gpu_id,
+        weight_prefix=weight_prefix,
+        feedback_enabled=feedback_enabled,
+        tp_rank=tp_rank,
+        nccl_port=nccl_port,
+        total_gpu_memory_fraction=total_gpu_memory_fraction,
+        enable_partial_start=enable_partial_start,
+        partial_start_min_chunks=partial_start_min_chunks,
+    )

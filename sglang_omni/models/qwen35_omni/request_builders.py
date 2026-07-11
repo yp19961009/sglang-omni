@@ -9,7 +9,12 @@ import torch
 
 from sglang_omni.models.qwen3_omni import request_builders as qwen3_builders
 from sglang_omni.models.qwen3_omni.payload_types import Qwen3OmniPipelineState
+from sglang_omni.models.qwen35_omni.components.talker_prefill import (
+    Qwen35TalkerPrefillBuilder,
+)
+from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 
 IMAGE_STAGE = qwen3_builders.IMAGE_STAGE
@@ -17,21 +22,34 @@ AUDIO_STAGE = qwen3_builders.AUDIO_STAGE
 THINKER_STAGE = qwen3_builders.THINKER_STAGE
 DECODE_STAGE = qwen3_builders.DECODE_STAGE
 MM_AGGREGATE_STAGE = qwen3_builders.MM_AGGREGATE_STAGE
+TALKER_STAGE = qwen3_builders.TALKER_STAGE
+CODE2WAV_STAGE = qwen3_builders.CODE2WAV_STAGE
 
 output_modalities = qwen3_builders.output_modalities
 should_generate_audio_output = qwen3_builders.should_generate_audio_output
 resolve_preprocessing_next_stages = qwen3_builders.resolve_preprocessing_next_stages
 resolve_mm_aggregate_wait_sources = qwen3_builders.resolve_mm_aggregate_wait_sources
-project_preprocessing_to_image_encoder = qwen3_builders.project_preprocessing_to_image_encoder
-project_preprocessing_to_audio_encoder = qwen3_builders.project_preprocessing_to_audio_encoder
-project_preprocessing_to_mm_aggregate = qwen3_builders.project_preprocessing_to_mm_aggregate
+resolve_mm_aggregate_next_stages = qwen3_builders.resolve_mm_aggregate_next_stages
+resolve_thinker_next_stages = qwen3_builders.resolve_thinker_next_stages
+resolve_thinker_stream_done_targets = qwen3_builders.resolve_thinker_stream_done_targets
+resolve_terminal_stages = qwen3_builders.resolve_terminal_stages
+project_preprocessing_to_image_encoder = (
+    qwen3_builders.project_preprocessing_to_image_encoder
+)
+project_preprocessing_to_audio_encoder = (
+    qwen3_builders.project_preprocessing_to_audio_encoder
+)
+project_preprocessing_to_mm_aggregate = (
+    qwen3_builders.project_preprocessing_to_mm_aggregate
+)
 project_encoder_to_mm_aggregate = qwen3_builders.project_encoder_to_mm_aggregate
+project_mm_aggregate_to_talker_ar = qwen3_builders.project_mm_aggregate_to_talker_ar
 project_thinker_to_decode = qwen3_builders.project_thinker_to_decode
+project_talker_to_code2wav = qwen3_builders.project_talker_to_code2wav
 build_encoder_request = qwen3_builders.build_encoder_request
 apply_encoder_result = qwen3_builders.apply_encoder_result
 build_lightweight_mm_inputs = qwen3_builders.build_lightweight_mm_inputs
 apply_thinker_result = qwen3_builders.apply_thinker_result
-make_thinker_stream_output_builder = qwen3_builders.make_thinker_stream_output_builder
 
 
 def _as_grid_rows(value: Any) -> list[list[int]]:
@@ -73,7 +91,11 @@ def _compute_mrope_positions(
 
     if not image_grid_rows and not video_grid_rows:
         seq_len = ids_2d.shape[1]
-        pos = torch.arange(seq_len, dtype=torch.long).view(1, 1, -1).expand(3, ids_2d.shape[0], -1)
+        pos = (
+            torch.arange(seq_len, dtype=torch.long)
+            .view(1, 1, -1)
+            .expand(3, ids_2d.shape[0], -1)
+        )
         delta = pos.max(0, keepdim=False)[0].max(-1, keepdim=True)[0] + 1 - seq_len
         return pos.squeeze(1), delta
 
@@ -199,7 +221,9 @@ def _compute_mrope_positions(
         position_ids[:, batch_idx, :] = llm_positions.to(position_ids.device)
         deltas.append(int(llm_positions.max().item()) + 1 - len(input_tokens))
 
-    delta_tensor = torch.tensor(deltas, device=ids_2d.device, dtype=torch.long).unsqueeze(1)
+    delta_tensor = torch.tensor(
+        deltas, device=ids_2d.device, dtype=torch.long
+    ).unsqueeze(1)
     return position_ids.squeeze(1), delta_tensor
 
 
@@ -282,7 +306,9 @@ def build_sglang_thinker_request(
 
     data = SGLangARRequestData(
         input_ids=input_ids.to(dtype=torch.long),
-        attention_mask=attention_mask if isinstance(attention_mask, torch.Tensor) else None,
+        attention_mask=(
+            attention_mask if isinstance(attention_mask, torch.Tensor) else None
+        ),
         model_inputs=model_inputs,
         capture_model_output_keys=tuple(capture_keys) if capture_keys else (),
         max_new_tokens=max_new_tokens,
@@ -326,3 +352,128 @@ def make_thinker_scheduler_adapters(
         )
 
     return request_builder, result_adapter
+
+
+def make_thinker_stream_output_builder():
+    """Stream text tokens to decode and to Qwen3.5 talker without hidden capture."""
+
+    def _build_stream_output(
+        request_id: str, req_data: Any, req_output: Any
+    ) -> list[OutgoingMessage]:
+        req = getattr(req_data, "req", None)
+        if req is not None and int(getattr(req, "is_chunked", 0) or 0) > 0:
+            return []
+        if req_output.data is None:
+            return []
+
+        token_id = int(req_output.data)
+        token_index = int(getattr(req_data, "_qwen35_stream_token_index", 0))
+        req_data._qwen35_stream_token_index = token_index + 1
+        _emit_event(
+            request_id=request_id,
+            stage=THINKER_STAGE,
+            event_name="thinker_token_emit",
+            metadata={"token_id": token_id, "token_index": token_index},
+        )
+        stage_payload = req_data.stage_payload
+        messages: list[OutgoingMessage] = []
+        if bool((stage_payload.request.params or {}).get("stream", False)):
+            messages.append(
+                OutgoingMessage(
+                    request_id=request_id,
+                    type="stream",
+                    data=torch.tensor([token_id], dtype=torch.long),
+                    target=DECODE_STAGE,
+                    metadata={"token_id": token_id},
+                )
+            )
+        if should_generate_audio_output(stage_payload):
+            messages.append(
+                OutgoingMessage(
+                    request_id=request_id,
+                    type="stream",
+                    data=torch.tensor([token_id], dtype=torch.long),
+                    target=TALKER_STAGE,
+                    metadata={"token_id": token_id},
+                )
+            )
+        return messages
+
+    return _build_stream_output
+
+
+def make_talker_scheduler_adapters(
+    *,
+    tokenizer: Any,
+    codec_vocab_size: int,
+    valid_codec_vocab_size: int,
+    model: Any,
+    model_path: str,
+    root_config: Any,
+    thinker_config: Any,
+):
+    """Build Qwen3.5 talker adapters around the generic feedback scheduler."""
+
+    talker_config = root_config.talker_config
+    prefill_builder = Qwen35TalkerPrefillBuilder(
+        model=model,
+        root_config=root_config,
+        model_path=model_path,
+        first_text_tokens=4,
+    )
+
+    def _resolve_sampling_config(params: dict[str, Any]) -> dict[str, Any]:
+        eos_id = int(talker_config.codec_eos_token_id)
+        suppress_tokens = [
+            token_id
+            for token_id in range(valid_codec_vocab_size, codec_vocab_size)
+            if token_id != eos_id
+        ]
+        return {
+            "max_new_tokens": int(params.get("talker_max_new_tokens", 4096)),
+            "temperature": float(params.get("talker_temperature", 0.9)),
+            "top_k": int(params.get("talker_top_k", 50)),
+            "top_p": float(params.get("talker_top_p", 1.0)),
+            "repetition_penalty": float(params.get("talker_repetition_penalty", 1.05)),
+            "codec_eos_id": eos_id,
+            "suppress_tokens": suppress_tokens,
+            "seed": qwen3_builders._resolve_seed(params),
+        }
+
+    def request_builder(payload: StagePayload) -> SGLangARRequestData:
+        req_data = qwen3_builders._build_talker_request_data(
+            payload,
+            prefill_builder=prefill_builder,
+            tokenizer=tokenizer,
+            codec_vocab_size=codec_vocab_size,
+            codec_bos_id=talker_config.codec_bos_id,
+            audio_token_id=thinker_config.audio_token_id,
+            image_token_id=thinker_config.image_token_id,
+            video_token_id=thinker_config.video_token_id,
+            thinker_config=thinker_config,
+            resolve_sampling_config=_resolve_sampling_config,
+        )
+        req_data.feedback_only_decode = bool(req_data.thinker_chunks_done)
+        if not req_data.thinker_chunks_done:
+            req_data.interleaved_text_chunk_size = 4
+            req_data.interleaved_codec_chunk_size = 4
+            req_data.interleaved_codec_steps = 0
+            req_data.interleaved_final = False
+            req_data.interleaved_drop_next_output = False
+            req_data.interleaved_boundary_ready = False
+        return req_data
+
+    def result_adapter(data: SGLangARRequestData) -> StagePayload:
+        payload = data.stage_payload
+        return StagePayload(
+            request_id=payload.request_id,
+            request=payload.request,
+            data=payload.data,
+        )
+
+    return (
+        request_builder,
+        result_adapter,
+        prefill_builder.append_text_chunk,
+        prefill_builder.mark_thinker_done,
+    )

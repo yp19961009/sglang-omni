@@ -60,12 +60,18 @@ def test_invalid_sglang_max_prefill_tokens_raises() -> None:
         SGLangServerArgsConfig(max_prefill_tokens=0)
 
 
+def test_invalid_sglang_max_running_requests_raises() -> None:
+    with pytest.raises(ValueError, match="max_running_requests"):
+        SGLangServerArgsConfig(max_running_requests=0)
+
+
 def test_typed_sglang_server_args_merge_into_factory_overrides() -> None:
     stage = _stage(
         factory_args={"server_args_overrides": {"foo": "bar"}},
         runtime=StageRuntimeConfig(
             sglang_server_args=SGLangServerArgsConfig(
                 disable_radix_cache=True,
+                max_running_requests=8,
                 max_prefill_tokens=4096,
                 mem_fraction_static=0.7,
             ),
@@ -79,6 +85,7 @@ def test_typed_sglang_server_args_merge_into_factory_overrides() -> None:
         "disable_radix_cache": True,
         "foo": "bar",
         "mem_fraction_static": 0.7,
+        "max_running_requests": 8,
         "max_prefill_tokens": 4096,
     }
 

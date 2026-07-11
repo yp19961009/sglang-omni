@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# Initial two-H20 Qwen3.5-Omni speech topology. The thinker and encoders use
+# logical GPU 0; talker and the external public_v1 codec decoder use GPU 1.
+
+config_cls: Qwen35OmniSpeechPipelineConfig
+name: qwen35-omni-speech-h20
+model_path: /myapp/models/qwen3_5_omni_23b_final_multilingual_all_voice_bf16_0315
+relay_backend: shm
+
+stage_overrides:
+  preprocessing:
+    runtime:
+      max_seq_len: 32768
+  thinker:
+    runtime:
+      max_seq_len: 32768
+  talker_ar:
+    runtime:
+      max_seq_len: 32768

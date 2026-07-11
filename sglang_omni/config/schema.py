@@ -69,6 +69,7 @@ class SGLangServerArgsConfig(BaseModel):
 
     disable_radix_cache: bool | None = None
     mem_fraction_static: float | None = None
+    max_running_requests: int | None = None
     max_prefill_tokens: int | None = None
 
     def model_post_init(self, __context: Any = None) -> None:
@@ -81,6 +82,11 @@ class SGLangServerArgsConfig(BaseModel):
         if prefill_tokens is not None and prefill_tokens <= 0:
             raise ValueError(
                 "runtime.sglang_server_args.max_prefill_tokens must be positive"
+            )
+        running_requests = self.max_running_requests
+        if running_requests is not None and running_requests <= 0:
+            raise ValueError(
+                "runtime.sglang_server_args.max_running_requests must be positive"
             )
 
 

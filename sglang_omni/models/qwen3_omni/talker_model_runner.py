@@ -77,6 +77,7 @@ class QwenTalkerModelRunner(ModelRunner):
 
         if result.next_token_ids is None:
             return
+        self.model.prepare_decode_buffers(requests)
         layer0_codes = result.next_token_ids
         if layer0_codes.ndim == 1:
             layer0_codes = layer0_codes.unsqueeze(1)
@@ -118,8 +119,29 @@ class QwenTalkerModelRunner(ModelRunner):
             req = schedule_batch.reqs[idx]
             code_chunk = self.model._output_codes[idx].detach().clone()
             feedback_row = self.model._output_embeds[idx].detach().clone()
+            data = sched_req.data
+            if bool(getattr(data, "interleaved_drop_next_output", False)):
+                # vLLM consumes the last emitted codec feedback once more at a
+                # chunk boundary, but replaces the sampled candidate with the
+                # next text chunk. Keep that candidate feedback only until the
+                # text extend arrives; it must not reach code2wav or advance the
+                # externally visible codec position.
+                data.pending_feedback_queue.append(feedback_row)
+                data.interleaved_drop_next_output = False
+                data.interleaved_boundary_ready = True
+                codec_eos_id = getattr(
+                    getattr(self.model, "config", None),
+                    "codec_eos_token_id",
+                    None,
+                )
+                if codec_eos_id is not None and int(
+                    code_chunk.reshape(-1)[0].item()
+                ) == int(codec_eos_id):
+                    schedule_batch.output_ids[idx] = 0
+                continue
+
             # Tell code2wav whether to forward audio chunks to the Coordinator.
-            stage_payload = sched_req.data.stage_payload
+            stage_payload = data.stage_payload
             is_streaming = bool(
                 stage_payload is not None
                 and (stage_payload.request.params or {}).get("stream", False)
@@ -133,7 +155,14 @@ class QwenTalkerModelRunner(ModelRunner):
                     metadata={"stream": is_streaming},
                 )
             )
-            sched_req.data.pending_feedback_queue.append(feedback_row)
+            data.pending_feedback_queue.append(feedback_row)
+            data.codec_generation_steps = (
+                int(getattr(data, "codec_generation_steps", 0)) + 1
+            )
+            if int(getattr(data, "interleaved_codec_chunk_size", 0) or 0) > 0:
+                data.interleaved_codec_steps = (
+                    int(getattr(data, "interleaved_codec_steps", 0)) + 1
+                )
 
     def sample_before_post_prefill(
         self, forward_batch: Any, schedule_batch: Any, requests: list
@@ -355,6 +384,7 @@ class QwenTalkerModelRunner(ModelRunner):
             if combined is None:
                 continue
             self._append_decode_input_history(sched_req.data, combined)
+            self._append_interleaved_sequence_row(sched_req.data, combined)
             rows.append(row_idx)
             embeds.append(combined)
         if rows:
@@ -370,6 +400,18 @@ class QwenTalkerModelRunner(ModelRunner):
         pending_feedback_queue = getattr(data, "pending_feedback_queue", None)
         if not pending_feedback_queue:
             return False
+        codec_chunk_size = int(getattr(data, "interleaved_codec_chunk_size", 0) or 0)
+        if (
+            codec_chunk_size > 0
+            and not bool(getattr(data, "interleaved_final", False))
+            and int(getattr(data, "interleaved_codec_steps", 0)) >= codec_chunk_size
+            and bool(getattr(data, "interleaved_boundary_ready", False))
+        ):
+            return False
+        if getattr(data, "feedback_only_decode", False):
+            return True
+        if int(getattr(data, "interleaved_text_chunk_size", 0) or 0) > 0:
+            return True
         pending_text_queue = getattr(data, "pending_text_queue", None)
         if pending_text_queue:
             return True
@@ -416,6 +458,22 @@ class QwenTalkerModelRunner(ModelRunner):
         QwenTalkerModelRunner._decode_input_history(data).append(row.detach())
 
     @staticmethod
+    def _append_interleaved_sequence_row(data: Any, row: torch.Tensor) -> None:
+        if int(getattr(data, "interleaved_text_chunk_size", 0) or 0) <= 0:
+            return
+        sequence = getattr(data, "prefill_input_embeds", None)
+        if not isinstance(sequence, torch.Tensor):
+            raise RuntimeError(
+                "Interleaved talker requests require a tensor-backed input history"
+            )
+        row = QwenTalkerModelRunner._decode_row(
+            row,
+            device=sequence.device,
+            dtype=sequence.dtype,
+        )
+        data.prefill_input_embeds = torch.cat([sequence, row.unsqueeze(0)], dim=0)
+
+    @staticmethod
     def _decode_row(
         row: torch.Tensor,
         *,
@@ -448,6 +506,10 @@ class QwenTalkerModelRunner(ModelRunner):
             device=device,
             dtype=dtype,
         )
+        if getattr(data, "feedback_only_decode", False):
+            return combined
+        if int(getattr(data, "interleaved_text_chunk_size", 0) or 0) > 0:
+            return combined
         next_text = QwenTalkerModelRunner._peek_left(
             getattr(data, "pending_text_queue", None)
         )
@@ -479,7 +541,9 @@ class QwenTalkerModelRunner(ModelRunner):
             return None
 
         QwenTalkerModelRunner._pop_left(getattr(data, "pending_feedback_queue", None))
-        if getattr(data, "pending_text_queue", None):
+        if int(getattr(data, "interleaved_text_chunk_size", 0) or 0) <= 0 and getattr(
+            data, "pending_text_queue", None
+        ):
             QwenTalkerModelRunner._pop_left(data.pending_text_queue)
         return combined
 
