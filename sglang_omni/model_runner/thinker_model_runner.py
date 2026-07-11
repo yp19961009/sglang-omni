@@ -4,6 +4,7 @@
 Handles image/video/audio token → embedding replacement and deepstack
 visual embeddings for Qwen3-Omni's thinker stage.
 """
+
 from __future__ import annotations
 
 import logging
@@ -14,6 +15,8 @@ import torch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 
 logger = logging.getLogger(__name__)
 
@@ -68,13 +71,30 @@ class ThinkerModelRunner(ModelRunner):
             return None
 
         with torch.inference_mode():
-            omni_result = self._inject_multimodal_embeds(forward_batch, schedule_batch)
+            self._emit_request_event(requests, "thinker_mm_inject_start")
+            try:
+                omni_result = self._inject_multimodal_embeds(
+                    forward_batch, schedule_batch
+                )
+            finally:
+                self._emit_request_event(requests, "thinker_mm_inject_end")
             if omni_result is not None and omni_result[0] is not None:
                 input_embeds, ds_embeds, vis_masks = omni_result
                 return self._forward_with_omni_embeds(
                     forward_batch, input_embeds, ds_embeds, vis_masks
                 )
             return None
+
+    @staticmethod
+    def _emit_request_event(requests: list[Any], event_name: str) -> None:
+        if not _get_event_recorder().is_active():
+            return
+        for request in requests:
+            _emit_event(
+                request_id=request.request_id,
+                stage=None,
+                event_name=event_name,
+            )
 
     def requested_capture_hidden_mode_prefill(
         self, schedule_batch: Any, requests: list

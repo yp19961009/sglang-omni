@@ -268,6 +268,14 @@ def test_stage_breakdown_covers_preprocess_encoder_and_prefill(
         _ev("r1", "audio_encoder", "encoder_start", 1_100_000, modality="audio"),
         _ev("r1", "audio_encoder", "encoder_end", 6_100_000, modality="audio"),  # 5ms
         _ev("r1", "thinker", "scheduler_prefill_start", 6_200_000),
+        _ev("r1", "thinker", "scheduler_prefill_execute_start", 6_300_000),
+        _ev("r1", "thinker", "thinker_mm_inject_start", 6_400_000),
+        _ev("r1", "thinker", "thinker_mm_inject_end", 6_500_000),
+        _ev("r1", "thinker", "scheduler_prefill_execute_end", 8_300_000),
+        _ev("r1", "thinker", "scheduler_prefill_execute_start", 8_400_000),
+        _ev("r1", "thinker", "scheduler_prefill_execute_end", 10_000_000),
+        _ev("r1", "thinker", "scheduler_decode_execute_start", 10_000_000),
+        _ev("r1", "thinker", "scheduler_decode_execute_end", 10_100_000),
         _ev(
             "r1",
             "thinker",
@@ -302,6 +310,27 @@ def test_stage_breakdown_covers_preprocess_encoder_and_prefill(
     )
     assert thinker_ttft_key in by_key
     assert by_key[thinker_ttft_key].total_ms == 4.0
+
+    prefill_execute_key = (
+        "thinker",
+        "scheduler_prefill_execute_start->scheduler_prefill_execute_end",
+    )
+    assert by_key[prefill_execute_key].count == 2
+    assert by_key[prefill_execute_key].total_ms == 3.6
+
+    decode_execute_key = (
+        "thinker",
+        "scheduler_decode_execute_start->scheduler_decode_execute_end",
+    )
+    assert by_key[decode_execute_key].count == 1
+    assert abs(by_key[decode_execute_key].total_ms - 0.1) < 1e-9
+
+    mm_inject_key = (
+        "thinker",
+        "thinker_mm_inject_start->thinker_mm_inject_end",
+    )
+    assert by_key[mm_inject_key].count == 1
+    assert abs(by_key[mm_inject_key].total_ms - 0.1) < 1e-9
 
     talker_build_key = (
         "talker",

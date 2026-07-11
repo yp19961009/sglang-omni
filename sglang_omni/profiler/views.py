@@ -142,8 +142,12 @@ _STAGE_INTERVAL_EVENTS = (
     ("preprocess_media_load_start", "preprocess_media_load_end"),
     ("preprocess_prompt_start", "preprocess_prompt_end"),
     ("preprocess_hf_processor_start", "preprocess_hf_processor_end"),
+    ("preprocess_encoder_cast_start", "preprocess_encoder_cast_end"),
     ("preprocess_finalize_start", "preprocess_finalize_end"),
     ("scheduler_request_build_start", "scheduler_request_build_end"),
+    ("scheduler_prefill_execute_start", "scheduler_prefill_execute_end"),
+    ("scheduler_decode_execute_start", "scheduler_decode_execute_end"),
+    ("thinker_mm_inject_start", "thinker_mm_inject_end"),
     ("scheduler_prefill_start", "stage_first_stream_chunk_sent"),
     ("scheduler_prefill_start", "scheduler_first_emit"),
 )

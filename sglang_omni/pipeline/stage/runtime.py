@@ -6,6 +6,7 @@ stream chunk routing, abort tracking, profiling.
 
 Dispatches all compute to scheduler (OmniScheduler or SimpleScheduler).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -14,6 +15,7 @@ import logging
 import os
 import queue as _queue_mod
 import threading
+import time
 from contextlib import suppress
 from typing import Any, Callable, Literal
 
@@ -860,6 +862,11 @@ class Stage:
                 continue
 
             if out.type == "result":
+                _emit_event(
+                    request_id=out.request_id,
+                    stage=self.name,
+                    event_name="scheduler_result_dequeued",
+                )
                 await self._route_result(out.request_id, out.data)
             elif out.type == "stream":
                 if out.target is None:
@@ -988,7 +995,9 @@ class Stage:
             logger.warning("Stage %s: no endpoint for %s", self.name, target)
             return
         projector = self._project_payload.get(target)
+        project_started_ns = time.perf_counter_ns()
         projected_payload = projector(payload) if projector is not None else payload
+        project_ms = (time.perf_counter_ns() - project_started_ns) / 1_000_000
         use_local_object = allow_local_object or (
             allow_projected_local_object
             and self._is_isolated_projected_payload(
@@ -1021,7 +1030,11 @@ class Stage:
                 request_id=request_id,
                 stage=self.name,
                 event_name="stage_hop_sent",
-                metadata={"to_stage": target, "transport": "local_object"},
+                metadata={
+                    "to_stage": target,
+                    "transport": "local_object",
+                    "project_ms": round(project_ms, 3),
+                },
             )
             await self._local_dispatcher.send_payload(
                 from_stage=self.name,
@@ -1049,6 +1062,11 @@ class Stage:
             shm_metadata=metadata,
         )
         hop_metadata: dict[str, Any] = {"to_stage": target}
+        hop_metadata["transport"] = "relay"
+        hop_metadata["project_ms"] = round(project_ms, 3)
+        relay_write_profile = metadata.get("relay_write_profile")
+        if relay_write_profile is not None:
+            hop_metadata["relay_write_profile"] = relay_write_profile
         tensor_ref_stats = metadata.get("tensor_ref_stats")
         if tensor_ref_stats is not None:
             hop_metadata.update(tensor_ref_stats)

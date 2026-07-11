@@ -33,6 +33,7 @@ from sglang.srt.utils import broadcast_pyobj
 
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_active_stage as _get_active_stage
+from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.proto.admin import (
     ADMIN_CONTINUE_GENERATION,
     ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP,
@@ -834,7 +835,11 @@ class OmniScheduler:
             # needs it (the fallback reaches upstream run_batch, which counts).
             self.forward_ct = getattr(self, "forward_ct", 0) + 1
             sched_output = self._build_sched_output(batch)
-            mr_output = self._model_runner.execute(sched_output)
+            self._emit_model_execute_event(batch, "start")
+            try:
+                mr_output = self._model_runner.execute(sched_output)
+            finally:
+                self._emit_model_execute_event(batch, "end")
             self._emit_stream_output(sched_output, mr_output)
             return self._make_batch_result(batch, mr_output)
         # Fallback: call upstream's run_batch (uses tp_worker directly)
@@ -966,6 +971,39 @@ class OmniScheduler:
                 request_id=rid,
                 stage=None,
                 event_name="scheduler_prefill_start",
+                metadata=metadata,
+            )
+
+    @staticmethod
+    def _emit_model_execute_event(batch: ScheduleBatch, boundary: str) -> None:
+        if not _get_event_recorder().is_active():
+            return
+        forward_mode = getattr(batch, "forward_mode", None)
+        if forward_mode is not None and forward_mode.is_extend():
+            operation = "prefill"
+        elif forward_mode is not None and forward_mode.is_decode():
+            operation = "decode"
+        else:
+            operation = "model"
+        event_name = f"scheduler_{operation}_execute_{boundary}"
+        batch_metadata = {
+            "batch_size": len(batch.reqs),
+            "is_prefill_only": bool(batch.is_prefill_only),
+            "is_extend_in_batch": bool(batch.is_extend_in_batch),
+            "forward_mode": str(forward_mode or ""),
+        }
+        for req in batch.reqs:
+            metadata = dict(batch_metadata)
+            metadata.update(
+                {
+                    "is_chunked": int(getattr(req, "is_chunked", 0) or 0),
+                    "extend_input_len": int(getattr(req, "extend_input_len", 0) or 0),
+                }
+            )
+            _emit_event(
+                request_id=req.rid,
+                stage=None,
+                event_name=event_name,
                 metadata=metadata,
             )
 
