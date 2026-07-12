@@ -347,6 +347,44 @@ def test_qwen35_residual_predictor_uses_request_sampler_and_frame_position() -> 
     assert torch.equal(captured["positions"], torch.tensor([75]))
 
 
+def test_qwen35_residual_predictor_prefers_cuda_graph(monkeypatch) -> None:
+    talker = Qwen35OmniNextTalker.__new__(Qwen35OmniNextTalker)
+    nn.Module.__init__(talker)
+    expected = (torch.tensor([[[1]]]), torch.tensor([[[2.0]]]))
+    talker._code_predictor_graph_runner = SimpleNamespace(
+        replay=lambda codes, hidden: expected
+    )
+    talker._code_predictor_forward_eager = lambda codes, hidden: pytest.fail(
+        "eager predictor should not run after a graph hit"
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    result = talker.code_predictor_forward(
+        torch.tensor([[1]]), torch.tensor([[[2.0]]])
+    )
+
+    assert result is expected
+
+
+def test_qwen35_residual_predictor_falls_back_when_graph_declines(
+    monkeypatch,
+) -> None:
+    talker = Qwen35OmniNextTalker.__new__(Qwen35OmniNextTalker)
+    nn.Module.__init__(talker)
+    expected = (torch.tensor([[[3]]]), torch.tensor([[[4.0]]]))
+    talker._code_predictor_graph_runner = SimpleNamespace(
+        replay=lambda codes, hidden: None
+    )
+    talker._code_predictor_forward_eager = lambda codes, hidden: expected
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    result = talker.code_predictor_forward(
+        torch.tensor([[3]]), torch.tensor([[[4.0]]])
+    )
+
+    assert result is expected
+
+
 def test_qwen35_residual_frame_position_ignores_interleaved_placeholders() -> None:
     talker = Qwen35OmniNextTalker.__new__(Qwen35OmniNextTalker)
     nn.Module.__init__(talker)

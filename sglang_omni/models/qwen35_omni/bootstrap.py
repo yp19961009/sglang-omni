@@ -146,6 +146,9 @@ def create_talker_scheduler(
     if want_cuda_graph:
         server_args.disable_cuda_graph = False
         model_worker.model_runner.init_device_graphs()
+        model = model_worker.model_runner.model
+        if hasattr(model, "init_code_predictor_graphs"):
+            model.init_code_predictor_graphs(server_args.cuda_graph_bs)
 
     output_proc = SGLangOutputProcessor(
         capture_hidden=False,

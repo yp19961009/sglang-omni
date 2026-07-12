@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
 import torch
@@ -34,6 +36,118 @@ from sglang_omni.vendor.sglang.layers import (
 from sglang_omni.vendor.sglang.models import apply_qk_norm
 from sglang_omni.vendor.sglang.server_args import get_global_server_args
 from sglang_omni.vendor.sglang.utils import add_prefix
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _CodePredictorGraphEntry:
+    graph: torch.cuda.CUDAGraph
+    layer0_codes: torch.Tensor
+    talker_hidden: torch.Tensor
+
+
+class _CodePredictorCudaGraphRunner:
+    """CUDA graphs for the residual code predictor used after Talker prefill."""
+
+    def __init__(self, model: "Qwen35OmniNextTalker") -> None:
+        self._model = model
+        self._entries: dict[int, _CodePredictorGraphEntry] = {}
+        self._pool = None
+
+    @property
+    def has_graphs(self) -> bool:
+        return bool(self._entries)
+
+    @torch.inference_mode()
+    def capture(self, batch_sizes: Iterable[int]) -> None:
+        sizes = sorted({int(size) for size in batch_sizes if int(size) > 0})
+        if not sizes:
+            return
+
+        device = self._model._output_codes.device
+        with torch.cuda.device(device):
+            self._pool = torch.cuda.graph_pool_handle()
+            for batch_size in reversed(sizes):
+                self._capture_one(batch_size, device=device)
+
+    @torch.inference_mode()
+    def _capture_one(self, batch_size: int, *, device: torch.device) -> None:
+        hidden_size = int(self._model.config.text_config.hidden_size)
+        dtype = self._model.model.codec_embedding.weight.dtype
+        layer0_codes = torch.zeros(
+            (batch_size, 1), dtype=torch.long, device=device
+        )
+        talker_hidden = torch.zeros(
+            (batch_size, 1, hidden_size), dtype=dtype, device=device
+        )
+
+        warmup_stream = torch.cuda.Stream(device=device)
+        warmup_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(warmup_stream):
+            self._model._code_predictor_forward_eager(
+                layer0_codes, talker_hidden
+            )
+        torch.cuda.current_stream(device).wait_stream(warmup_stream)
+        torch.cuda.synchronize(device)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(
+            graph,
+            pool=self._pool,
+            capture_error_mode="thread_local",
+        ):
+            self._model._code_predictor_forward_eager(
+                layer0_codes, talker_hidden
+            )
+        self._entries[batch_size] = _CodePredictorGraphEntry(
+            graph=graph,
+            layer0_codes=layer0_codes,
+            talker_hidden=talker_hidden,
+        )
+        logger.info(
+            "Captured Qwen3.5 code predictor CUDA graph bs=%d", batch_size
+        )
+
+    @torch.inference_mode()
+    def replay(
+        self,
+        layer0_codes: torch.Tensor,
+        talker_hidden: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if layer0_codes.ndim == 1:
+            layer0_codes = layer0_codes.unsqueeze(1)
+        if talker_hidden.ndim == 2:
+            talker_hidden = talker_hidden.unsqueeze(1)
+        if (
+            not layer0_codes.is_cuda
+            or layer0_codes.shape[1] != 1
+            or talker_hidden.shape[1] != 1
+        ):
+            return None
+
+        batch_size = int(layer0_codes.shape[0])
+        captured_size = next(
+            (size for size in sorted(self._entries) if size >= batch_size),
+            None,
+        )
+        if captured_size is None:
+            return None
+
+        entry = self._entries[captured_size]
+        entry.layer0_codes[:batch_size].copy_(layer0_codes)
+        entry.talker_hidden[:batch_size].copy_(talker_hidden)
+        if captured_size > batch_size:
+            entry.layer0_codes[batch_size:].zero_()
+            entry.talker_hidden[batch_size:].zero_()
+            self._model._subtalker_frame_positions[
+                batch_size:captured_size
+            ].zero_()
+        entry.graph.replay()
+        return (
+            self._model._output_codes[:batch_size].unsqueeze(-1),
+            self._model._output_embeds[:batch_size].unsqueeze(1),
+        )
 
 
 class Qwen35OmniNextTalkerTextModel(Qwen3NextModel):
@@ -430,6 +544,9 @@ class Qwen35OmniNextTalker(Qwen3OmniTalker):
             dtype=self.model.codec_embedding.weight.dtype,
             device=device,
         )
+        self._code_predictor_graph_runner: (
+            _CodePredictorCudaGraphRunner | None
+        ) = None
         self._sampler = None
         _bind_default_weight_loaders(self)
         self._cached_params_dict = dict(self.named_parameters())
@@ -471,8 +588,35 @@ class Qwen35OmniNextTalker(Qwen3OmniTalker):
         layer0_codes: torch.Tensor,
         talker_hidden: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        runner = self._code_predictor_graph_runner
+        if runner is not None and not torch.cuda.is_current_stream_capturing():
+            result = runner.replay(layer0_codes, talker_hidden)
+            if result is not None:
+                return result
+        return self._code_predictor_forward_eager(layer0_codes, talker_hidden)
+
+    def _code_predictor_forward_eager(
+        self,
+        layer0_codes: torch.Tensor,
+        talker_hidden: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         self._subtalker_sample_index = 0
         return super().code_predictor_forward(layer0_codes, talker_hidden)
+
+    def init_code_predictor_graphs(self, batch_sizes: Iterable[int]) -> None:
+        if not torch.cuda.is_available():
+            return
+        runner = _CodePredictorCudaGraphRunner(self)
+        try:
+            runner.capture(batch_sizes)
+        except Exception:
+            logger.warning(
+                "Qwen3.5 code predictor CUDA graph capture failed; using eager",
+                exc_info=True,
+            )
+            return
+        if runner.has_graphs:
+            self._code_predictor_graph_runner = runner
 
     def _sample_code_predictor_token(self, logits: torch.Tensor) -> torch.Tensor:
         """Sample residual codec groups with the request's talker policy."""
