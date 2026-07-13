@@ -229,17 +229,16 @@ def create_sglang_thinker_executor_from_config(
     total_gpu_memory_fraction: float | None = None,
 ):
     attention_backend = _default_thinker_attention_backend()
-    overrides: dict[str, Any] = {
-        "disable_cuda_graph": False,
-        "disable_radix_cache": True,
-        "enable_mixed_chunk": True,
-        "chunked_prefill_size": 8192,
-        "max_running_requests": 1,
-        "sampling_backend": "pytorch",
-        "attention_backend": attention_backend,
-    }
-    if server_args_overrides:
-        overrides.update(server_args_overrides)
+    overrides = build_generation_batch_overrides(
+        max_running_requests=16,
+        server_args_overrides=server_args_overrides,
+        disable_cuda_graph=False,
+        disable_radix_cache=True,
+        enable_mixed_chunk=True,
+        chunked_prefill_size=8192,
+        sampling_backend="pytorch",
+        attention_backend=attention_backend,
+    )
     logger.info(
         "Qwen3.5 thinker attention backend=%s",
         overrides["attention_backend"],
@@ -273,6 +272,10 @@ def create_sglang_thinker_executor_from_config(
     ):
         if not hasattr(server_args, attr):
             setattr(server_args, attr, default)
+    validate_generation_batch_policy(
+        model_name="Qwen3.5-Omni thinker",
+        server_args=server_args,
+    )
     if total_gpu_memory_fraction is None:
         reserve_applied = qwen3_stages._apply_qwen_thinker_encoder_reserve(
             server_args,
