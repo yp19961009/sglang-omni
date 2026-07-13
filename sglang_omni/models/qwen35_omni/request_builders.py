@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -24,6 +25,23 @@ DECODE_STAGE = qwen3_builders.DECODE_STAGE
 MM_AGGREGATE_STAGE = qwen3_builders.MM_AGGREGATE_STAGE
 TALKER_STAGE = qwen3_builders.TALKER_STAGE
 CODE2WAV_STAGE = qwen3_builders.CODE2WAV_STAGE
+
+_BENCHMARK_FIXED_TEXT_TOKENS_ENV = (
+    "SGLANG_OMNI_BENCHMARK_FIXED_TEXT_TOKENS"
+)
+_BENCHMARK_FIXED_CODEC_FRAMES_ENV = (
+    "SGLANG_OMNI_BENCHMARK_FIXED_CODEC_FRAMES"
+)
+
+
+def _positive_int_env(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    return parsed
 
 output_modalities = qwen3_builders.output_modalities
 should_generate_audio_output = qwen3_builders.should_generate_audio_output
@@ -256,7 +274,17 @@ def build_sglang_thinker_request(
     model_inputs.pop("attention_mask", None)
     input_ids_list = input_ids.to(dtype=torch.long).tolist()
 
-    max_new_tokens = params.get("max_new_tokens", 2048)
+    fixed_text_tokens = _positive_int_env(_BENCHMARK_FIXED_TEXT_TOKENS_ENV)
+    max_new_tokens = (
+        fixed_text_tokens
+        if fixed_text_tokens is not None
+        else int(params.get("max_new_tokens", 2048))
+    )
+    min_new_tokens = (
+        fixed_text_tokens
+        if fixed_text_tokens is not None
+        else int(params.get("min_new_tokens", 0))
+    )
     temperature = params.get("temperature", 0.0)
     top_p = params.get("top_p", 1.0)
     top_k = params.get("top_k", -1)
@@ -268,6 +296,7 @@ def build_sglang_thinker_request(
 
     sampling_params = SamplingParams(
         max_new_tokens=max_new_tokens,
+        min_new_tokens=min_new_tokens,
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
@@ -424,13 +453,24 @@ def make_talker_scheduler_adapters(
 
     def _resolve_sampling_config(params: dict[str, Any]) -> dict[str, Any]:
         eos_id = int(talker_config.codec_eos_token_id)
+        fixed_codec_frames = _positive_int_env(
+            _BENCHMARK_FIXED_CODEC_FRAMES_ENV
+        )
         suppress_tokens = [
             token_id
             for token_id in range(valid_codec_vocab_size, codec_vocab_size)
             if token_id != eos_id
         ]
+        if fixed_codec_frames is not None:
+            # A max token count alone is only an upper bound. Suppressing codec
+            # EOS makes the benchmark emit exactly this many valid frames.
+            suppress_tokens.append(eos_id)
         return {
-            "max_new_tokens": int(params.get("talker_max_new_tokens", 4096)),
+            "max_new_tokens": (
+                fixed_codec_frames
+                if fixed_codec_frames is not None
+                else int(params.get("talker_max_new_tokens", 4096))
+            ),
             "temperature": float(params.get("talker_temperature", 0.9)),
             "top_k": int(params.get("talker_top_k", 50)),
             "top_p": float(params.get("talker_top_p", 1.0)),
