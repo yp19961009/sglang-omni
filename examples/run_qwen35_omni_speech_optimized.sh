@@ -13,6 +13,108 @@ set -euo pipefail
 # Throughput launch with graph/compile batch ranges aligned through 8:
 #   CUDA_VISIBLE_DEVICES=0,1 MAX_RUNNING_REQUESTS=8 \
 #     ./examples/run_qwen35_omni_speech_optimized.sh
+#
+# Run with --help for prepared-media client examples and request semantics.
+
+print_usage() {
+  cat <<'EOF'
+Usage:
+  CUDA_VISIBLE_DEVICES=2,3 [OPTIONS...] \
+    ./examples/run_qwen35_omni_speech_optimized.sh [SGLANG_SERVE_ARGS...]
+
+This launcher must run in the sglang-omni-dev container. On the host,
+/home/gangouyu is mounted at /myapp in the container:
+
+  docker exec -it sglang-omni-dev bash
+  cd /myapp/sglang-omni
+  CUDA_VISIBLE_DEVICES=2,3 MAX_RUNNING_REQUESTS=1 \
+    ./examples/run_qwen35_omni_speech_optimized.sh
+
+Important options (environment variables):
+  MODEL_PATH             Model directory. Default: Qwen3.5-Omni local model.
+  MODEL_NAME             Served model name. Default: qwen35-omni.
+  HOST / PORT            Listen address. Default: 127.0.0.1:8011.
+  MAX_RUNNING_REQUESTS   Runtime, compile, and CUDA graph max batch size.
+                         Default: 1.
+  ENCODER_MEM_RESERVE    Encoder-stage memory reserve ratio. Default: 0.30.
+  SGLANG_OMNI_PREPROCESSED_MEDIA_CACHE_SIZE
+                         Number of path-backed prepared media objects retained
+                         by the preprocessing process. Default: 4.
+
+Single prepared-media S2T request (sample 001-1):
+
+  python3 benchmarks/eval/qwen35_omni_single_s2t.py client \
+    --engine sglang \
+    --base-url http://127.0.0.1:8011 \
+    --model-name qwen35-omni \
+    --data-root /myapp/data/videoamme \
+    --output /myapp/benchmarks/qwen35_s2t_align/manual-preprocessed/results.json \
+    --suite custom \
+    --sample-id 001-1 \
+    --no-cache-probes \
+    --video-fps 1 \
+    --video-max-frames 128 \
+    --video-max-pixels 401408 \
+    --preprocessed-video-dir \
+      /myapp/data/qwen35_s2t_predecoded_fps1_factor32/videos \
+    --preprocessed-audio-dir \
+      /myapp/data/qwen35_s2t_predecoded_fps1/audios
+
+Prepared-media Thinker+Talker request and audio output:
+
+  python3 benchmarks/eval/benchmark_omni_videoamme.py \
+    --base-url http://127.0.0.1:8011 \
+    --model qwen35-omni \
+    --max-samples 1 \
+    --max-concurrency 1 \
+    --max-tokens 256 \
+    --video-fps 1 \
+    --video-max-frames 128 \
+    --video-max-pixels 401408 \
+    --preprocessed-video-dir \
+      /myapp/data/qwen35_s2t_predecoded_fps1_factor32/videos \
+    --preprocessed-audio-dir \
+      /myapp/data/qwen35_s2t_predecoded_fps1/audios \
+    --reuse-preprocessed-media \
+    --enable-audio \
+    --skip-wer \
+    --output-dir /myapp/benchmarks/qwen35_speech_manual
+
+The HTTP request contract is equivalent to:
+
+  "preprocessed_videos": [
+    {"path": "/myapp/data/.../001_fps1p0_frames128_px401408.pt",
+     "reuse_loaded": true}
+  ],
+  "preprocessed_audios": [
+    {"path": "/myapp/data/.../001-1_sr16000.pt", "reuse_loaded": true}
+  ]
+
+Prepared-media behavior:
+  - Video .pt files already contain decoded, sampled, resized frames and FPS.
+  - Audio .pt files already contain a decoded 16 kHz waveform.
+  - The server skips video decode/frame sampling/resize and audio decode/resample,
+    then starts at prepared-media materialization followed by the HF processor.
+  - Paths are resolved by the server inside the container, so use /myapp paths,
+    not host-side /home/gangouyu paths.
+  - Do not send videos together with preprocessed_videos, or audios together
+    with preprocessed_audios. The API rejects either combination with HTTP 400.
+  - reuse_loaded=true retains path-backed objects for repeated requests. The
+    benchmark flag --reuse-preprocessed-media adds it automatically.
+  - The video-fps/max-frames/max-pixels client options select the matching cache
+    filename; they are not reapplied to already prepared tensors.
+
+All extra command-line arguments are forwarded to `python -m sglang_omni.cli
+serve` after the optimized defaults in this script.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help)
+    print_usage
+    exit 0
+    ;;
+esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
