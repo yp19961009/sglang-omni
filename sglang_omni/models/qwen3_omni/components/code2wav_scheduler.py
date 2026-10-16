@@ -7,6 +7,8 @@ runs vocoder incrementally, outputs final audio via outbox.
 from __future__ import annotations
 
 import logging
+import os
+import time
 from typing import Any
 
 import numpy as np
@@ -20,6 +22,14 @@ from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleSch
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 
 logger = logging.getLogger(__name__)
+_STREAM_TIMING_STATS_ENV = "SGLANG_OMNI_STREAM_TIMING_STATS"
+
+
+def _stream_timing_stats_enabled() -> bool:
+    raw = os.getenv(_STREAM_TIMING_STATS_ENV)
+    if raw is None or raw == "":
+        return False
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def load_code2wav_model(
@@ -75,6 +85,9 @@ class Code2WavScheduler(StreamingSimpleScheduler):
         self._emitted: dict[str, int] = {}
         self._audio_chunks: dict[str, list[np.ndarray]] = {}
         self._stream_enabled: dict[str, bool] = {}
+        self._collecting_window: set[str] = set()
+        self._timing_stats_enabled = _stream_timing_stats_enabled()
+        self._timing_stats: dict[str, dict[str, Any]] = {}
         super().__init__(compute_fn=None)
         self._payloads = self._stream_payloads
 
@@ -91,6 +104,8 @@ class Code2WavScheduler(StreamingSimpleScheduler):
         self._emitted.pop(request_id, None)
         self._audio_chunks.pop(request_id, None)
         self._stream_enabled.pop(request_id, None)
+        self._collecting_window.discard(request_id)
+        self._timing_stats.pop(request_id, None)
 
     def _fail_request(self, request_id: str, error: Exception) -> None:
         self.outbox.put(
@@ -109,10 +124,127 @@ class Code2WavScheduler(StreamingSimpleScheduler):
         self._emitted[request_id] = 0
         self._audio_chunks[request_id] = []
 
+    def _timing_state(self, request_id: str) -> dict[str, Any] | None:
+        if not self._timing_stats_enabled:
+            return None
+        return self._timing_stats.setdefault(
+            request_id,
+            {
+                "chunk_count": 0,
+                "audio_parts": 0,
+                "last_recv_ns": None,
+                "window_start_ns": None,
+                "hop_ms": [],
+                "recv_gap_ms": [],
+                "collect_ms": [],
+                "decode_ms": [],
+            },
+        )
+
+    @staticmethod
+    def _timing_summary(values: list[float]) -> tuple[int, float, float]:
+        if not values:
+            return 0, 0.0, 0.0
+        return len(values), sum(values) / len(values), max(values)
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _record_chunk_timing(
+        self,
+        request_id: str,
+        chunk: StreamItem,
+        *,
+        recv_ns: int,
+    ) -> None:
+        stats = self._timing_state(request_id)
+        if stats is None:
+            return
+        stats["chunk_count"] += 1
+        last_recv_ns = stats.get("last_recv_ns")
+        if isinstance(last_recv_ns, int):
+            stats["recv_gap_ms"].append((recv_ns - last_recv_ns) / 1e6)
+        stats["last_recv_ns"] = recv_ns
+        metadata = chunk.metadata if isinstance(chunk.metadata, dict) else {}
+        emit_ns = self._coerce_int(metadata.get("talker_emit_ns"))
+        if emit_ns is not None and recv_ns >= emit_ns:
+            stats["hop_ms"].append((recv_ns - emit_ns) / 1e6)
+
+    def _record_collect_start(self, request_id: str, *, start_ns: int) -> None:
+        stats = self._timing_state(request_id)
+        if stats is not None:
+            stats["window_start_ns"] = start_ns
+
+    def _record_collect_end(self, request_id: str, *, end_ns: int) -> None:
+        stats = self._timing_state(request_id)
+        if stats is None:
+            return
+        start_ns = stats.get("window_start_ns")
+        if isinstance(start_ns, int) and end_ns >= start_ns:
+            stats["collect_ms"].append((end_ns - start_ns) / 1e6)
+        stats["window_start_ns"] = None
+
+    def _record_decode_duration(self, request_id: str, *, duration_ms: float) -> None:
+        stats = self._timing_state(request_id)
+        if stats is not None:
+            stats["decode_ms"].append(duration_ms)
+
+    def _record_audio_part(self, request_id: str) -> None:
+        stats = self._timing_state(request_id)
+        if stats is not None:
+            stats["audio_parts"] += 1
+
+    def _log_timing_stats(self, request_id: str) -> None:
+        if not self._timing_stats_enabled:
+            return
+        stats = self._timing_stats.get(request_id)
+        if not stats:
+            return
+        hop_n, hop_avg, hop_max = self._timing_summary(stats["hop_ms"])
+        gap_n, gap_avg, gap_max = self._timing_summary(stats["recv_gap_ms"])
+        collect_n, collect_avg, collect_max = self._timing_summary(
+            stats["collect_ms"]
+        )
+        decode_n, decode_avg, decode_max = self._timing_summary(stats["decode_ms"])
+        logger.info(
+            "code2wav_timing_stats req=%s chunks=%d audio_parts=%d "
+            "hop_count=%d hop_avg_ms=%.3f hop_max_ms=%.3f "
+            "recv_gap_count=%d recv_gap_avg_ms=%.3f recv_gap_max_ms=%.3f "
+            "collect_count=%d collect_avg_ms=%.3f collect_max_ms=%.3f "
+            "decode_count=%d decode_avg_ms=%.3f decode_max_ms=%.3f",
+            request_id,
+            int(stats["chunk_count"]),
+            int(stats["audio_parts"]),
+            hop_n,
+            hop_avg,
+            hop_max,
+            gap_n,
+            gap_avg,
+            gap_max,
+            collect_n,
+            collect_avg,
+            collect_max,
+            decode_n,
+            decode_avg,
+            decode_max,
+        )
+
     def on_stream_chunk(
         self, request_id: str, chunk: StreamItem
     ) -> list[OutgoingMessage]:
+        if self._append_code_chunk(request_id, chunk):
+            return self._decode_and_emit(request_id)
+        return []
+
+    def _append_code_chunk(self, request_id: str, chunk: StreamItem) -> bool:
         self._ensure_request_state(request_id)
+        recv_ns = time.monotonic_ns() if self._timing_stats_enabled else 0
+        if self._timing_stats_enabled:
+            self._record_chunk_timing(request_id, chunk, recv_ns=recv_ns)
 
         # Latch the stream flag from talker's metadata once per request.
         # Talker contract: always populate metadata['stream']; a missing
@@ -128,30 +260,64 @@ class Code2WavScheduler(StreamingSimpleScheduler):
                         "populate it."
                     ),
                 )
-                return []
+                return False
             self._stream_enabled[request_id] = bool(meta["stream"])
 
         codes = chunk.data.to(device=self._device, dtype=torch.long)
+        if codes.ndim == 0:
+            rows = codes.reshape(1, 1)
+        elif codes.ndim == 1:
+            rows = codes.reshape(1, -1)
+        else:
+            rows = codes.reshape(codes.shape[0], -1)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                "Code2Wav chunk req=%s shape=%s first_codes=%s",
+                "Code2Wav chunk req=%s shape=%s rows=%s first_codes=%s",
                 request_id,
                 tuple(codes.shape),
-                codes.reshape(-1)[:8].tolist(),
+                int(rows.shape[0]),
+                rows.reshape(-1)[:8].tolist(),
             )
 
-        # Skip EOS
-        if codes.ndim >= 1 and codes[0].item() == self._codec_eos_token_id:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "Code2Wav skip EOS req=%s codes=%s", request_id, codes.tolist()
-                )
-            return []
-        self._code_chunks[request_id].append(codes)
+        chunks = self._code_chunks[request_id]
+        emitted = self._emitted[request_id]
+        ready_before = len(chunks) - emitted
+        if ready_before <= 0 and request_id not in self._collecting_window:
+            self._collecting_window.add(request_id)
+            if self._timing_stats_enabled:
+                self._record_collect_start(request_id, start_ns=recv_ns)
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name="code2wav_window_collect_start",
+                metadata={
+                    "stream_chunk_size": self._stream_chunk_size,
+                    "emitted_chunks": emitted,
+                },
+            )
+        appended = 0
+        skipped_eos = 0
+        for row in rows:
+            # Skip EOS rows. Grouped stream chunks may contain multiple codec rows.
+            if row.numel() > 0 and row.reshape(-1)[0].item() == self._codec_eos_token_id:
+                skipped_eos += 1
+                continue
+            chunks.append(row.reshape(-1))
+            appended += 1
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name="code2wav_chunk_received",
+            metadata={
+                "ready_before": ready_before,
+                "stream_chunk_size": self._stream_chunk_size,
+                "rows": int(rows.shape[0]),
+                "appended_rows": appended,
+                "skipped_eos_rows": skipped_eos,
+            },
+        )
         ready = len(self._code_chunks[request_id]) - self._emitted[request_id]
-        if ready >= self._stream_chunk_size:
-            return self._decode_and_emit(request_id)
-        return []
+        return ready >= self._stream_chunk_size
 
     def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
         # Decode remaining
@@ -161,58 +327,115 @@ class Code2WavScheduler(StreamingSimpleScheduler):
         if chunks and emitted < len(chunks):
             messages.extend(self._decode_and_emit(request_id))
 
-        # Build final output
-        audio_parts = self._audio_chunks.get(request_id, [])
-        if not audio_parts:
-            self._fail_request(
-                request_id,
-                RuntimeError(f"code2wav produced no audio for {request_id!r}"),
-            )
-            return []
-        full_audio = np.concatenate(audio_parts).astype(np.float32, copy=False)
-        payload = self._payloads[request_id]
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "Code2Wav finalize req=%s code_chunks=%s audio_parts=%s final_samples=%s",
-                request_id,
-                len(self._code_chunks[request_id]),
-                len(audio_parts),
-                int(full_audio.shape[0]),
-            )
-        # Streaming clients already received per-chunk audio; final result is
-        # metadata-only to avoid IPC-ing full audio that the HTTP layer drops.
-        # Default False so missing latch falls back to non-streaming (safe:
-        # may waste bandwidth, never starves a non-streaming client).
-        if self._stream_enabled.get(request_id, False):
-            final_data: dict[str, Any] = {
-                "modality": "audio",
-                "sample_rate": self._sample_rate,
-            }
-        else:
-            final_data = self._build_audio_payload(full_audio)
-        messages.append(
-            OutgoingMessage(
-                request_id=request_id,
-                type="result",
-                data=StagePayload(
-                    request_id=payload.request_id,
-                    request=payload.request,
-                    data=final_data,
-                ),
-            )
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name="code2wav_finalize_start",
         )
-        return messages
+        try:
+            # Build final output
+            audio_parts = self._audio_chunks.get(request_id, [])
+            if not audio_parts:
+                self._fail_request(
+                    request_id,
+                    RuntimeError(f"code2wav produced no audio for {request_id!r}"),
+                )
+                return []
+            full_audio = np.concatenate(audio_parts).astype(np.float32, copy=False)
+            payload = self._payloads[request_id]
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Code2Wav finalize req=%s code_chunks=%s audio_parts=%s final_samples=%s",
+                    request_id,
+                    len(self._code_chunks[request_id]),
+                    len(audio_parts),
+                    int(full_audio.shape[0]),
+                )
+            # Streaming clients already received per-chunk audio; final result is
+            # metadata-only to avoid IPC-ing full audio that the HTTP layer drops.
+            # Default False so missing latch falls back to non-streaming (safe:
+            # may waste bandwidth, never starves a non-streaming client).
+            if self._stream_enabled.get(request_id, False):
+                final_data: dict[str, Any] = {
+                    "modality": "audio",
+                    "sample_rate": self._sample_rate,
+                }
+            else:
+                final_data = self._build_audio_payload(full_audio)
+            messages.append(
+                OutgoingMessage(
+                    request_id=request_id,
+                    type="result",
+                    data=StagePayload(
+                        request_id=payload.request_id,
+                        request=payload.request,
+                        data=final_data,
+                    ),
+                )
+            )
+            return messages
+        finally:
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name="code2wav_finalize_end",
+            )
+            self._log_timing_stats(request_id)
 
     def _decode_and_emit(self, request_id: str) -> list[OutgoingMessage]:
         chunks = self._code_chunks[request_id]
         start = self._emitted[request_id]
         end = len(chunks)
-        audio = self._decode_incremental(request_id, chunks, start, end)
+        window_metadata = {
+            "start": start,
+            "end": end,
+            "new_chunks": end - start,
+            "context_chunks": min(self._left_context_size, start),
+            "stream_chunk_size": self._stream_chunk_size,
+        }
+        if request_id in self._collecting_window:
+            self._collecting_window.discard(request_id)
+            collect_end_ns = time.monotonic_ns() if self._timing_stats_enabled else 0
+            if self._timing_stats_enabled:
+                self._record_collect_end(request_id, end_ns=collect_end_ns)
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name="code2wav_window_collect_end",
+                metadata=window_metadata,
+            )
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name="code2wav_decode_start",
+            metadata=window_metadata,
+        )
+        audio: np.ndarray | None = None
+        decode_start_ns = time.monotonic_ns() if self._timing_stats_enabled else 0
+        try:
+            audio = self._decode_incremental(request_id, chunks, start, end)
+        finally:
+            if self._timing_stats_enabled:
+                decode_end_ns = time.monotonic_ns()
+                self._record_decode_duration(
+                    request_id,
+                    duration_ms=(decode_end_ns - decode_start_ns) / 1e6,
+                )
+            decode_metadata = dict(window_metadata)
+            if audio is not None:
+                decode_metadata["samples"] = int(audio.shape[0])
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name="code2wav_decode_end",
+                metadata=decode_metadata,
+            )
         self._emitted[request_id] = end
         messages: list[OutgoingMessage] = []
         if audio.size > 0:
             is_first = not self._audio_chunks[request_id]
             self._audio_chunks[request_id].append(audio)
+            self._record_audio_part(request_id)
             if is_first:
                 _emit_event(
                     request_id=request_id,

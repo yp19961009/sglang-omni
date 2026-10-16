@@ -26,6 +26,17 @@ from transformers.utils.hub import cached_file
 _CONFIG_MODEL_TYPE_TO_ARCH = {
     "moss_tts_delay": "MossTTSDelayModel",
     "moss_tts_delay_with_codec": "MossTTSDelayWithCodec",
+    # Qwen3.5-Omni root configs use the model_type from the Qwen reference.
+    # When transformers does not know the config yet, or architectures is
+    # missing, the raw-config fallback should still select the Qwen3.5-Omni
+    # pipeline.
+    "qwen3_omni_next": "Qwen3OmniNextForConditionalGeneration",
+    # Bring-up often points directly at a split thinker directory. Map it to a
+    # pipeline-recognized architecture here; talker submodels are still handled
+    # by model_worker's submodel path logic, not by pipeline root detection.
+    "qwen3_omni_next_thinker": "Qwen3OmniNextThinkerForConditionalGeneration",
+    "qwen3_omni_next_thinker_mtp": "Qwen3OmniNextThinkerMTP",
+    "qwen3_omni_next_talker": "Qwen3OmniNextTalkerModel",
     "qwen3_tts": "Qwen3TTSForConditionalGeneration",
     "voxtral_tts": "VoxtralTTSForConditionalGeneration",
 }

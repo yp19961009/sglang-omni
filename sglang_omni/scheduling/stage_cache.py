@@ -27,6 +27,16 @@ def _detach_value(value: Any, *, device: torch.device | None) -> Any:
     return value
 
 
+def _clone_cached_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {key: _clone_cached_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_clone_cached_value(item) for item in value)
+    return value
+
+
 def _value_size_bytes(value: Any) -> int:
     if isinstance(value, torch.Tensor):
         return int(value.numel() * value.element_size())
@@ -45,6 +55,7 @@ class StageOutputCache:
         max_size: int | None = None,
         max_bytes: int | None = None,
         cache_device: torch.device | str | None = None,
+        clone_on_get: bool = True,
     ) -> None:
         if isinstance(cache_device, str):
             cache_device = torch.device(cache_device)
@@ -52,6 +63,7 @@ class StageOutputCache:
         self.max_size = max_size
         self.max_bytes = max_bytes
         self.cache_device = cache_device
+        self.clone_on_get = bool(clone_on_get)
         self.current_bytes = 0
 
     def get(self, key: str | None) -> Any | None:
@@ -62,7 +74,19 @@ class StageOutputCache:
         if entry is None:
             return None
         self._cache.move_to_end(key)
+        if self.clone_on_get:
+            return _clone_cached_value(entry.data)
         return entry.data
+
+    def contains(self, key: str | None) -> bool:
+        if key is None:
+            return False
+        key = str(key)
+        entry = self._cache.get(key)
+        if entry is None:
+            return False
+        self._cache.move_to_end(key)
+        return True
 
     def put(self, key: str | None, data: Any) -> None:
         if key is None:

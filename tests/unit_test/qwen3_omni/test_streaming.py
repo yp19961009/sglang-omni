@@ -14,7 +14,9 @@ from sglang_omni.models.qwen3_omni.components.code2wav_scheduler import (
     Code2WavScheduler,
 )
 from sglang_omni.models.qwen3_omni.components.streaming_detokenizer import (
+    _PriorityStreamOutbox,
     StreamingDetokenizeScheduler,
+    _PriorityFirstStreamInbox,
 )
 from sglang_omni.models.qwen3_omni.request_builders import (
     make_thinker_stream_output_builder,
@@ -55,6 +57,26 @@ class _ByteTokenizer:
         return b"".join(chunks).decode("utf-8", errors="replace")
 
 
+class _BoundedTokenizer(_ByteTokenizer):
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        *,
+        size: int,
+        special_token_ids: set[int] | None = None,
+        eos_token_id: int | None = None,
+    ):
+        super().__init__(
+            vocab,
+            special_token_ids=special_token_ids,
+            eos_token_id=eos_token_id,
+        )
+        self._size = size
+
+    def __len__(self) -> int:
+        return self._size
+
+
 @dataclass
 class _StreamItem:
     """Mimics StreamItem.data shape passed to the scheduler inbox."""
@@ -85,11 +107,156 @@ def _make_payload(stream: bool) -> StagePayload:
     )
 
 
+def _make_prerun_payload(stream: bool) -> StagePayload:
+    payload = _make_payload(stream)
+    payload.request.metadata["pre_run"] = True
+    return payload
+
+
 def _drain_outbox(scheduler: StreamingDetokenizeScheduler) -> list[OutgoingMessage]:
     out: list[OutgoingMessage] = []
     while not scheduler.outbox.empty():
         out.append(scheduler.outbox.get_nowait())
     return out
+
+
+def test_decode_priority_first_stream_inbox_promotes_first_chunk():
+    inbox = _PriorityFirstStreamInbox()
+    old_chunk = IncomingMessage(
+        request_id="old",
+        type="stream_chunk",
+        data=StreamItem(chunk_id=3, data=3, from_stage="thinker"),
+    )
+    old_payload = IncomingMessage(
+        request_id="payload",
+        type="new_request",
+        data=_make_payload(stream=True),
+    )
+    first_chunk = IncomingMessage(
+        request_id="first",
+        type="stream_chunk",
+        data=StreamItem(chunk_id=0, data=1, from_stage="thinker"),
+    )
+
+    inbox.put(old_chunk)
+    inbox.put(old_payload)
+    inbox.put(first_chunk)
+
+    assert inbox.get_nowait() is first_chunk
+    assert inbox.get_nowait() is old_chunk
+    assert inbox.get_nowait() is old_payload
+
+
+def test_decode_priority_first_stream_inbox_promotes_streaming_actual_payload():
+    inbox = _PriorityFirstStreamInbox()
+    prerun_payload = IncomingMessage(
+        request_id="prerun",
+        type="new_request",
+        data=_make_prerun_payload(stream=True),
+    )
+    actual_payload = IncomingMessage(
+        request_id="actual",
+        type="new_request",
+        data=_make_payload(stream=True),
+    )
+    stream_done = IncomingMessage(
+        request_id="actual",
+        type="stream_done",
+    )
+
+    inbox.put(prerun_payload)
+    inbox.put(actual_payload)
+    inbox.put(stream_done)
+
+    assert inbox.get_nowait() is actual_payload
+    assert inbox.get_nowait() is stream_done
+    assert inbox.get_nowait() is prerun_payload
+
+
+def test_decode_priority_first_stream_inbox_keeps_payload_done_ahead_of_later_chunks():
+    inbox = _PriorityFirstStreamInbox()
+    old_chunk = IncomingMessage(
+        request_id="old",
+        type="stream_chunk",
+        data=StreamItem(chunk_id=1, data=1, from_stage="thinker"),
+    )
+    actual_payload = IncomingMessage(
+        request_id="actual",
+        type="new_request",
+        data=_make_payload(stream=True),
+    )
+    stream_done = IncomingMessage(
+        request_id="actual",
+        type="stream_done",
+    )
+    later_chunk = IncomingMessage(
+        request_id="later",
+        type="stream_chunk",
+        data=StreamItem(chunk_id=2, data=2, from_stage="thinker"),
+    )
+
+    inbox.put(old_chunk)
+    inbox.put(actual_payload)
+    inbox.put(stream_done)
+    inbox.put(later_chunk)
+
+    assert inbox.get_nowait() is old_chunk
+    assert inbox.get_nowait() is actual_payload
+    assert inbox.get_nowait() is stream_done
+    assert inbox.get_nowait() is later_chunk
+
+
+def test_decode_priority_first_stream_inbox_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_DECODE_PRIORITY_FIRST_STREAM", "0")
+
+    scheduler = StreamingDetokenizeScheduler(_ByteTokenizer({1: b"a"}), eos_token_id=None)
+
+    assert not isinstance(scheduler.inbox, _PriorityFirstStreamInbox)
+
+
+def test_decode_priority_stream_outbox_promotes_first_text_delta():
+    outbox = _PriorityStreamOutbox()
+    old_result = OutgoingMessage(
+        request_id="old",
+        type="result",
+        data=_make_payload(stream=False),
+    )
+    old_later_stream = OutgoingMessage(
+        request_id="old-stream",
+        type="stream",
+        data={"text": "later"},
+        metadata={"modality": "text"},
+    )
+    first_stream = OutgoingMessage(
+        request_id="fresh",
+        type="stream",
+        data={"text": "first"},
+        metadata={"modality": "text"},
+    )
+
+    outbox.put(old_result)
+    outbox.put(old_later_stream)
+    outbox.put(first_stream)
+
+    assert outbox.get_nowait() is old_later_stream
+    assert outbox.get_nowait() is first_stream
+    assert outbox.get_nowait() is old_result
+
+
+def test_decode_priority_stream_outbox_enabled_by_default(monkeypatch):
+    monkeypatch.delenv("SGLANG_OMNI_DECODE_PRIORITY_STREAM_OUTBOX", raising=False)
+
+    scheduler = StreamingDetokenizeScheduler(_ByteTokenizer({1: b"a"}), eos_token_id=None)
+
+    assert isinstance(scheduler.outbox, _PriorityStreamOutbox)
+
+
+def test_decode_priority_stream_outbox_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_DECODE_PRIORITY_STREAM_OUTBOX", "0")
+
+    scheduler = StreamingDetokenizeScheduler(_ByteTokenizer({1: b"a"}), eos_token_id=None)
+
+    assert not isinstance(scheduler.outbox, _PriorityStreamOutbox)
 
 
 def _thinker_stage_payload(output_modalities: list[str] | None) -> StagePayload:
@@ -172,6 +339,107 @@ def test_qwen_thinker_stream_builder_keeps_talker_for_audio_output():
     messages = builder("req-1", req_data, req_output)
 
     assert [msg.target for msg in messages] == ["decode", "talker_ar"]
+
+
+def test_qwen_thinker_stream_builder_inlines_decode_token_when_enabled(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
+    builder = make_thinker_stream_output_builder()
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(is_chunked=0),
+        stage_payload=_thinker_stage_payload(["audio"]),
+    )
+    req_output = SimpleNamespace(
+        data=11,
+        extra={"hidden_states": torch.tensor([[1.0, 2.0]])},
+    )
+
+    messages = builder("req-1", req_data, req_output)
+
+    assert [msg.target for msg in messages] == ["decode", "talker_ar"]
+    assert messages[0].data == 11
+    assert torch.equal(messages[1].data, torch.tensor([1.0, 2.0]))
+
+
+def test_qwen_thinker_stream_builder_batches_decode_tokens(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
+    monkeypatch.setenv("SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE", "3")
+    builder = make_thinker_stream_output_builder()
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(is_chunked=0),
+        stage_payload=_thinker_stage_payload(["text"]),
+    )
+
+    per_token_messages = [
+        builder(
+            "req-1",
+            req_data,
+            SimpleNamespace(data=token_id, extra={}),
+        )
+        for token_id in [11, 12, 13, 14, 15]
+    ]
+    decode_chunks = [
+        [msg for msg in messages if msg.target == "decode"]
+        for messages in per_token_messages
+    ]
+
+    assert decode_chunks[0][0].data == 11
+    assert decode_chunks[1] == []
+    assert decode_chunks[2] == []
+    assert decode_chunks[3][0].data == [12, 13, 14]
+    assert decode_chunks[3][0].metadata["token_count"] == 3
+    assert decode_chunks[4] == []
+
+
+def test_qwen_thinker_stream_builder_flushes_tail_decode_tokens(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
+    monkeypatch.setenv("SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE", "3")
+    builder = make_thinker_stream_output_builder()
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(is_chunked=0),
+        stage_payload=_thinker_stage_payload(["text"]),
+    )
+
+    for token_id in [11, 12, 13, 14, 15]:
+        builder("req-1", req_data, SimpleNamespace(data=token_id, extra={}))
+
+    flush = getattr(builder, "flush")
+    flushed = flush("req-1", req_data)
+
+    assert len(flushed) == 1
+    assert flushed[0].target == "decode"
+    assert flushed[0].data == 15
+    assert flush("req-1", req_data) == []
+
+
+def test_qwen_thinker_stream_builder_keeps_immediate_decode_prefix(monkeypatch):
+    monkeypatch.setenv("SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES", "4096")
+    monkeypatch.setenv("SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE", "3")
+    monkeypatch.setenv("SGLANG_OMNI_DECODE_STREAM_IMMEDIATE_TOKEN_COUNT", "2")
+    builder = make_thinker_stream_output_builder()
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(is_chunked=0),
+        stage_payload=_thinker_stage_payload(["text"]),
+    )
+
+    per_token_messages = [
+        builder(
+            "req-1",
+            req_data,
+            SimpleNamespace(data=token_id, extra={}),
+        )
+        for token_id in [11, 12, 13, 14, 15, 16]
+    ]
+    decode_chunks = [
+        [msg for msg in messages if msg.target == "decode"]
+        for messages in per_token_messages
+    ]
+
+    assert decode_chunks[0][0].data == 11
+    assert decode_chunks[1][0].data == 12
+    assert decode_chunks[2] == []
+    assert decode_chunks[3] == []
+    assert decode_chunks[4][0].data == [13, 14, 15]
+    assert decode_chunks[5] == []
 
 
 def test_qwen_thinker_stream_builder_keeps_talker_when_modalities_missing():
@@ -297,6 +565,45 @@ def test_qwen_aux_hidden_states_clone_only_audio_request_slice():
     )
 
 
+def test_qwen_aux_hidden_states_preserve_single_request_prefill_suffix():
+    model = SimpleNamespace(
+        _captured_aux_hidden_states=[
+            torch.arange(6, dtype=torch.float32).reshape(3, 2),
+            torch.arange(30, 36, dtype=torch.float32).reshape(3, 2),
+        ]
+    )
+    output_processor = SGLangOutputProcessor(
+        capture_hidden=True,
+        capture_hidden_layers=[0, 24],
+        model=model,
+        should_emit_hidden=lambda request: request.request_id == "audio",
+    )
+    scheduler_output = SchedulerOutput(
+        requests=[SchedulerRequest(request_id="audio")],
+        batch_data=SimpleNamespace(reqs=[SimpleNamespace(extend_input_len=3)]),
+    )
+    model_output = SimpleNamespace(
+        next_token_ids=torch.tensor([22]),
+        logits_output=SimpleNamespace(
+            hidden_states=torch.arange(100, 106, dtype=torch.float32).reshape(3, 2)
+        ),
+    )
+
+    outputs = output_processor.process(model_output, scheduler_output)
+
+    audio_hidden = outputs["audio"].extra["hidden_states"]
+    assert torch.equal(
+        audio_hidden["embed"], torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    )
+    assert torch.equal(
+        audio_hidden[24], torch.arange(30, 36, dtype=torch.float32).reshape(3, 2)
+    )
+    assert torch.equal(
+        outputs["audio"].extra["stream_hidden_states"],
+        torch.arange(100, 106, dtype=torch.float32).reshape(3, 2),
+    )
+
+
 def test_qwen_aux_hidden_states_clear_when_no_request_emits_hidden():
     model = SimpleNamespace(
         _captured_aux_hidden_states=[
@@ -363,6 +670,17 @@ def test_utf8_multibyte_hold_then_emit():
     assert out[0].data["text"] == "hello"
 
 
+def test_streaming_detokenizer_accepts_batched_token_ids():
+    tok = _ByteTokenizer(vocab={1: b"hi", 2: b" there", 3: b"!"})
+    sched = StreamingDetokenizeScheduler(tokenizer=tok, eos_token_id=None)
+
+    sched._on_stream_chunk("req-1", _StreamItem(data=[1, 2, 3]))
+
+    out = _drain_outbox(sched)
+    assert [msg.data["text"] for msg in out] == ["hi there!"]
+    assert sched._state["req-1"].stream_token_count == 3
+
+
 def test_special_tokens_emit_no_delta():
     """A token in the special set must not produce a stream chunk."""
     tok = _ByteTokenizer(
@@ -376,6 +694,20 @@ def test_special_tokens_emit_no_delta():
     out = _drain_outbox(sched)
     assert len(out) == 1
     assert out[0].data["text"] == "hi"
+
+
+def test_streaming_detokenizer_skips_out_of_range_token_ids():
+    tok = _BoundedTokenizer(vocab={1: b"hi"}, size=8)
+    sched = StreamingDetokenizeScheduler(tokenizer=tok, eos_token_id=None)
+
+    sched._on_stream_chunk("req-1", _StreamItem(data=2**63 - 1))
+    sched._on_stream_chunk("req-1", _StreamItem(data=1))
+
+    out = _drain_outbox(sched)
+    assert len(out) == 1
+    assert out[0].type == "stream"
+    assert out[0].data["text"] == "hi"
+    assert sched._state["req-1"].skipped_token_count == 1
 
 
 def test_zero_token_stream_done_does_not_deadlock():
@@ -472,6 +804,25 @@ def test_streaming_final_result_drops_full_text_to_avoid_duplication():
     assert final_data.get("finish_reason") == "stop"
 
 
+def test_streaming_finalize_emits_unstreamed_suffix_from_output_ids():
+    tok = _ByteTokenizer(vocab={1: b"hi", 2: b" there", 3: b"!"})
+    sched = StreamingDetokenizeScheduler(tokenizer=tok, eos_token_id=None)
+
+    sched._on_stream_chunk("req-1", _StreamItem(data=1))
+    sched._on_stream_done("req-1")
+    sched._on_new_request(
+        "req-1", _payload_with_output_ids(stream=True, output_ids=[1, 2, 3])
+    )
+
+    out = _drain_outbox(sched)
+    stream_msgs = [m for m in out if m.type == "stream"]
+    result_msgs = [m for m in out if m.type == "result"]
+
+    assert [msg.data["text"] for msg in stream_msgs] == ["hi", " there!"]
+    assert len(result_msgs) == 1
+    assert "text" not in result_msgs[0].data.data
+
+
 def test_non_streaming_final_result_keeps_full_text():
     """Non-streaming clients receive a single terminal result and must
     still see the full reconstructed text (regression guard for the
@@ -488,6 +839,21 @@ def test_non_streaming_final_result_keeps_full_text():
     final_data = result_msgs[0].data.data
     assert final_data.get("text") == "hi there"
     assert final_data.get("finish_reason") == "stop"
+
+
+def test_final_result_skips_out_of_range_output_ids():
+    tok = _BoundedTokenizer(vocab={1: b"hi"}, size=8)
+    sched = StreamingDetokenizeScheduler(tokenizer=tok, eos_token_id=None)
+
+    sched._on_new_request(
+        "req-1",
+        _payload_with_output_ids(stream=False, output_ids=[2**63 - 1, 1]),
+    )
+
+    result_msgs = [m for m in _drain_outbox(sched) if m.type == "result"]
+    assert len(result_msgs) == 1
+    final_data = result_msgs[0].data.data
+    assert final_data.get("text") == "hi"
 
 
 def test_abort_clears_state():
@@ -649,7 +1015,11 @@ def _bare_stage(*, is_terminal: bool, owns_io: bool = True) -> Stage:
     s._active_requests = set()
     s._stream_queue = None
     s._stream_chunk_counters = {}
+    s._stream_ingest_queues = {}
+    s._stream_ingest_tasks = {}
     s._first_stream_chunk_seen = set()
+    s._first_outbox_stream_dequeue_seen = set()
+    s._first_scheduler_stream_enqueue_seen = set()
     s._local_stream_targets = {}
     s._nonlocal_stream_targets = {}
     s.input_handler = SimpleNamespace(cancel=lambda request_id: None)
@@ -1074,6 +1444,8 @@ def test_client_speech_forces_non_streaming_request(
             "top_k": -1,
             "min_p": 0.0,
             "repetition_penalty": 1.0,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
             "stop": [],
             "stop_token_ids": [],
             "seed": None,

@@ -20,6 +20,9 @@ from typing import Any, Mapping
 
 logger = logging.getLogger(__name__)
 
+_EVENT_BUFFER_BYTES_ENV = "SGLANG_OMNI_PROFILE_EVENT_BUFFER_BYTES"
+_DEFAULT_EVENT_BUFFER_BYTES = 1024 * 1024
+
 
 # Active-stage binding used when ``emit(stage=None)`` is called from code
 # that can't plumb the stage name down (preprocessor, encoder callable,
@@ -32,6 +35,22 @@ _thread_active_stage = threading.local()
 _active_stage_cv: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "sglang_omni_active_stage", default=None
 )
+
+
+def _event_buffer_bytes() -> int:
+    raw = os.getenv(_EVENT_BUFFER_BYTES_ENV)
+    if raw is None or raw == "":
+        return _DEFAULT_EVENT_BUFFER_BYTES
+    try:
+        return max(int(raw), 1)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using default %d",
+            _EVENT_BUFFER_BYTES_ENV,
+            raw,
+            _DEFAULT_EVENT_BUFFER_BYTES,
+        )
+        return _DEFAULT_EVENT_BUFFER_BYTES
 
 
 def set_active_stage(stage: str | None) -> contextvars.Token:
@@ -123,7 +142,11 @@ class RequestEventRecorder:
             # Filename uses the first stage to join; per-event ``stage``
             # disambiguates owners once others join.
             path = directory / f"events_{stage}_{self._pid}.jsonl"
-            self._fp = path.open("a", buffering=1, encoding="utf-8")
+            self._fp = path.open(
+                "a",
+                buffering=_event_buffer_bytes(),
+                encoding="utf-8",
+            )
             self._run_id = run_id
             self._stage = stage
             self._stages = {stage}
@@ -205,7 +228,13 @@ class RequestEventRecorder:
                 metadata=dict(metadata) if metadata else {},
             )
             try:
-                fp.write(json.dumps(event.to_dict(), default=_json_default))
+                fp.write(
+                    json.dumps(
+                        event.to_dict(),
+                        default=_json_default,
+                        separators=(",", ":"),
+                    )
+                )
                 fp.write("\n")
             except Exception:
                 self._dropped += 1

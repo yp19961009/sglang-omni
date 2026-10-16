@@ -15,6 +15,7 @@ from typing import Any
 
 from sglang_omni.config.placement import (
     StagePlacementPlan,
+    resolve_same_gpu_payload_targets,
     resolve_same_gpu_stream_targets,
     resolve_stage_gpu_ids,
 )
@@ -57,6 +58,10 @@ def _build_stage_groups(
         ctx = multiprocessing.get_context("spawn")
 
     stage_endpoints = {s.name: endpoints[f"stage_{s.name}"] for s in stages_cfg}
+    stage_stream_endpoints = {
+        s.name: endpoints.get(f"stage_stream_{s.name}", endpoints[f"stage_{s.name}"])
+        for s in stages_cfg
+    }
     stream_receivers: set[str] = set()
     for scfg in stages_cfg:
         for target in scfg.stream_to:
@@ -75,6 +80,12 @@ def _build_stage_groups(
         same_gpu_targets = resolve_same_gpu_stream_targets(
             placement_plan,
             stage_cfg,
+        )
+        same_gpu_payload_targets = resolve_same_gpu_payload_targets(
+            placement_plan,
+            stage_cfg,
+            stage_cfg_by_name,
+            name_map,
         )
         same_process_targets = _resolve_same_process_targets(
             stage_cfg,
@@ -103,9 +114,11 @@ def _build_stage_groups(
             coordinator_endpoint=endpoints["completion"],
             abort_endpoint=endpoints["abort"],
             stage_endpoints=stage_endpoints,
+            stage_stream_endpoints=stage_stream_endpoints,
             stream_targets=list(stage_cfg.stream_to),
             stream_done_to_fn=stage_cfg.stream_done_to_fn,
             same_gpu_targets=same_gpu_targets,
+            same_gpu_payload_targets=same_gpu_payload_targets,
             same_process_targets=same_process_targets,
             is_stream_receiver=stage_cfg.name in stream_receivers,
             can_accept_stream_before_payload=stage_cfg.can_accept_stream_before_payload,
@@ -117,6 +130,7 @@ def _build_stage_groups(
                 config=config,
                 gpu_id=gpu_ids[0],
                 recv_endpoint=stage_endpoints[stage_cfg.name],
+                stream_recv_endpoint=stage_stream_endpoints[stage_cfg.name],
                 base_factory_args=base_factory_args,
                 stage_kwargs=stage_kwargs,
             )
@@ -128,6 +142,7 @@ def _build_stage_groups(
                 gpu_ids=gpu_ids,
                 nccl_port=nccl_port,
                 recv_endpoint=stage_endpoints[stage_cfg.name],
+                stream_recv_endpoint=stage_stream_endpoints[stage_cfg.name],
                 base_factory_args=base_factory_args,
                 stage_kwargs=stage_kwargs,
             )
@@ -201,6 +216,7 @@ def _build_single_stage_spec(
     config: PipelineConfig,
     gpu_id: int | None,
     recv_endpoint: str,
+    stream_recv_endpoint: str,
     base_factory_args: dict[str, Any],
     stage_kwargs: dict[str, Any],
 ) -> StageLaunchConfig:
@@ -217,6 +233,7 @@ def _build_single_stage_spec(
         factory_args=factory_args,
         relay_config=relay_config,
         recv_endpoint=recv_endpoint,
+        stream_recv_endpoint=stream_recv_endpoint,
         **stage_kwargs,
     )
 
@@ -229,6 +246,7 @@ def _build_tp_stage_specs(
     gpu_ids: list[int | None],
     nccl_port: int | None,
     recv_endpoint: str,
+    stream_recv_endpoint: str,
     base_factory_args: dict[str, Any],
     stage_kwargs: dict[str, Any],
 ) -> list[StageLaunchConfig]:
@@ -260,6 +278,7 @@ def _build_tp_stage_specs(
                     factory_args=factory_args,
                     relay_config=relay_config,
                     recv_endpoint=recv_endpoint,
+                    stream_recv_endpoint=stream_recv_endpoint,
                     follower_work_queues=follower_work_queues,
                     follower_abort_queues=follower_abort_queues,
                     **stage_kwargs,
@@ -278,6 +297,7 @@ def _build_tp_stage_specs(
                 factory_args=factory_args,
                 relay_config=relay_config,
                 recv_endpoint="",
+                stream_recv_endpoint="",
                 internal_work_queue=follower_work_queues[idx],
                 internal_abort_queue=follower_abort_queues[idx],
                 **stage_kwargs,
@@ -293,11 +313,15 @@ def _resolve_relay_config(
     *,
     gpu_id: int | None,
 ) -> dict[str, Any]:
-    """Build relay config, overriding gpu_id from placement."""
+    """Build relay config, using placement only when relay has no device."""
     relay_config = build_relay_config(stage_cfg, config)
     # shm copies into host shared memory, so CUDA staging only creates extra
     # GPU allocator pressure.
-    if stage_cfg.gpu is not None and config.relay_backend != "shm":
+    if (
+        stage_cfg.relay is None
+        and stage_cfg.gpu is not None
+        and config.relay_backend != "shm"
+    ):
         relay_config["gpu_id"] = gpu_id
     return relay_config
 

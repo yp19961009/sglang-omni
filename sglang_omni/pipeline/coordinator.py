@@ -3,6 +3,7 @@
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable, Sequence
 from typing import Any, AsyncIterator
 
@@ -194,6 +195,17 @@ class Coordinator:
         if not isinstance(request, OmniRequest):
             request = OmniRequest(inputs=request)
 
+        admission_perf = time.perf_counter()
+        metadata = getattr(request, "metadata", None)
+        if isinstance(metadata, dict):
+            # Lightweight internal timing anchor for request-local latency metrics.
+            # It is intentionally kept in metadata so the value follows the
+            # StagePayload across process/stage boundaries without enabling the
+            # heavyweight event profiler.
+            metadata.setdefault("__omni_admission_perf", admission_perf)
+            metadata.setdefault("__omni_admission_time_ns", time.time_ns())
+            metadata.setdefault("__omni_admission_stage", self.entry_stage)
+
         # Track request
         self._requests[request_id] = RequestInfo(
             request_id=request_id,
@@ -213,11 +225,28 @@ class Coordinator:
             data={"raw_inputs": request.inputs},
         )
 
+        profile_metadata: dict[str, Any] = {"entry_stage": self.entry_stage}
+        if isinstance(metadata, dict):
+            # The coordinator request id is generated internally. Keep the
+            # user/client request id in profiler metadata so benchmark results
+            # can join server timelines back to the correct client sample.
+            metadata_request_id = metadata.get("request_id")
+            if metadata_request_id is not None:
+                profile_metadata["metadata_request_id"] = str(metadata_request_id)
+            for key in (
+                "pre_run",
+                "realtime_prefix",
+                "trunk_size",
+                "media_cache_namespace",
+            ):
+                if key in metadata:
+                    profile_metadata[key] = metadata[key]
+
         _emit_event(
             request_id=request_id,
             stage="coordinator",
             event_name="request_admission",
-            metadata={"entry_stage": self.entry_stage},
+            metadata=profile_metadata,
         )
 
         # Submit to entry stage

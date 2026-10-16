@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import logging
+import os
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -34,9 +36,245 @@ DECODE_STAGE = "decode"
 TALKER_STAGE = "talker_ar"
 CODE2WAV_STAGE = "code2wav"
 MM_AGGREGATE_STAGE = "mm_aggregate"
+_INLINE_CPU_STREAM_CHUNK_MAX_BYTES_ENV = (
+    "SGLANG_OMNI_INLINE_CPU_STREAM_CHUNK_MAX_BYTES"
+)
+_DECODE_STREAM_TOKEN_BATCH_SIZE_ENV = "SGLANG_OMNI_DECODE_STREAM_TOKEN_BATCH_SIZE"
+_DECODE_STREAM_IMMEDIATE_TOKEN_COUNT_ENV = (
+    "SGLANG_OMNI_DECODE_STREAM_IMMEDIATE_TOKEN_COUNT"
+)
+_PREFER_INLINE_CPU_STREAM_CHUNK_METADATA_KEY = (
+    "_prefer_inline_cpu_stream_chunk"
+)
+_DECODE_STREAM_BATCH_STATE_MAX = 10000
+_DEBUG_THINKER_INPUTS_ENV = "SGLANG_OMNI_DEBUG_THINKER_INPUTS"
+_DEBUG_THINKER_INPUTS_ALL_ENV = "SGLANG_OMNI_DEBUG_THINKER_INPUTS_ALL"
+_DEBUG_MAMBA_RTC_ENV = "SGLANG_OMNI_DEBUG_MAMBA_RTC"
 
 # Note(Chenchen Hong): PyTorch sampling_seed must fit a positive int32.
 MAX_INT32_POSITIVE = 0x7FFFFFFF
+
+
+def _inline_cpu_stream_chunks_enabled() -> bool:
+    raw = os.getenv(_INLINE_CPU_STREAM_CHUNK_MAX_BYTES_ENV)
+    if raw is None or raw == "":
+        return False
+    try:
+        return int(raw) > 0
+    except ValueError:
+        return False
+
+
+def _decode_stream_token_batch_size() -> int:
+    raw = os.getenv(_DECODE_STREAM_TOKEN_BATCH_SIZE_ENV)
+    if raw is None or raw == "":
+        return 1
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 1
+
+
+def _decode_stream_immediate_token_count() -> int:
+    raw = os.getenv(_DECODE_STREAM_IMMEDIATE_TOKEN_COUNT_ENV)
+    if raw is None or raw == "":
+        return 1
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 1
+
+
+def _debug_thinker_inputs_enabled() -> bool:
+    value = os.getenv(_DEBUG_THINKER_INPUTS_ENV)
+    return value is not None and value.strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _debug_thinker_inputs_all_enabled() -> bool:
+    value = os.getenv(_DEBUG_THINKER_INPUTS_ALL_ENV)
+    return value is not None and value.strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _tensor_debug_stats(path: str, value: Any, out: list[dict[str, Any]]) -> None:
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach()
+        if tensor.dtype.is_floating_point or tensor.dtype.is_complex:
+            nan = int(torch.isnan(tensor).sum().detach().cpu().item())
+            posinf = int(torch.isposinf(tensor).sum().detach().cpu().item())
+            neginf = int(torch.isneginf(tensor).sum().detach().cpu().item())
+        else:
+            nan = posinf = neginf = 0
+        if nan or posinf or neginf or _debug_thinker_inputs_all_enabled():
+            out.append(
+                {
+                    "path": path,
+                    "shape": list(tensor.shape),
+                    "dtype": str(tensor.dtype),
+                    "device": str(tensor.device),
+                    "nan": nan,
+                    "posinf": posinf,
+                    "neginf": neginf,
+                }
+            )
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _tensor_debug_stats(f"{path}.{key}" if path else str(key), item, out)
+        return
+    if isinstance(value, (list, tuple)):
+        for idx, item in enumerate(value):
+            _tensor_debug_stats(f"{path}[{idx}]", item, out)
+
+
+def _maybe_log_thinker_input_stats(
+    *,
+    rid: str,
+    input_len: int,
+    max_new_tokens: int,
+    model_inputs: dict[str, Any],
+    media_cache_keys: dict[str, Any],
+    pad_values: dict[str, int],
+) -> None:
+    if not _debug_thinker_inputs_enabled():
+        return
+    stats: list[dict[str, Any]] = []
+    _tensor_debug_stats("", model_inputs, stats)
+    if not stats and not _debug_thinker_inputs_all_enabled():
+        return
+    logger.warning(
+        "thinker_input_stats rid=%s input_len=%s max_new_tokens=%s "
+        "media_cache_keys=%s pad_values=%s tensor_stats=%s",
+        rid,
+        input_len,
+        max_new_tokens,
+        media_cache_keys,
+        pad_values,
+        stats,
+    )
+
+
+def _make_decode_stream_message(
+    request_id: str,
+    token_ids: list[int],
+) -> OutgoingMessage:
+    if len(token_ids) == 1:
+        metadata = {
+            "token_id": token_ids[0],
+            _PREFER_INLINE_CPU_STREAM_CHUNK_METADATA_KEY: True,
+        }
+        data: int | list[int] | torch.Tensor = token_ids[0]
+    else:
+        metadata = {
+            "token_id": token_ids[-1],
+            "token_ids": list(token_ids),
+            "token_count": len(token_ids),
+            _PREFER_INLINE_CPU_STREAM_CHUNK_METADATA_KEY: True,
+        }
+        data = list(token_ids)
+
+    return OutgoingMessage(
+        request_id=request_id,
+        type="stream",
+        data=data,
+        target=DECODE_STAGE,
+        metadata=metadata,
+    )
+
+
+class _DecodeStreamTokenBatcher:
+    """Batch thinker text tokens after a short immediate-token prefix."""
+
+    def __init__(self) -> None:
+        self._buffers: OrderedDict[str, list[int]] = OrderedDict()
+        self._sent_counts: OrderedDict[str, int] = OrderedDict()
+
+    @staticmethod
+    def _evict_oldest(items: OrderedDict[str, Any]) -> None:
+        while len(items) > _DECODE_STREAM_BATCH_STATE_MAX:
+            items.popitem(last=False)
+
+    def build(
+        self,
+        request_id: str,
+        token_id: int,
+        *,
+        batch_size: int | None = None,
+        immediate_token_count: int | None = None,
+    ) -> OutgoingMessage | None:
+        batch_size = (
+            _decode_stream_token_batch_size()
+            if batch_size is None
+            else max(1, int(batch_size))
+        )
+        if batch_size <= 1:
+            return _make_decode_stream_message(request_id, [token_id])
+
+        sent_count = self._sent_counts.get(request_id, 0)
+        immediate_token_count = (
+            _decode_stream_immediate_token_count()
+            if immediate_token_count is None
+            else max(1, int(immediate_token_count))
+        )
+        if sent_count < immediate_token_count:
+            self._sent_counts[request_id] = sent_count + 1
+            self._sent_counts.move_to_end(request_id)
+            self._evict_oldest(self._sent_counts)
+            return _make_decode_stream_message(request_id, [token_id])
+
+        self._sent_counts.move_to_end(request_id)
+        pending = self._buffers.setdefault(request_id, [])
+        pending.append(token_id)
+        self._buffers.move_to_end(request_id)
+        self._evict_oldest(self._buffers)
+        if len(pending) < batch_size:
+            return None
+
+        token_ids = list(pending)
+        self._buffers.pop(request_id, None)
+        return _make_decode_stream_message(request_id, token_ids)
+
+    def flush(self, request_id: str) -> OutgoingMessage | None:
+        token_ids = self._buffers.pop(request_id, None)
+        self._sent_counts.pop(request_id, None)
+        if not token_ids:
+            return None
+        return _make_decode_stream_message(request_id, list(token_ids))
+
+_MEDIA_MODEL_INPUT_KEYS = (
+    "audio_embeds",
+    "image_embeds",
+    "video_embeds",
+    "deepstack_input_embeds",
+    "deepstack_visual_embeds",
+    "image_deepstack_visual_embeds",
+    "video_deepstack_visual_embeds",
+)
+
+_MODALITY_MODEL_INPUT_KEYS = {
+    "audio": ("audio_embeds",),
+    "image": (
+        "image_embeds",
+        "deepstack_visual_embeds",
+        "image_deepstack_visual_embeds",
+    ),
+    "video": (
+        "video_embeds",
+        "deepstack_visual_embeds",
+        "video_deepstack_visual_embeds",
+    ),
+}
 
 
 def _resolve_seed(params: dict[str, Any]) -> int | None:
@@ -46,6 +284,279 @@ def _resolve_seed(params: dict[str, Any]) -> int | None:
         if value is not None:
             return int(value)
     return None
+
+
+def _resolve_max_new_tokens(params: dict[str, Any], default: int = 2048) -> int:
+    for key in ("max_new_tokens", "max_completion_tokens", "max_tokens"):
+        value = params.get(key)
+        if value is not None:
+            # OpenAI chat's newer field is max_completion_tokens, while the
+            # legacy-compatible field is max_tokens. SGLang SamplingParams uses
+            # max_new_tokens. Keep this consistent with preprocessor context
+            # length validation.
+            return int(value)
+    return int(default)
+
+
+def _has_non_empty_media_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, torch.Tensor):
+        return value.numel() > 0
+    if isinstance(value, dict):
+        return any(_has_non_empty_media_value(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_non_empty_media_value(item) for item in value)
+    return True
+
+
+def _has_multimodal_model_inputs(model_inputs: dict[str, Any]) -> bool:
+    return any(
+        _has_non_empty_media_value(model_inputs.get(key))
+        for key in _MEDIA_MODEL_INPUT_KEYS
+    )
+
+
+def _has_modality_model_inputs(model_inputs: dict[str, Any], modality: str) -> bool:
+    return any(
+        _has_non_empty_media_value(model_inputs.get(key))
+        for key in _MODALITY_MODEL_INPUT_KEYS.get(modality, ())
+    )
+
+
+def _input_embeds_radix_extra_key(prefix: str, request_id: str, embeds: Any) -> str:
+    return f"{prefix}:{request_id}:{id(embeds):x}"
+
+
+def _media_cache_radix_extra_key(media_cache_keys: dict[str, Any]) -> str | None:
+    if not media_cache_keys:
+        return None
+    parts = [
+        f"{modality}={media_cache_keys[modality]}"
+        for modality in sorted(media_cache_keys)
+        if media_cache_keys.get(modality) is not None
+    ]
+    if not parts:
+        return None
+    return "media-cache:" + "|".join(parts)
+
+
+def _install_prefix_cache_limit_patch(Req: Any) -> None:
+    if getattr(Req, "_omni_prefix_cache_limit_patched", False):
+        return
+
+    original = Req.init_next_round_input
+
+    def _init_next_round_input_with_omni_limit(self, tree_cache=None):
+        limit = getattr(self, "_omni_max_prefix_cache_len", None)
+        if limit is None or tree_cache is None:
+            result = original(self, tree_cache)
+        else:
+            old_return_logprob = self.return_logprob
+            old_logprob_start_len = self.logprob_start_len
+            try:
+                self.return_logprob = True
+                if old_return_logprob and old_logprob_start_len >= 0:
+                    self.logprob_start_len = min(int(old_logprob_start_len), int(limit))
+                else:
+                    self.logprob_start_len = int(limit)
+                result = original(self, tree_cache)
+            finally:
+                self.return_logprob = old_return_logprob
+                self.logprob_start_len = old_logprob_start_len
+        return result
+
+    Req._omni_original_init_next_round_input = original
+    Req.init_next_round_input = _init_next_round_input_with_omni_limit
+    Req._omni_prefix_cache_limit_patched = True
+
+
+def _install_mamba_branching_hint_patch(Req: Any) -> None:
+    if getattr(Req, "_omni_mamba_branching_hint_patched", False):
+        return
+
+    original = Req.init_next_round_input
+
+    def _init_next_round_input_with_omni_mamba_hint(self, tree_cache=None):
+        debug_mamba_rtc = os.getenv(_DEBUG_MAMBA_RTC_ENV, "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        hint = getattr(self, "_omni_mamba_branching_seqlen", None)
+        try:
+            hint = int(hint) if hint is not None else None
+        except (TypeError, ValueError):
+            hint = None
+
+        cache_limit = getattr(self, "_omni_mamba_prefix_cache_limit", None)
+        if cache_limit is None:
+            cache_limit = getattr(self, "_omni_max_prefix_cache_len", None)
+        try:
+            cache_limit = int(cache_limit) if cache_limit is not None else None
+        except (TypeError, ValueError):
+            cache_limit = None
+
+        if cache_limit is not None and tree_cache is not None:
+            old_return_logprob = self.return_logprob
+            old_logprob_start_len = self.logprob_start_len
+            try:
+                self.return_logprob = True
+                if old_return_logprob and old_logprob_start_len >= 0:
+                    self.logprob_start_len = min(
+                        int(old_logprob_start_len), int(cache_limit)
+                    )
+                else:
+                    self.logprob_start_len = int(cache_limit)
+                result = original(self, tree_cache)
+            finally:
+                self.return_logprob = old_return_logprob
+                self.logprob_start_len = old_logprob_start_len
+        else:
+            result = original(self, tree_cache)
+
+        current_before = getattr(self, "mamba_branching_seqlen", None)
+        try:
+            current_before_int = (
+                int(current_before) if current_before is not None else None
+            )
+        except (TypeError, ValueError):
+            current_before_int = None
+        prefix_indices = getattr(self, "prefix_indices", None)
+        prefix_len = len(prefix_indices) if prefix_indices is not None else 0
+        if hint is not None and hint > prefix_len:
+            if current_before_int is None or current_before_int > hint:
+                self.mamba_branching_seqlen = hint
+        if debug_mamba_rtc and "rtc:" in str(getattr(self, "extra_key", "")):
+            logger.info(
+                "qwen3_omni_mamba_hint rid=%s max_new_tokens=%s prefix_len=%s "
+                "extend_input_len=%s origin_input_len=%s hint=%s "
+                "branch_before=%s branch_after=%s cache_limit=%s extra_key=%s",
+                getattr(self, "rid", None),
+                getattr(getattr(self, "sampling_params", None), "max_new_tokens", None),
+                prefix_len,
+                getattr(self, "extend_input_len", None),
+                len(getattr(self, "origin_input_ids", []) or []),
+                hint,
+                current_before,
+                getattr(self, "mamba_branching_seqlen", None),
+                cache_limit,
+                getattr(self, "extra_key", None),
+            )
+        return result
+
+    Req._omni_original_init_next_round_input_for_mamba_hint = original
+    Req.init_next_round_input = _init_next_round_input_with_omni_mamba_hint
+    Req._omni_mamba_branching_hint_patched = True
+
+
+def _first_multimodal_token_index(
+    input_ids: list[int],
+    model_inputs: dict[str, Any],
+    thinker_config: Any,
+    pad_values: dict[str, int],
+) -> int | None:
+    first_index: int | None = None
+    for modality, config_key in [
+        ("image", "image_token_id"),
+        ("video", "video_token_id"),
+        ("audio", "audio_token_id"),
+    ]:
+        if not _has_modality_model_inputs(model_inputs, modality):
+            continue
+        token_id = pad_values.get(modality, getattr(thinker_config, config_key, None))
+        if token_id is None:
+            continue
+        try:
+            index = input_ids.index(int(token_id))
+        except ValueError:
+            continue
+        first_index = index if first_index is None else min(first_index, index)
+    return first_index
+
+
+def _first_modality_token_index(
+    input_ids: list[int],
+    *,
+    modality: str,
+    model_inputs: dict[str, Any],
+    thinker_config: Any,
+    pad_values: dict[str, int],
+) -> int | None:
+    if not _has_modality_model_inputs(model_inputs, modality):
+        return None
+    token_id = pad_values.get(
+        modality, getattr(thinker_config, f"{modality}_token_id", None)
+    )
+    if token_id is None:
+        return None
+    try:
+        return input_ids.index(int(token_id))
+    except ValueError:
+        return None
+
+
+def _mamba_branching_chunk_size() -> int | None:
+    try:
+        from sglang.srt.layers.attention.fla.chunk_delta_h import (
+            CHUNK_SIZE as fla_chunk_size,
+        )
+    except Exception:
+        return None
+    try:
+        chunk_size = int(fla_chunk_size)
+    except (TypeError, ValueError):
+        return None
+    return chunk_size if chunk_size > 0 else None
+
+
+def _media_mamba_branching_seqlen(
+    input_ids: list[int],
+    model_inputs: dict[str, Any],
+    thinker_config: Any,
+    pad_values: dict[str, int],
+) -> int | None:
+    """Aligned visual-prefix boundary for hybrid-SSM prefix cache reuse."""
+
+    first_audio = _first_modality_token_index(
+        input_ids,
+        modality="audio",
+        model_inputs=model_inputs,
+        thinker_config=thinker_config,
+        pad_values=pad_values,
+    )
+    if first_audio is None:
+        return None
+
+    visual_indices = [
+        idx
+        for idx in (
+            _first_modality_token_index(
+                input_ids,
+                modality="image",
+                model_inputs=model_inputs,
+                thinker_config=thinker_config,
+                pad_values=pad_values,
+            ),
+            _first_modality_token_index(
+                input_ids,
+                modality="video",
+                model_inputs=model_inputs,
+                thinker_config=thinker_config,
+                pad_values=pad_values,
+            ),
+        )
+        if idx is not None
+    ]
+    if not visual_indices or min(visual_indices) >= first_audio:
+        return None
+
+    chunk_size = _mamba_branching_chunk_size()
+    if chunk_size is None:
+        return None
+    aligned = first_audio // chunk_size * chunk_size
+    return aligned if aligned > 0 else None
 
 
 def output_modalities(request: OmniRequest | None) -> set[str] | None:
@@ -110,6 +621,8 @@ def resolve_terminal_stages(request: OmniRequest) -> list[str]:
 def resolve_preprocessing_next_stages(
     request_id: str, output: StagePayload
 ) -> list[str]:
+    """Route to encoders for present media, then always aggregate."""
+
     del request_id
     state = Qwen3OmniPipelineState.from_dict(output.data)
     return [
@@ -133,6 +646,7 @@ def resolve_mm_aggregate_wait_sources(
 def project_thinker_to_decode(payload: StagePayload) -> StagePayload:
     """Keep decode payload focused on text detokenization state."""
     state = Qwen3OmniPipelineState.from_dict(payload.data)
+    state.prompt = _prompt_token_count_only(state.prompt)
     state.thinker_inputs = {}
     state.stream_state = _copy_mutable_containers(state.stream_state)
 
@@ -159,6 +673,30 @@ def project_thinker_to_decode(payload: StagePayload) -> StagePayload:
     )
 
 
+def _prompt_token_count_only(prompt: Any) -> dict[str, Any] | None:
+    if not isinstance(prompt, dict):
+        return None
+    prompt_tokens = _sequence_length(prompt.get("input_ids"))
+    if prompt_tokens is None:
+        return None
+    return {"prompt_tokens": prompt_tokens}
+
+
+def _sequence_length(value: Any) -> int | None:
+    if value is None:
+        return None
+    numel = getattr(value, "numel", None)
+    if callable(numel):
+        try:
+            return int(numel())
+        except (TypeError, ValueError):
+            return None
+    try:
+        return len(value)
+    except TypeError:
+        return None
+
+
 def project_talker_to_code2wav(payload: StagePayload) -> StagePayload:
     """Keep code2wav payload as a request latch; code tensors arrive by stream."""
     return StagePayload(
@@ -175,6 +713,12 @@ class EncoderRequestData:
     model_inputs: dict[str, Any]
     cache_key: str | None = None
     skip_result: dict[str, Any] | None = None
+    item_cache_keys: dict[str, tuple[str | None, ...]] = field(default_factory=dict)
+    item_pixel_present: dict[str, tuple[bool, ...]] = field(default_factory=dict)
+    item_feature_present: dict[str, tuple[bool, ...]] = field(default_factory=dict)
+    item_pixel_fallbacks: dict[str, tuple[Any | None, ...]] = field(
+        default_factory=dict
+    )
 
 
 def build_encoder_request(
@@ -190,12 +734,63 @@ def build_encoder_request(
             skip_result=skip_result if isinstance(skip_result, dict) else {},
         )
     cache_key = inputs.get("cache_key")
+    item_cache_keys: dict[str, tuple[str | None, ...]] = {}
+    item_pixel_present: dict[str, tuple[bool, ...]] = {}
+    item_feature_present: dict[str, tuple[bool, ...]] = {}
+    item_pixel_fallbacks: dict[str, tuple[Any | None, ...]] = {}
+    for modality, key_name in (
+        ("image", "image_item_cache_keys"),
+        ("video", "video_item_cache_keys"),
+        ("audio", "audio_item_cache_keys"),
+    ):
+        raw_keys = inputs.get(key_name)
+        if isinstance(raw_keys, (list, tuple)):
+            item_cache_keys[modality] = tuple(
+                str(item) if item is not None else None for item in raw_keys
+            )
+    for modality, key_name in (
+        ("image", "image_item_pixel_present"),
+        ("video", "video_item_pixel_present"),
+    ):
+        raw_mask = inputs.get(key_name)
+        if isinstance(raw_mask, (list, tuple)):
+            item_pixel_present[modality] = tuple(bool(item) for item in raw_mask)
+    raw_audio_feature_mask = inputs.get("audio_item_feature_present")
+    if isinstance(raw_audio_feature_mask, (list, tuple)):
+        item_feature_present["audio"] = tuple(
+            bool(item) for item in raw_audio_feature_mask
+        )
+    for modality, key_name in (
+        ("image", "image_item_pixel_fallbacks"),
+        ("video", "video_item_pixel_fallbacks"),
+    ):
+        raw_fallbacks = inputs.get(key_name)
+        if isinstance(raw_fallbacks, (list, tuple)):
+            item_pixel_fallbacks[modality] = tuple(raw_fallbacks)
     model_inputs = {
-        k: v for k, v in inputs.items() if k not in ("cache_key", "_active")
+        k: v
+        for k, v in inputs.items()
+        if k
+        not in (
+            "cache_key",
+            "_active",
+            "image_item_cache_keys",
+            "video_item_cache_keys",
+            "audio_item_cache_keys",
+            "image_item_pixel_present",
+            "video_item_pixel_present",
+            "audio_item_feature_present",
+            "image_item_pixel_fallbacks",
+            "video_item_pixel_fallbacks",
+        )
     }
     return EncoderRequestData(
         model_inputs=model_inputs,
         cache_key=str(cache_key) if cache_key is not None else None,
+        item_cache_keys=item_cache_keys,
+        item_pixel_present=item_pixel_present,
+        item_feature_present=item_feature_present,
+        item_pixel_fallbacks=item_pixel_fallbacks,
     )
 
 
@@ -222,7 +817,11 @@ def build_lightweight_mm_inputs(mm_inputs: dict[str, Any]) -> dict[str, Any]:
         "image": _select_present_fields(mm_image, ("image_grid_thw",)),
         "audio": _select_present_fields(
             mm_audio,
-            ("feature_attention_mask", "audio_feature_lengths"),
+            (
+                "feature_attention_mask",
+                "audio_feature_lengths",
+                "audio_is_dependent",
+            ),
         ),
         "video": _select_present_fields(
             mm_video,
@@ -242,10 +841,10 @@ def project_preprocessing_to_audio_encoder(payload: StagePayload) -> StagePayloa
 def project_preprocessing_to_mm_aggregate(payload: StagePayload) -> StagePayload:
     state = Qwen3OmniPipelineState.from_dict(payload.data)
     projected = Qwen3OmniPipelineState(
-        prompt=dict(state.prompt) if isinstance(state.prompt, dict) else None,
+        prompt=_copy_mutable_containers(state.prompt),
         mm_inputs=build_lightweight_mm_inputs(state.mm_inputs),
         encoder_inputs=_project_encoder_input_metadata(state.encoder_inputs),
-        stream_state=dict(state.stream_state),
+        stream_state=_copy_mutable_containers(state.stream_state),
     )
     return _payload_with_state(payload, projected)
 
@@ -258,14 +857,23 @@ def project_encoder_to_mm_aggregate(payload: StagePayload) -> StagePayload:
     return _payload_with_state(payload, projected)
 
 
+def project_mm_aggregate_to_thinker(payload: StagePayload) -> StagePayload:
+    """Fan-out projection: give thinker its own prompt and model input containers."""
+    state = Qwen3OmniPipelineState.from_dict(payload.data)
+    projected = Qwen3OmniPipelineState(
+        prompt=_copy_mutable_containers(state.prompt),
+        thinker_inputs=_copy_mutable_containers(state.thinker_inputs),
+        stream_state=_copy_mutable_containers(state.stream_state),
+    )
+    return _payload_with_state(payload, projected)
+
+
 def project_mm_aggregate_to_talker_ar(payload: StagePayload) -> StagePayload:
     """Early-submit projection: ship prompt + thinker_inputs to the talker."""
     state = Qwen3OmniPipelineState.from_dict(payload.data)
     projected = Qwen3OmniPipelineState(
-        prompt=dict(state.prompt) if isinstance(state.prompt, dict) else None,
-        thinker_inputs=(
-            dict(state.thinker_inputs) if isinstance(state.thinker_inputs, dict) else {}
-        ),
+        prompt=_copy_mutable_containers(state.prompt),
+        thinker_inputs=_copy_mutable_containers(state.thinker_inputs),
     )
     return _payload_with_state(payload, projected)
 
@@ -289,8 +897,16 @@ def _payload_with_state(
 ) -> StagePayload:
     return StagePayload(
         request_id=payload.request_id,
-        request=payload.request,
+        request=_lightweight_downstream_request(payload.request),
         data=state.to_dict(),
+    )
+
+
+def _lightweight_downstream_request(request: Any) -> Any:
+    return request.__class__(
+        inputs={},
+        params=dict(request.params or {}),
+        metadata=dict(request.metadata or {}),
     )
 
 
@@ -318,7 +934,7 @@ def _select_encoder_inputs(
     stage_inputs = encoder_inputs.get(stage_name)
     if not isinstance(stage_inputs, dict):
         return {}
-    return {stage_name: dict(stage_inputs)}
+    return {stage_name: _copy_mutable_containers(stage_inputs)}
 
 
 def _project_encoder_input_metadata(
@@ -505,6 +1121,12 @@ def build_sglang_thinker_request(
     vocab_size: int,
     request_id: str | None = None,
     thinker_config: Any = None,
+    mrope_position_builder: (
+        Callable[[torch.Tensor, dict[str, Any], Any], Any] | None
+    ) = None,
+    limit_prefix_cache_before_media: bool = False,
+    mamba_media_branching_cache: bool = False,
+    use_media_pad_values: bool = True,
 ) -> "SGLangARRequestData":
     """Build SGLangARRequestData from pipeline state.
 
@@ -522,6 +1144,7 @@ def build_sglang_thinker_request(
 
     attention_mask = prompt.get("attention_mask")
     thinker_inputs = state.thinker_inputs or {}
+    rid = request_id or "req-0"
 
     model_inputs = dict(thinker_inputs.get("model_inputs", {}))
     if not model_inputs:
@@ -532,18 +1155,34 @@ def build_sglang_thinker_request(
         }
     capture_keys = thinker_inputs.get("capture_model_output_keys", ())
     media_cache_keys = thinker_inputs.get("media_cache_keys", {})
+    if (model_inputs or media_cache_keys) and "original_input_ids" not in model_inputs:
+        prompt_original_ids = prompt.get("original_input_ids")
+        if prompt_original_ids is not None:
+            model_inputs["original_input_ids"] = prompt_original_ids
+        else:
+            model_inputs["original_input_ids"] = original_input_ids
     pad_values: dict[str, int] = {}
-    if media_cache_keys and thinker_config is not None:
+    if use_media_pad_values and thinker_config is not None and (
+        media_cache_keys or _has_multimodal_model_inputs(model_inputs)
+    ):
         token_id_map: dict[int, int] = {}
         for modality, orig_token_id in [
             ("image", thinker_config.image_token_id),
             ("video", thinker_config.video_token_id),
             ("audio", thinker_config.audio_token_id),
         ]:
+            if orig_token_id is None:
+                continue
             cache_key = media_cache_keys.get(modality)
             if cache_key is None:
-                continue
-            h = xxhash.xxh3_64(cache_key.encode()).intdigest()
+                if not _has_modality_model_inputs(model_inputs, modality):
+                    continue
+                pad_key = _input_embeds_radix_extra_key(
+                    f"media-pad:{modality}", rid, model_inputs
+                )
+            else:
+                pad_key = str(cache_key)
+            h = xxhash.xxh3_64(pad_key.encode()).intdigest()
             pad_val = vocab_size + h % (1 << 62)
             pad_values[modality] = pad_val
             token_id_map[orig_token_id] = pad_val
@@ -557,15 +1196,25 @@ def build_sglang_thinker_request(
         model_inputs.pop("attention_mask", None)
     input_ids_list = input_ids.to(dtype=torch.long).tolist()
 
-    max_new_tokens = params.get("max_new_tokens", 2048)
+    max_new_tokens = _resolve_max_new_tokens(params, 2048)
     temperature = params.get("temperature", 0.0)
     top_p = params.get("top_p", 1.0)
     top_k = params.get("top_k", -1)
     min_p = params.get("min_p", 0.0)
+    frequency_penalty = params.get("frequency_penalty", 0.0)
+    presence_penalty = params.get("presence_penalty", 0.0)
     repetition_penalty = params.get("repetition_penalty", 1.0)
     stop = params.get("stop") or []
     stop_token_ids = params.get("stop_token_ids") or []
     seed = _resolve_seed(params)
+    _maybe_log_thinker_input_stats(
+        rid=rid,
+        input_len=len(input_ids_list),
+        max_new_tokens=max_new_tokens,
+        model_inputs=model_inputs,
+        media_cache_keys=media_cache_keys,
+        pad_values=pad_values,
+    )
 
     # Build SGLang SamplingParams and normalize
     sampling_params = SamplingParams(
@@ -574,6 +1223,8 @@ def build_sglang_thinker_request(
         top_p=top_p,
         top_k=top_k,
         min_p=min_p,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
         repetition_penalty=repetition_penalty,
         stop=stop,
         stop_token_ids=stop_token_ids,
@@ -583,19 +1234,37 @@ def build_sglang_thinker_request(
     sampling_params.verify(vocab_size)
 
     # Build SGLang Req
-    rid = request_id or "req-0"
+    extra_key = _media_cache_radix_extra_key(media_cache_keys)
+    if extra_key is None and _has_multimodal_model_inputs(model_inputs) and not pad_values:
+        extra_key = _input_embeds_radix_extra_key("media-inputs", rid, model_inputs)
     req = Req(
         rid=rid,
         origin_input_text="",
         origin_input_ids=input_ids_list,
         sampling_params=sampling_params,
+        extra_key=extra_key,
         vocab_size=vocab_size,
     )
+    if limit_prefix_cache_before_media and thinker_config is not None:
+        prefix_cache_limit = _first_multimodal_token_index(
+            input_ids_list, model_inputs, thinker_config, pad_values
+        )
+        if prefix_cache_limit is not None:
+            _install_prefix_cache_limit_patch(Req)
+            req._omni_max_prefix_cache_len = int(prefix_cache_limit)
+    if mamba_media_branching_cache and thinker_config is not None:
+        branching_seqlen = _media_mamba_branching_seqlen(
+            input_ids_list, model_inputs, thinker_config, pad_values
+        )
+        if branching_seqlen is not None:
+            _install_mamba_branching_hint_patch(Req)
+            req._omni_mamba_branching_seqlen = int(branching_seqlen)
     req.tokenizer = tokenizer
 
     # Compute M-RoPE positions and attach multimodal_inputs to Req
     if thinker_config is not None and model_inputs:
-        mrope_result = _compute_mrope_positions(
+        mrope_builder = mrope_position_builder or _compute_mrope_positions
+        mrope_result = mrope_builder(
             original_input_ids.to(dtype=torch.long), model_inputs, thinker_config
         )
         if mrope_result is not None:
@@ -634,6 +1303,7 @@ def build_sglang_talker_request(
     temperature: float = 0.7,
     top_k: int = 50,
     top_p: float = 1.0,
+    min_p: float = 0.0,
     repetition_penalty: float = 1.05,
     request_id: str | None = None,
     codec_bos_id: int = 2149,
@@ -655,6 +1325,9 @@ def build_sglang_talker_request(
     thinker_config: Any = None,
     talker_model_inputs: dict[str, Any] | None = None,
     seed: int | None = None,
+    mrope_position_builder: (
+        Callable[[torch.Tensor, dict[str, Any], Any], Any] | None
+    ) = None,
 ) -> "SGLangARRequestData":
     """Build SGLang AR request for the Talker from thinker hidden states.
 
@@ -695,6 +1368,7 @@ def build_sglang_talker_request(
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
+        min_p=min_p,
         repetition_penalty=repetition_penalty,
         stop_token_ids=[int(codec_eos_id)] if codec_eos_id is not None else None,
         logit_bias=None,
@@ -704,6 +1378,11 @@ def build_sglang_talker_request(
     sampling_params.verify(codec_vocab_size)
 
     rid = request_id or "talker-req-0"
+    input_embeds_extra_key = _input_embeds_radix_extra_key(
+        "projected-input-embeds" if input_embeds_are_projected else "input-embeds",
+        rid,
+        prefill_embeds_tensor,
+    )
     req = Req(
         rid=rid,
         origin_input_text="",
@@ -714,6 +1393,7 @@ def build_sglang_talker_request(
             None if input_embeds_are_projected else prefill_embeds_tensor.cpu().tolist()
         ),
         eos_token_ids={int(codec_eos_id)} if codec_eos_id is not None else None,
+        extra_key=input_embeds_extra_key,
         vocab_size=codec_vocab_size,
     )
     req.tokenizer = tokenizer
@@ -726,15 +1406,18 @@ def build_sglang_talker_request(
         else None
     )
     if thinker_config is not None and talker_model_inputs:
-        mrope_positions, mrope_position_delta = _compute_mrope_positions(
+        mrope_builder = mrope_position_builder or _compute_mrope_positions
+        mrope_result = mrope_builder(
             input_ids_tensor.to(dtype=torch.long),
             talker_model_inputs or {},
             thinker_config,
         )
-        mm_inputs = MultimodalInputs(mm_items=[])
-        mm_inputs.mrope_positions = mrope_positions
-        mm_inputs.mrope_position_delta = mrope_position_delta
-        req.multimodal_inputs = mm_inputs
+        if mrope_result is not None:
+            mrope_positions, mrope_position_delta = mrope_result
+            mm_inputs = MultimodalInputs(mm_items=[])
+            mm_inputs.mrope_positions = mrope_positions
+            mm_inputs.mrope_position_delta = mrope_position_delta
+            req.multimodal_inputs = mm_inputs
 
     multimodal_mask: torch.Tensor | None = None
     if thinker_token_ids is not None:
@@ -802,6 +1485,8 @@ def apply_thinker_result(
 
 
 def make_thinker_stream_output_builder():
+    decode_stream_batcher = _DecodeStreamTokenBatcher()
+
     def _normalize_chunk_hidden(hidden: torch.Tensor | None) -> torch.Tensor | None:
         if hidden is None:
             return None
@@ -856,16 +1541,12 @@ def make_thinker_stream_output_builder():
             and (stage_payload.request.params or {}).get("stream", False)
         )
         if is_streaming:
-            # Wrap int — relay_io.write_blob is tensor-only.
-            messages.append(
-                OutgoingMessage(
-                    request_id=request_id,
-                    type="stream",
-                    data=torch.tensor([token_id], dtype=torch.long),
-                    target="decode",
-                    metadata={"token_id": token_id},
-                )
-            )
+            # Inline CPU stream chunks keep tiny text-token deltas off the relay
+            # tensor path. Preserve the old tensor payload when inline is not
+            # enabled because relay_io.write_blob is tensor-only.
+            decode_msg = decode_stream_batcher.build(request_id, token_id)
+            if decode_msg is not None:
+                messages.append(decode_msg)
 
         if not should_generate_audio_output(stage_payload):
             return messages
@@ -900,6 +1581,20 @@ def make_thinker_stream_output_builder():
 
         return messages
 
+    def _flush_stream_output(
+        request_id: str, req_data: Any
+    ) -> list[OutgoingMessage]:
+        stage_payload = getattr(req_data, "stage_payload", None)
+        is_streaming = bool(
+            stage_payload is not None
+            and (stage_payload.request.params or {}).get("stream", False)
+        )
+        if not is_streaming:
+            return []
+        decode_msg = decode_stream_batcher.flush(request_id)
+        return [decode_msg] if decode_msg is not None else []
+
+    _build_stream_output.flush = _flush_stream_output  # type: ignore[attr-defined]
     return _build_stream_output
 
 
@@ -909,6 +1604,9 @@ def make_thinker_scheduler_adapters(
     vocab_size: int,
     thinker_config: Any = None,
     stage_name: str = "thinker",
+    mrope_position_builder: (
+        Callable[[torch.Tensor, dict[str, Any], Any], Any] | None
+    ) = None,
 ):
     """Build model-specific StagePayload <-> scheduler adapters for thinker."""
 
@@ -922,6 +1620,7 @@ def make_thinker_scheduler_adapters(
             vocab_size=vocab_size,
             request_id=payload.request_id,
             thinker_config=thinker_config,
+            mrope_position_builder=mrope_position_builder,
         )
         req_data.stage_payload = payload
         return req_data
@@ -965,6 +1664,9 @@ def make_talker_scheduler_adapters(
     user_token_id: int = 872,
     assistant_token_id: int = 77091,
     speaker_map: dict[str, int] | None = None,
+    mrope_position_builder: (
+        Callable[[torch.Tensor, dict[str, Any], Any], Any] | None
+    ) = None,
 ):
     """Build model-specific StagePayload <-> scheduler adapters for talker."""
     prefill_builder = TalkerPrefillBuilder(
@@ -1001,6 +1703,7 @@ def make_talker_scheduler_adapters(
             "temperature": float(params.get("talker_temperature", 0.9)),
             "top_k": int(params.get("talker_top_k", 50)),
             "top_p": float(params.get("talker_top_p", 1.0)),
+            "min_p": float(params.get("talker_min_p", 0.0)),
             "repetition_penalty": float(params.get("talker_repetition_penalty", 1.05)),
             "codec_eos_id": codec_eos_id if codec_eos_id >= 0 else None,
             "suppress_tokens": suppress_tokens,
@@ -1019,6 +1722,7 @@ def make_talker_scheduler_adapters(
             video_token_id=video_token_id,
             thinker_config=thinker_config,
             resolve_sampling_config=_resolve_talker_sampling_config,
+            mrope_position_builder=mrope_position_builder,
         )
 
     def result_adapter(data: SGLangARRequestData) -> StagePayload:
@@ -1049,6 +1753,9 @@ def _build_talker_request_data(
     video_token_id: int | None,
     thinker_config: Any,
     resolve_sampling_config: Callable[[dict[str, Any]], dict[str, Any]],
+    mrope_position_builder: (
+        Callable[[torch.Tensor, dict[str, Any], Any], Any] | None
+    ) = None,
 ) -> SGLangARRequestData:
     params = payload.request.params
     sampling_cfg = resolve_sampling_config(params)
@@ -1090,6 +1797,7 @@ def _build_talker_request_data(
         temperature=sampling_cfg["temperature"],
         top_k=sampling_cfg["top_k"],
         top_p=sampling_cfg["top_p"],
+        min_p=sampling_cfg.get("min_p", 0.0),
         repetition_penalty=sampling_cfg["repetition_penalty"],
         request_id=payload.request_id,
         codec_bos_id=codec_bos_id,
@@ -1107,6 +1815,7 @@ def _build_talker_request_data(
         thinker_config=thinker_config,
         talker_model_inputs=prompt_prefill["prompt_model_inputs"],
         seed=sampling_cfg.get("seed"),
+        mrope_position_builder=mrope_position_builder,
     )
     req_data.tts_eos_embed = prompt_prefill["tts_eos_embed"]
     req_data.stage_payload = payload

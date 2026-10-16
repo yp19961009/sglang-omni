@@ -33,6 +33,7 @@ class ChatMessage(BaseModel):
     name: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
+    function_call: dict[str, Any] | None = None
 
 
 class ChatCompletionAudio(BaseModel):
@@ -40,6 +41,8 @@ class ChatCompletionAudio(BaseModel):
 
     id: str
     data: str  # base64-encoded audio
+    format: str | None = None
+    sample_rate: int | None = None
     expires_at: int | None = None
     transcript: str | None = None
 
@@ -58,6 +61,8 @@ class ChatCompletionRequest(BaseModel):
     top_k: int | None = None
     min_p: float | None = None
     repetition_penalty: float | None = None
+    frequency_penalty: float | None = None
+    presence_penalty: float | None = None
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
     stop: str | list[str] | None = None
@@ -65,6 +70,17 @@ class ChatCompletionRequest(BaseModel):
 
     # Streaming
     stream: bool = False
+    stream_options: dict[str, Any] | None = None
+
+    metadata: dict[str, Any] | None = None
+
+    # Tool/function-call prompt material. The server only preserves these for
+    # the model chat template; it does not execute tools.
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any | None = None
+    parallel_tool_calls: bool | None = None
+    functions: list[dict[str, Any]] | None = None
+    function_call: Any | None = None
 
     # Multi-modal output control
     modalities: list[str] | None = None  # e.g. ["text", "audio"]
@@ -73,21 +89,37 @@ class ChatCompletionRequest(BaseModel):
     audio: dict[str, Any] | None = None  # {"voice": "...", "format": "wav"}
 
     # Audio input (sglang-omni extension)
-    # Can be a list of audio file paths (local paths or URLs)
+    # Can be a list of audio file paths (local paths or URLs).
     audios: list[str] | None = None
 
     # Image input (sglang-omni extension)
-    # Can be a list of image file paths (local paths or URLs)
+    # Can be a list of image file paths (local paths or URLs).
     images: list[str] | None = None
+    image_min_pixels: int | None = None
+    image_max_pixels: int | None = None
 
     # Video input (sglang-omni extension)
-    # Can be a list of video file paths (local paths or URLs)
+    # Can be a list of video file paths (local paths or URLs).
     videos: list[str] | None = None
     video_fps: float | None = None
+    video_min_frames: int | None = None
     video_max_frames: int | None = None
     video_min_pixels: int | None = None
     video_max_pixels: int | None = None
     video_total_pixels: int | None = None
+    use_audio_in_video: bool | list[bool] | None = None
+    dependent_audio: list[int] | list[bool] | None = None
+    video_dependent_audio: list[int] | list[bool] | None = None
+    video_seconds_per_chunk: float | None = None
+    video_position_id_per_seconds: float | None = None
+    return_video_metadata: bool | None = None
+    video_metadata: Any | None = None
+
+    # Audio processor overrides (sglang-omni extension)
+    audio_target_sr: int | None = None
+    audio_timestamp_interval: int | None = None
+    audio_downsample_times: int | None = None
+    audio_downsample_chunk_size: int | None = None
 
     # Per-stage sampling overrides (sglang-omni specific)
     stage_sampling: dict[str, dict[str, Any]] | None = None
@@ -200,14 +232,21 @@ class CreateSpeechRequest(BaseModel):
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
 
     # Generation parameters
+    max_tokens: int | None = None
+    max_completion_tokens: int | None = None
     max_new_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
+    min_p: float | None = None
     repetition_penalty: float | None = None
+    frequency_penalty: float | None = None
+    presence_penalty: float | None = None
+    stop: str | list[str] | None = None
     seed: int | None = None
 
     # Per-stage overrides (sglang-omni specific)
+    stage_sampling: dict[str, dict[str, Any]] | None = None
     stage_params: dict[str, dict[str, Any]] | None = None
 
     @model_validator(mode="after")

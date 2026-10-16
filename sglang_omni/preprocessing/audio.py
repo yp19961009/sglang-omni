@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import struct
 from pathlib import Path
 from typing import Any
@@ -144,7 +145,23 @@ def _resample_linear(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndar
     return np.interp(new_idx, old_idx, audio).astype(np.float32)
 
 
+def _load_audio_librosa(source: Any, *, target_sr: int) -> np.ndarray | None:
+    """Load audio with the same high-quality path used by qwen_omni_utils."""
+    try:
+        import librosa
+    except ImportError:
+        return None
+    try:
+        audio, _ = librosa.load(source, sr=target_sr, mono=True)
+    except Exception:
+        return None
+    return audio.astype(np.float32, copy=False)
+
+
 def load_audio_path(path: str | Path, *, target_sr: int = 16000) -> np.ndarray:
+    audio = _load_audio_librosa(str(path), target_sr=target_sr)
+    if audio is not None:
+        return audio
     with open(path, "rb") as f:
         data = f.read()
     try:
@@ -193,6 +210,9 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray, float]]):
 
     def load_bytes(self, data: bytes) -> tuple[npt.NDArray, float]:
         """Load audio from raw bytes (WAV, WebM/Opus, MP3, OGG, FLAC, etc.)."""
+        audio = _load_audio_librosa(io.BytesIO(data), target_sr=self.target_sr)
+        if audio is not None:
+            return audio, float(self.target_sr)
         try:
             audio, sr = _parse_wav_bytes(data, source="bytes")
         except ValueError:
@@ -210,6 +230,9 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray, float]]):
 
     def load_file(self, filepath: Path) -> tuple[npt.NDArray, float]:
         """Load audio from a local file path (WAV, WebM/Opus, MP3, OGG, FLAC, etc.)."""
+        audio = _load_audio_librosa(str(filepath), target_sr=self.target_sr)
+        if audio is not None:
+            return audio, float(self.target_sr)
         with open(filepath, "rb") as f:
             data = f.read()
         try:

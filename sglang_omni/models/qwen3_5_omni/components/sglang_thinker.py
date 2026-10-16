@@ -1,0 +1,349 @@
+# SPDX-License-Identifier: Apache-2.0
+"""SGLang thinker wrapper for Qwen3.5-Omni.
+
+The Qwen3.5-Omni root checkpoint owns thinker/talker/code2wav/encoder weights.
+This wrapper keeps only the Qwen3-Next language model used by the thinker stage;
+the Omni pipeline runs image/audio encoders as separate stages and injects their
+embeddings before SGLang prefill.
+"""
+
+from __future__ import annotations
+
+import functools
+import inspect
+import logging
+from collections.abc import Iterable, Iterator
+from typing import Any, Optional, Tuple
+
+import torch
+import torch.nn as nn
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.models.qwen3_next import Qwen3NextForCausalLM
+from sglang.srt.utils import logger as sglang_logger
+
+from sglang_omni.models.qwen3_omni.quantization import (
+    convert_fp8_weight_scale_inv_for_sglang,
+)
+from sglang_omni.models.qwen3_5_omni.components.common import (
+    ensure_sglang_qwen3_next_text_config,
+    sub_config_or_self,
+)
+
+logger = logging.getLogger(__name__)
+
+_SKIP_PREFIXES = (
+    "audio_tower.",
+    "visual.",
+    "talker.",
+    "code2wav.",
+    "mtp.",
+)
+_LANGUAGE_PREFIXES = ("model.", "lm_head.")
+_IGNORED_SUFFIXES = (
+    ".bias",
+    "_bias",
+    ".k_scale",
+    "_k_scale",
+    ".v_scale",
+    "_v_scale",
+    ".weight_scale",
+    "_weight_scale",
+    ".input_scale",
+    "_input_scale",
+)
+
+
+def _normalize_language_weight_name(name: str) -> str | None:
+    """Map Omni checkpoint names to Qwen3NextForCausalLM-local names."""
+    if name.startswith("thinker.lm_head."):
+        name = "lm_head." + name[len("thinker.lm_head.") :]
+    elif name.startswith("thinker.model."):
+        name = "model." + name[len("thinker.model.") :]
+    elif name.startswith("thinker.language_model."):
+        name = name[len("thinker.language_model.") :]
+    elif name.startswith("thinker."):
+        name = name[len("thinker.") :]
+    elif name.startswith("language_model."):
+        name = name[len("language_model.") :]
+    elif name.startswith("model.language_model."):
+        name = "model." + name[len("model.language_model.") :]
+
+    if name.startswith(_SKIP_PREFIXES):
+        return None
+    if not name.startswith(_LANGUAGE_PREFIXES):
+        return None
+    return name
+
+
+def _iter_language_weights(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+    params_dict: dict[str, nn.Parameter] | None = None,
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    for name, loaded_weight in weights:
+        mapped = _normalize_language_weight_name(name)
+        if mapped is None:
+            continue
+        if (
+            params_dict is not None
+            and mapped.endswith(_IGNORED_SUFFIXES)
+            and mapped not in params_dict
+        ):
+            continue
+        loaded_weight = convert_fp8_weight_scale_inv_for_sglang(
+            mapped,
+            loaded_weight,
+        )
+        yield mapped, loaded_weight
+
+
+def _has_real_deepstack(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, torch.Tensor):
+        return value.numel() > 0
+    if isinstance(value, dict):
+        return any(_has_real_deepstack(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_real_deepstack(item) for item in value)
+    return True
+
+
+def _native_layers_to_capture_supported(forward_fn: Any) -> bool:
+    try:
+        source = inspect.getsource(forward_fn)
+    except (OSError, TypeError):
+        return False
+    return "layers_to_capture" in source and "aux_hidden_states" in source
+
+
+def _deepstack_tensor_for_layer(value: Any, layer_id: int) -> torch.Tensor | None:
+    if layer_id < 0:
+        return None
+    if value is None:
+        return None
+    key = f"deepstack_input_embeds_{layer_id}"
+    if isinstance(value, dict):
+        if key in value:
+            return value[key]
+        if layer_id in value:
+            return value[layer_id]
+        return None
+    if isinstance(value, (list, tuple)):
+        return value[layer_id] if 0 <= layer_id < len(value) else None
+    if isinstance(value, torch.Tensor):
+        if value.ndim >= 3 and 0 <= layer_id < value.shape[0]:
+            return value[layer_id]
+        return value if layer_id == 0 else None
+    try:
+        return value[key]
+    except Exception:
+        return None
+
+
+def _add_deepstack_to_residual(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    deepstack_input_embeds: Any,
+    layer_id: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    layer_deepstack = _deepstack_tensor_for_layer(deepstack_input_embeds, layer_id)
+    if layer_deepstack is None:
+        return hidden_states, residual
+    layer_deepstack = layer_deepstack.to(
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    # SGLang Qwen3-VL applies deepstack after the residual add for the previous
+    # decoder layer. Qwen3Next layers do not forward post_residual_addition, so
+    # inject it into residual before the next layer's input RMSNorm.
+    if residual is None:
+        return hidden_states + layer_deepstack, residual
+    return hidden_states, residual + layer_deepstack
+
+
+def _install_layers_to_capture_support(text_model: nn.Module) -> None:
+    """Teach SGLang Qwen3NextModel to return aux hidden states when requested."""
+    if getattr(text_model, "_qwen35_capture_forward_installed", False):
+        return
+
+    original_forward = text_model.forward
+    native_capture_supported = _native_layers_to_capture_supported(original_forward)
+
+    @functools.wraps(original_forward)
+    def _forward_with_capture(
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: Any,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        deepstack_input_embeds: Any | None = None,
+    ):
+        capture_layers = list(getattr(text_model, "layers_to_capture", []) or [])
+        has_deepstack = _has_real_deepstack(deepstack_input_embeds)
+        if (
+            (not has_deepstack)
+            and (not capture_layers or native_capture_supported)
+        ):
+            return original_forward(
+                input_ids,
+                positions,
+                forward_batch,
+                inputs_embeds,
+            )
+
+        # The existing hidden-capture hook expects text_model.forward to return
+        # (hidden_states, aux_hidden_states) after layers_to_capture is set.
+        # SGLang core Qwen3Next does not provide that return value yet, so this
+        # follows the original forward logic and adds the missing capture output.
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = text_model.embed_tokens(input_ids)
+
+        capture_set = set(capture_layers)
+        aux_hidden_by_layer = {}
+        if 0 in capture_set:
+            aux_hidden_by_layer[0] = hidden_states.clone()
+        residual = None
+        for layer_id, layer in enumerate(text_model.layers):
+            if has_deepstack:
+                hidden_states, residual = _add_deepstack_to_residual(
+                    hidden_states,
+                    residual,
+                    deepstack_input_embeds,
+                    layer_id - 1,
+                )
+            with get_global_expert_distribution_recorder().with_current_layer(
+                layer_id
+            ):
+                hidden_states, residual = layer(
+                    layer_id=layer_id,
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    forward_batch=forward_batch,
+                )
+            if layer_id != 0 and layer_id in capture_set:
+                aux_hidden_by_layer[layer_id] = hidden_states.clone()
+        if has_deepstack:
+            hidden_states, residual = _add_deepstack_to_residual(
+                hidden_states,
+                residual,
+                deepstack_input_embeds,
+                len(text_model.layers) - 1,
+            )
+        if not forward_batch.forward_mode.is_idle():
+            if residual is None:
+                hidden_states = text_model.norm(hidden_states)
+            else:
+                hidden_states, _ = text_model.norm(hidden_states, residual)
+
+        aux_hidden_states = [
+            aux_hidden_by_layer[layer_id]
+            for layer_id in capture_layers
+            if layer_id in aux_hidden_by_layer
+        ]
+        return hidden_states, aux_hidden_states
+
+    text_model.forward = _forward_with_capture
+    text_model._qwen35_capture_forward_installed = True
+
+
+class Qwen3OmniNextThinkerForConditionalGeneration(nn.Module):
+    """Qwen3.5-Omni thinker backed by SGLang's Qwen3NextForCausalLM."""
+
+    def __init__(
+        self,
+        config: Any,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        ) -> None:
+        super().__init__()
+        self.root_config = config
+        self.thinker_config = sub_config_or_self(config, "thinker_config")
+        self.config = ensure_sglang_qwen3_next_text_config(
+            getattr(self.thinker_config, "text_config", None) or self.thinker_config
+        )
+
+        self.language_model = Qwen3NextForCausalLM(
+            self.config,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+        self.model = self.language_model.model
+        _install_layers_to_capture_support(self.model)
+
+    @property
+    def thinker(self) -> "Qwen3OmniNextThinkerForConditionalGeneration":
+        # Existing Omni hidden-capture hooks navigate through model.thinker.model.
+        return self
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: Any,
+        get_embedding: bool = False,
+        pp_proxy_tensors: Any | None = None,
+        input_embeds: torch.Tensor | None = None,
+        input_deepstack_embeds: Any | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: Any,
+    ):
+        del get_embedding, pp_proxy_tensors
+        if forward_batch.mrope_positions is not None:
+            positions = forward_batch.mrope_positions
+
+        if input_embeds is not None and inputs_embeds is not None:
+            raise ValueError("Pass only one of input_embeds or inputs_embeds.")
+        embeds = inputs_embeds if inputs_embeds is not None else input_embeds
+        deepstack_input_embeds = kwargs.pop(
+            "deepstack_input_embeds",
+            input_deepstack_embeds,
+        )
+
+        if _has_real_deepstack(deepstack_input_embeds):
+            hidden_states = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                inputs_embeds=embeds,
+                deepstack_input_embeds=deepstack_input_embeds,
+            )
+            if isinstance(hidden_states, tuple):
+                hidden_states, _ = hidden_states
+            return self.language_model.logits_processor(
+                input_ids,
+                hidden_states,
+                self.language_model.lm_head,
+                forward_batch,
+            )
+
+        return self.language_model(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            inputs_embeds=embeds,
+            **kwargs,
+        )
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        """Load thinker language-model weights and ignore other Omni modules."""
+        params_dict = dict(self.language_model.named_parameters())
+        loaded = self.language_model.load_weights(
+            _iter_language_weights(weights, params_dict=params_dict)
+        )
+        for name in loaded:
+            if not name.startswith(_LANGUAGE_PREFIXES):
+                sglang_logger.warning(
+                    "Loaded unexpected Qwen3.5 thinker weight %s",
+                    name,
+                )
+        return loaded
+
+
+Qwen3OmniNextForConditionalGeneration = Qwen3OmniNextThinkerForConditionalGeneration
+Qwen3OmniNextThinkerMTP = Qwen3OmniNextThinkerForConditionalGeneration
+EntryClass = Qwen3OmniNextThinkerForConditionalGeneration

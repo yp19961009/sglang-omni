@@ -1,0 +1,31 @@
+category,name,count,avg_ms,p50_ms,p95_ms,p99_ms,max_ms,notes
+milestone,preprocess_done,12,1199.8,1283.6,2083.9,2261.3,,from request admission
+milestone,image_encoder_done,12,4624.7,4770.4,6613.8,7030.1,,from request admission
+milestone,audio_encoder_done,12,1555.1,1684.4,2423.8,2608.1,,from request admission
+milestone,mm_aggregate_done,12,5914.7,6224.0,7867.9,8270.4,,from request admission
+milestone,thinker_prefill_start,12,6336.2,6542.1,8174.2,8576.6,,from request admission
+milestone,thinker_first_emit,12,6733.6,6919.1,8553.2,8762.0,,from request admission
+milestone,decode_first_text,12,7690.2,7193.7,8851.8,16819.0,,from request admission
+milestone,talker_prefill_start,12,9457.9,9483.4,9485.5,9485.8,,from request admission
+milestone,talker_first_code,12,9595.9,9608.4,9644.3,9652.2,,from request admission
+milestone,first_audio,12,10001.9,10006.7,10045.0,10054.1,,from request admission
+milestone,thinker_done,12,27242.7,27617.4,30854.7,31584.5,,from request admission
+milestone,talker_done,12,28340.3,28658.8,32253.7,32848.1,,from request admission
+milestone,code2wav_done,12,28354.6,28676.0,32264.7,32862.2,,from request admission
+milestone,last_client_stream,12,34378.0,34298.7,35988.5,36586.7,,from request admission
+stage,preprocessing,12,1199.3,1283.2,2083.4,2260.9,,stage input to complete
+stage,image_encoder,12,3247.4,3288.0,4349.8,4591.1,,stage input to complete
+stage,audio_encoder,12,227.5,233.2,246.5,258.0,,stage input to complete
+stage,mm_aggregate,12,4566.8,4756.7,5645.7,5869.3,,stage input to complete
+stage,thinker,12,21062.5,20550.1,23991.8,24094.5,,stage input to complete
+stage,decode,12,5861.2,5906.5,8258.2,8840.7,,stage input to complete
+stage,talker_ar,12,21960.2,21357.4,24968.6,25170.5,,stage input to complete
+stage,code2wav,12,7.4,10.2,10.9,11.0,,terminal payload only
+stream_interval,code2wav_window_collect,352,575.8,40.7,366.5,,20093.5,streaming window collection
+stream_interval,code2wav_decode,352,9.3,9.0,9.4,,92.4,actual codec decode is not bottleneck
+stream_interval,talker_ar_to_code2wav_stream_hop,1418,8.3,7.8,16.0,,39.9,stream hop latency
+stream_interval,thinker_to_decode_stream_hop,60,941.4,1144.4,1386.4,,1535.9,stream hop latency
+prefill_stats,best_sil672,333,1.51,,,,,avg_new_seq distribution=1:238|2:63|3:16|4:9|5:3|9:1|10:1|11:2
+prefill_stats,profile_sil700,717,1.40,,,,,avg_new_seq distribution=1:560|2:110|3:19|4:12|5:3|6:5|7:1|8:1|9:2|10:1|11:3
+prefill_stats,trimpartial_8162,1119,1.35,,,,,avg_new_seq distribution=1:904|2:147|3:25|4:24|5:5|6:5|8:2|9:1|10:3|11:3
+prefill_stats,prefillwait20_8163,866,1.32,,,,,unstable avg_new_seq distribution=1:732|2:88|3:19|4:8|5:6|6:3|7:1|9:3|10:3|11:3

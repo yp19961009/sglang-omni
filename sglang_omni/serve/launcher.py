@@ -293,6 +293,8 @@ async def _run_server(
     log_level: str = "info",
     client_kwargs: dict[str, Any] | None = None,
     enable_realtime: bool = False,
+    default_talker_params: dict[str, Any] | None = None,
+    default_generation_params: dict[str, Any] | None = None,
 ) -> None:
     """Start the pipeline and run the OpenAI server.
 
@@ -334,6 +336,8 @@ async def _run_server(
             client,
             model_name=model_name or pipeline_config.name,
             enable_realtime=enable_realtime,
+            default_talker_params=default_talker_params,
+            default_generation_params=default_generation_params,
         )
         profiler_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
         profiler_ctl = ProfilerControlClient(mp_runner.stage_control_endpoints)
@@ -401,6 +405,8 @@ def launch_server(
     log_level: str = "info",
     client_kwargs: dict[str, Any] | None = None,
     enable_realtime: bool = False,
+    default_talker_params: dict[str, Any] | None = None,
+    default_generation_params: dict[str, Any] | None = None,
 ) -> None:
     """Blocking helper: start the pipeline and OpenAI-compatible server.
 
@@ -415,6 +421,10 @@ def launch_server(
             :class:`~sglang_omni.client.Client`.
         enable_realtime: If True, mount the WebSocket ``/v1/realtime``
             endpoint (OpenAI Realtime API).
+        default_talker_params: Defaults forwarded to the OpenAI app and
+            merged into per-request talker/code2wav params.
+        default_generation_params: Defaults forwarded to the OpenAI app and
+            merged into per-request sampling/max-token params.
     """
     asyncio.run(
         _run_server(
@@ -425,5 +435,7 @@ def launch_server(
             log_level=log_level,
             client_kwargs=client_kwargs,
             enable_realtime=enable_realtime,
+            default_talker_params=default_talker_params,
+            default_generation_params=default_generation_params,
         )
     )

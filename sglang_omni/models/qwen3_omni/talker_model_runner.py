@@ -3,13 +3,91 @@
 
 from __future__ import annotations
 
+import inspect
+import logging
+import os
+import time
 from typing import Any
 
 import torch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.scheduling.messages import OutgoingMessage
+
+logger = logging.getLogger(__name__)
+
+_QWEN35_EXTERNAL_DECODE_INPUT_MODE = "qwen35_external"
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid integer env %s=%r", name, raw)
+        return default
+
+_QWEN35_ALLOW_EMPTY_TEXT_FEEDBACK = os.environ.get(
+    "QWEN35_TALKER_ALLOW_EMPTY_TEXT_FEEDBACK",
+    "1",
+).lower() in {"1", "true", "yes", "on"}
+_QWEN35_ALLOW_UNBOUNDED_EMPTY_TEXT_FEEDBACK = os.environ.get(
+    "QWEN35_TALKER_ALLOW_UNBOUNDED_EMPTY_TEXT_FEEDBACK",
+    "0",
+).lower() in {"1", "true", "yes", "on"}
+_QWEN35_ALLOW_PARTIAL_TEXT_CHUNK_BEFORE_DONE = os.environ.get(
+    "QWEN35_TALKER_ALLOW_PARTIAL_TEXT_CHUNK_BEFORE_DONE",
+    "0",
+).lower() in {"1", "true", "yes", "on"}
+_QWEN35_PARTIAL_TEXT_CHUNK_WAIT_SKIPS = max(
+    0,
+    _env_int("QWEN35_TALKER_PARTIAL_TEXT_CHUNK_WAIT_SKIPS", 0),
+)
+_STREAM_TIMING_STATS_ENV = "SGLANG_OMNI_STREAM_TIMING_STATS"
+_READINESS_STATS_ENV = "SGLANG_OMNI_TALKER_READINESS_STATS"
+_CODEC_STREAM_INLINE_CPU_ENV = "SGLANG_OMNI_TALKER_CODEC_STREAM_INLINE_CPU"
+_CODEC_STREAM_GROUP_SIZE_ENV = "SGLANG_OMNI_TALKER_CODEC_STREAM_GROUP_SIZE"
+_PREFER_INLINE_CPU_STREAM_CHUNK_METADATA_KEY = "_prefer_inline_cpu_stream_chunk"
+
+
+def _stream_timing_stats_enabled() -> bool:
+    raw = os.getenv(_STREAM_TIMING_STATS_ENV)
+    if raw is None or raw == "":
+        return False
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _talker_readiness_stats_enabled() -> bool:
+    raw = os.getenv(_READINESS_STATS_ENV)
+    if raw is None or raw == "":
+        return _stream_timing_stats_enabled()
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _codec_stream_inline_cpu_enabled() -> bool:
+    raw = os.getenv(_CODEC_STREAM_INLINE_CPU_ENV)
+    if raw is None or raw == "":
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _codec_stream_group_size() -> int:
+    # Grouping codec rows is opt-in: it reduces tiny stream messages but can
+    # hurt overlap between talker generation and code2wav ingestion.
+    return max(1, _env_int(_CODEC_STREAM_GROUP_SIZE_ENV, 1))
+
+
+def _queue_len(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        return len(value)
+    except TypeError:
+        return 0
 
 
 class QwenTalkerModelRunner(ModelRunner):
@@ -27,9 +105,48 @@ class QwenTalkerModelRunner(ModelRunner):
         self._outbox = outbox
         self._code2wav_target = code2wav_target
         self._feedback_enabled = bool(feedback_enabled)
+        self._code_predictor_accepts_requests: bool | None = None
+        self._decode_readiness_stats: dict[str, Any] = self._new_readiness_stats()
+        self._decode_readiness_last_log_ns = 0
+        self._codec_stream_inline_cpu = _codec_stream_inline_cpu_enabled()
+        self._codec_stream_group_size = _codec_stream_group_size()
+        self._codec_stream_buffers: dict[str, list[torch.Tensor]] = {}
+        self._codec_stream_first_emit_ns: dict[str, int] = {}
 
     def execute(self, scheduler_output: Any):
         return super().execute(scheduler_output)
+
+    @staticmethod
+    def _profile_request_id(sched_req: Any) -> str | None:
+        data = getattr(sched_req, "data", None)
+        for obj in (
+            getattr(data, "req", None),
+            getattr(data, "stage_payload", None),
+            sched_req,
+        ):
+            if obj is None:
+                continue
+            rid = getattr(obj, "rid", None) or getattr(obj, "request_id", None)
+            if rid:
+                return str(rid)
+        return None
+
+    def _emit_batch_profile_event(
+        self,
+        requests: list,
+        event_name: str,
+        **metadata: Any,
+    ) -> None:
+        for sched_req in requests:
+            request_id = self._profile_request_id(sched_req)
+            if request_id is None:
+                continue
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name=event_name,
+                metadata=metadata,
+            )
 
     def custom_prefill_forward(
         self,
@@ -60,8 +177,44 @@ class QwenTalkerModelRunner(ModelRunner):
                 "Talker decode reached model runner without ready feedback/text input"
             )
 
-        self.model.prepare_decode_buffers(requests)
-        self._write_feedback_buffers(requests)
+        self._emit_batch_profile_event(
+            requests,
+            "talker_feedback_prepare_start",
+            batch_size=len(requests),
+        )
+        try:
+            self._emit_batch_profile_event(
+                requests,
+                "talker_prepare_decode_buffers_start",
+                batch_size=len(requests),
+            )
+            try:
+                self.model.prepare_decode_buffers(requests)
+            finally:
+                self._emit_batch_profile_event(
+                    requests,
+                    "talker_prepare_decode_buffers_end",
+                    batch_size=len(requests),
+                )
+            self._emit_batch_profile_event(
+                requests,
+                "talker_write_feedback_buffers_start",
+                batch_size=len(requests),
+            )
+            try:
+                self._write_feedback_buffers(requests)
+            finally:
+                self._emit_batch_profile_event(
+                    requests,
+                    "talker_write_feedback_buffers_end",
+                    batch_size=len(requests),
+                )
+        finally:
+            self._emit_batch_profile_event(
+                requests,
+                "talker_feedback_prepare_end",
+                batch_size=len(requests),
+            )
 
     def post_prefill(
         self,
@@ -83,12 +236,51 @@ class QwenTalkerModelRunner(ModelRunner):
         talker_hidden = result.logits_output.hidden_states
         if isinstance(talker_hidden, torch.Tensor) and talker_hidden.ndim == 2:
             talker_hidden = talker_hidden.unsqueeze(1)
-        self.model.code_predictor_forward(layer0_codes, talker_hidden)
+        self._emit_batch_profile_event(
+            requests,
+            "talker_code_predictor_start",
+            batch_size=len(requests),
+            seq_len=int(layer0_codes.shape[1]),
+        )
+        try:
+            self._run_code_predictor_forward(layer0_codes, talker_hidden, requests)
+        finally:
+            self._emit_batch_profile_event(
+                requests,
+                "talker_code_predictor_end",
+                batch_size=len(requests),
+                seq_len=int(layer0_codes.shape[1]),
+            )
         schedule_batch.output_ids = result.next_token_ids
         self._emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,
             requests=requests,
         )
+
+    def _run_code_predictor_forward(
+        self,
+        layer0_codes: torch.Tensor,
+        talker_hidden: torch.Tensor,
+        requests: list,
+    ) -> Any:
+        code_predictor_forward = self.model.code_predictor_forward
+        accepts_requests = self._code_predictor_accepts_requests
+        if accepts_requests is None:
+            try:
+                params = inspect.signature(code_predictor_forward).parameters
+            except (TypeError, ValueError):
+                accepts_requests = False
+            else:
+                accepts_requests = "requests" in params
+            self._code_predictor_accepts_requests = accepts_requests
+
+        if accepts_requests:
+            return code_predictor_forward(
+                layer0_codes,
+                talker_hidden,
+                requests=requests,
+            )
+        return code_predictor_forward(layer0_codes, talker_hidden)
 
     def post_decode(
         self,
@@ -108,32 +300,164 @@ class QwenTalkerModelRunner(ModelRunner):
             requests=requests,
         )
 
+    def _build_codec_stream_message(
+        self,
+        *,
+        request_id: str,
+        rows: list[torch.Tensor],
+        is_streaming: bool,
+        batch_size: int,
+        first_emit_ns: int | None,
+    ) -> OutgoingMessage | None:
+        if not rows:
+            return None
+        data = rows[0] if len(rows) == 1 else torch.stack(rows, dim=0)
+        metadata = {"stream": is_streaming}
+        if self._codec_stream_inline_cpu:
+            metadata[_PREFER_INLINE_CPU_STREAM_CHUNK_METADATA_KEY] = True
+        if _stream_timing_stats_enabled():
+            metadata["talker_emit_ns"] = first_emit_ns or time.monotonic_ns()
+            metadata["talker_batch_size"] = batch_size
+            metadata["codec_rows"] = len(rows)
+        return OutgoingMessage(
+            request_id=request_id,
+            type="stream",
+            data=data,
+            target=self._code2wav_target,
+            metadata=metadata,
+        )
+
+    def _queue_codec_stream_row(
+        self,
+        *,
+        request_id: str,
+        code_chunk: torch.Tensor,
+        is_streaming: bool,
+        batch_size: int,
+    ) -> int:
+        configured_group_size = getattr(self, "_codec_stream_group_size", 1)
+        group_size = configured_group_size if self._codec_stream_inline_cpu else 1
+        emit_ns = time.monotonic_ns() if _stream_timing_stats_enabled() else None
+        if group_size <= 1:
+            msg = self._build_codec_stream_message(
+                request_id=request_id,
+                rows=[code_chunk],
+                is_streaming=is_streaming,
+                batch_size=batch_size,
+                first_emit_ns=emit_ns,
+            )
+            if msg is not None:
+                self._outbox.put(msg)
+            return 1
+
+        buffers = self.__dict__.setdefault("_codec_stream_buffers", {})
+        first_emit_by_request = self.__dict__.setdefault(
+            "_codec_stream_first_emit_ns", {}
+        )
+        rows = buffers.setdefault(request_id, [])
+        if not rows and emit_ns is not None:
+            first_emit_by_request[request_id] = emit_ns
+        rows.append(code_chunk.detach().clone())
+        if len(rows) < group_size:
+            return 0
+        grouped_rows = list(rows)
+        rows.clear()
+        first_emit_ns = first_emit_by_request.pop(request_id, emit_ns)
+        msg = self._build_codec_stream_message(
+            request_id=request_id,
+            rows=grouped_rows,
+            is_streaming=is_streaming,
+            batch_size=batch_size,
+            first_emit_ns=first_emit_ns,
+        )
+        if msg is not None:
+            self._outbox.put(msg)
+        return 1
+
+    def flush_stream_outputs(
+        self, request_id: str, data: Any
+    ) -> list[OutgoingMessage]:
+        buffers = self.__dict__.setdefault("_codec_stream_buffers", {})
+        first_emit_by_request = self.__dict__.setdefault(
+            "_codec_stream_first_emit_ns", {}
+        )
+        rows = buffers.pop(request_id, [])
+        if not rows:
+            first_emit_by_request.pop(request_id, None)
+            return []
+        stage_payload = getattr(data, "stage_payload", None)
+        is_streaming = bool(
+            stage_payload is not None
+            and (stage_payload.request.params or {}).get("stream", False)
+        )
+        first_emit_ns = first_emit_by_request.pop(request_id, None)
+        msg = self._build_codec_stream_message(
+            request_id=request_id,
+            rows=rows,
+            is_streaming=is_streaming,
+            batch_size=1,
+            first_emit_ns=first_emit_ns,
+        )
+        return [msg] if msg is not None else []
+
     def _emit_code_chunks_and_feedback(
         self,
         *,
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        for idx, sched_req in enumerate(requests):
-            req = schedule_batch.reqs[idx]
-            code_chunk = self.model._output_codes[idx].detach().clone()
-            feedback_row = self.model._output_embeds[idx].detach().clone()
-            # Tell code2wav whether to forward audio chunks to the Coordinator.
-            stage_payload = sched_req.data.stage_payload
-            is_streaming = bool(
-                stage_payload is not None
-                and (stage_payload.request.params or {}).get("stream", False)
-            )
-            self._outbox.put(
-                OutgoingMessage(
-                    request_id=req.rid,
-                    type="stream",
-                    data=code_chunk,
-                    target=self._code2wav_target,
-                    metadata={"stream": is_streaming},
+        emitted = 0
+        skipped = 0
+        stream_messages = 0
+        self._emit_batch_profile_event(
+            requests,
+            "talker_emit_chunk_start",
+            batch_size=len(requests),
+        )
+        try:
+            batch_size = len(requests)
+            output_codes = self.model._output_codes[:batch_size].detach()
+            if self._codec_stream_inline_cpu:
+                # Codec rows are tiny. Sending them through CPU-inline avoids CUDA
+                # relay lifetime hazards while code2wav still moves them to GPU.
+                code_chunks = output_codes.to(device="cpu", dtype=torch.long, copy=True)
+            else:
+                code_chunks = output_codes.clone()
+            feedback_rows = self.model._output_embeds[:batch_size].detach().clone()
+            for idx, sched_req in enumerate(requests):
+                req = schedule_batch.reqs[idx]
+                code_chunk = code_chunks[idx]
+                feedback_row = feedback_rows[idx]
+                should_emit = bool(
+                    getattr(sched_req.data, "last_talker_decode_should_emit", True)
                 )
+                # Tell code2wav whether to forward audio chunks to the Coordinator.
+                stage_payload = sched_req.data.stage_payload
+                is_streaming = bool(
+                    stage_payload is not None
+                    and (stage_payload.request.params or {}).get("stream", False)
+                )
+                if should_emit:
+                    emitted += 1
+                    stream_messages += self._queue_codec_stream_row(
+                        request_id=req.rid,
+                        code_chunk=code_chunk,
+                        is_streaming=is_streaming,
+                        batch_size=batch_size,
+                    )
+                else:
+                    skipped += 1
+                sched_req.data.pending_feedback_queue.append(feedback_row)
+        finally:
+            self._emit_batch_profile_event(
+                requests,
+                "talker_emit_chunk_end",
+                batch_size=len(requests),
+                emitted=emitted,
+                skipped=skipped,
+                stream_messages=stream_messages,
+                codec_group_size=getattr(self, "_codec_stream_group_size", 1),
             )
-            sched_req.data.pending_feedback_queue.append(feedback_row)
 
     def sample_before_post_prefill(
         self, forward_batch: Any, schedule_batch: Any, requests: list
@@ -150,10 +474,78 @@ class QwenTalkerModelRunner(ModelRunner):
     def is_decode_batch_ready(self, schedule_batch: Any) -> bool:
         if not self._feedback_enabled or not schedule_batch.forward_mode.is_decode():
             return True
-        return all(
-            self._data_has_next_decode_input(getattr(req, "_omni_data", None))
+        if not _talker_readiness_stats_enabled():
+            return all(
+                self._data_has_next_decode_input(getattr(req, "_omni_data", None))
+                for req in schedule_batch.reqs
+            )
+
+        readiness = [
+            self._decode_input_readiness(getattr(req, "_omni_data", None))
             for req in schedule_batch.reqs
+        ]
+        ready = all(item[0] for item in readiness)
+        if not ready:
+            self._record_decode_readiness_stats(readiness)
+        return ready
+
+    @staticmethod
+    def _new_readiness_stats() -> dict[str, Any]:
+        return {
+            "skip_batches": 0,
+            "ready_reqs": 0,
+            "unready_reqs": 0,
+            "batch_size_hist": {},
+            "ready_count_hist": {},
+            "unready_count_hist": {},
+            "reasons": {},
+        }
+
+    def _record_decode_readiness_stats(
+        self, readiness: list[tuple[bool, str]]
+    ) -> None:
+        stats = self._decode_readiness_stats
+        stats["skip_batches"] += 1
+        reasons = stats["reasons"]
+        batch_size = len(readiness)
+        ready_count = 0
+        unready_count = 0
+        for ready, reason in readiness:
+            if ready:
+                stats["ready_reqs"] += 1
+                ready_count += 1
+            else:
+                stats["unready_reqs"] += 1
+                unready_count += 1
+            reasons[reason] = reasons.get(reason, 0) + 1
+        for hist_name, value in (
+            ("batch_size_hist", batch_size),
+            ("ready_count_hist", ready_count),
+            ("unready_count_hist", unready_count),
+        ):
+            hist = stats[hist_name]
+            hist[value] = hist.get(value, 0) + 1
+
+        now_ns = time.monotonic_ns()
+        if (
+            self._decode_readiness_last_log_ns
+            and now_ns - self._decode_readiness_last_log_ns < 1_000_000_000
+        ):
+            return
+        self._decode_readiness_last_log_ns = now_ns
+        logger.info(
+            "talker_decode_readiness_stats skip_batches=%s ready_reqs=%s "
+            "unready_reqs=%s batch_size_hist=%s ready_count_hist=%s "
+            "unready_count_hist=%s reasons=%s",
+            stats["skip_batches"],
+            stats["ready_reqs"],
+            stats["unready_reqs"],
+            dict(sorted(stats["batch_size_hist"].items())),
+            dict(sorted(stats["ready_count_hist"].items())),
+            dict(sorted(stats["unready_count_hist"].items())),
+            dict(sorted(reasons.items())),
         )
+        self._decode_readiness_stats = self._new_readiness_stats()
 
     def _run_projected_prefill_forward(
         self,
@@ -347,6 +739,12 @@ class QwenTalkerModelRunner(ModelRunner):
         rows: list[int] = []
         embeds: list[torch.Tensor] = []
         for row_idx, sched_req in enumerate(requests):
+            pending_feedback_queue = getattr(
+                sched_req.data,
+                "pending_feedback_queue",
+                None,
+            )
+            pending_text_queue = getattr(sched_req.data, "pending_text_queue", None)
             combined = self._take_next_decode_input_embed(
                 sched_req=sched_req,
                 device=feedback_buffer.device,
@@ -365,18 +763,95 @@ class QwenTalkerModelRunner(ModelRunner):
 
     @staticmethod
     def _data_has_next_decode_input(data: Any) -> bool:
+        return QwenTalkerModelRunner._decode_input_readiness(data)[0]
+
+    @staticmethod
+    def _decode_input_readiness(data: Any) -> tuple[bool, str]:
         if data is None:
-            return False
+            return False, "missing_data"
         pending_feedback_queue = getattr(data, "pending_feedback_queue", None)
         if not pending_feedback_queue:
-            return False
+            return False, "wait_no_feedback"
+        if (
+            getattr(data, "talker_decode_input_mode", "sum")
+            == _QWEN35_EXTERNAL_DECODE_INPUT_MODE
+        ):
+            if int(getattr(data, "talker_text_chunk_remaining", 0) or 0) > 0:
+                return True, "ready_external_text_chunk_remaining"
+            if getattr(data, "pending_text_queue", None):
+                countdown = int(
+                    getattr(data, "talker_text_feedback_countdown", 0) or 0
+                )
+                if countdown > 0:
+                    return True, "ready_external_feedback_countdown"
+                chunk_size = max(
+                    1,
+                    int(getattr(data, "talker_text_chunk_size", 1) or 1),
+                )
+                pending_len = _queue_len(getattr(data, "pending_text_queue", None))
+                if pending_len >= chunk_size:
+                    QwenTalkerModelRunner._reset_partial_text_chunk_wait(data)
+                    return True, "ready_external_text_chunk"
+                if bool(getattr(data, "thinker_chunks_done", False)):
+                    QwenTalkerModelRunner._reset_partial_text_chunk_wait(data)
+                    return True, "ready_external_final_text_chunk"
+                partial_reason = (
+                    QwenTalkerModelRunner._partial_text_chunk_ready_reason(data)
+                )
+                if partial_reason is not None:
+                    return True, partial_reason
+                QwenTalkerModelRunner._increment_partial_text_chunk_wait(data)
+                return False, "wait_external_text_chunk"
+            if getattr(data, "thinker_chunks_done", False):
+                QwenTalkerModelRunner._reset_partial_text_chunk_wait(data)
+                return True, "ready_external_done_feedback"
+            QwenTalkerModelRunner._reset_partial_text_chunk_wait(data)
+            ready = (
+                _QWEN35_ALLOW_EMPTY_TEXT_FEEDBACK
+                and int(getattr(data, "talker_text_feedback_countdown", 0) or 0) > 0
+            )
+            if ready:
+                return True, "ready_external_empty_text_feedback"
+            if _QWEN35_ALLOW_UNBOUNDED_EMPTY_TEXT_FEEDBACK:
+                return True, "ready_external_unbounded_empty_text_feedback"
+            return False, "wait_external_text"
         pending_text_queue = getattr(data, "pending_text_queue", None)
         if pending_text_queue:
-            return True
-        return bool(
+            return True, "ready_sum_text"
+        ready = bool(
             getattr(data, "thinker_chunks_done", False)
             and getattr(data, "tts_pad_embed", None) is not None
         )
+        if ready:
+            return True, "ready_sum_pad"
+        return False, "wait_sum_text_or_pad"
+
+    @staticmethod
+    def _partial_text_chunk_ready_reason(data: Any) -> str | None:
+        if _QWEN35_ALLOW_PARTIAL_TEXT_CHUNK_BEFORE_DONE:
+            return "ready_external_partial_text_chunk"
+        if _QWEN35_PARTIAL_TEXT_CHUNK_WAIT_SKIPS <= 0:
+            return None
+        wait_skips = int(
+            getattr(data, "talker_partial_text_chunk_wait_skips", 0) or 0
+        )
+        if wait_skips >= _QWEN35_PARTIAL_TEXT_CHUNK_WAIT_SKIPS:
+            return "ready_external_partial_text_chunk_after_wait"
+        return None
+
+    @staticmethod
+    def _increment_partial_text_chunk_wait(data: Any) -> None:
+        if _QWEN35_PARTIAL_TEXT_CHUNK_WAIT_SKIPS <= 0:
+            return
+        wait_skips = int(
+            getattr(data, "talker_partial_text_chunk_wait_skips", 0) or 0
+        )
+        data.talker_partial_text_chunk_wait_skips = wait_skips + 1
+
+    @staticmethod
+    def _reset_partial_text_chunk_wait(data: Any) -> None:
+        if hasattr(data, "talker_partial_text_chunk_wait_skips"):
+            data.talker_partial_text_chunk_wait_skips = 0
 
     def _requests_ready_for_decode(self, requests: list) -> bool:
         return all(
@@ -463,6 +938,110 @@ class QwenTalkerModelRunner(ModelRunner):
         )
 
     @staticmethod
+    def _take_next_qwen35_external_decode_input_embed(
+        *,
+        data: Any,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        pending_feedback_queue = getattr(data, "pending_feedback_queue", None)
+        feedback = QwenTalkerModelRunner._peek_left(pending_feedback_queue)
+        if feedback is None:
+            data.last_talker_decode_input_kind = None
+            data.last_talker_decode_should_emit = True
+            return None
+
+        pending_text_queue = getattr(data, "pending_text_queue", None)
+        input_kind = "feedback"
+        should_emit = True
+
+        text_chunk_remaining = int(
+            getattr(data, "talker_text_chunk_remaining", 0) or 0
+        )
+        if text_chunk_remaining > 0:
+            row = QwenTalkerModelRunner._pop_left(pending_text_queue)
+            if row is None:
+                data.talker_text_chunk_remaining = 0
+                data.last_talker_decode_input_kind = None
+                data.last_talker_decode_should_emit = True
+                return None
+            input_kind = "text"
+            data.talker_text_chunk_remaining = text_chunk_remaining - 1
+            drop_count = int(getattr(data, "talker_text_outputs_to_drop", 0) or 0)
+            # Qwen3.5 drops the boundary step and the first N-1 text-conditioning
+            # outputs for an N-token external chunk. The Nth text step produces
+            # the first audible codec for that chunk; subsequent feedback steps
+            # produce the rest.
+            should_emit = drop_count <= 0
+            if drop_count > 0:
+                data.talker_text_outputs_to_drop = drop_count - 1
+            else:
+                data.talker_text_outputs_to_drop = 0
+            if data.talker_text_chunk_remaining <= 0:
+                data.talker_text_feedback_countdown = max(
+                    0,
+                    int(getattr(data, "talker_text_feedback_stride", 0) or 0),
+                )
+        elif pending_text_queue:
+            countdown = int(getattr(data, "talker_text_feedback_countdown", 0) or 0)
+            if countdown > 0:
+                data.talker_text_feedback_countdown = countdown - 1
+                row = feedback
+            else:
+                chunk_size = max(
+                    1,
+                    int(getattr(data, "talker_text_chunk_size", 1) or 1),
+                )
+                available = len(pending_text_queue)
+                if available <= 0:
+                    data.last_talker_decode_input_kind = None
+                    data.last_talker_decode_should_emit = True
+                    return None
+                if (
+                    available < chunk_size
+                    and not getattr(data, "thinker_chunks_done", False)
+                    and QwenTalkerModelRunner._partial_text_chunk_ready_reason(data)
+                    is None
+                ):
+                    data.last_talker_decode_input_kind = None
+                    data.last_talker_decode_should_emit = True
+                    return None
+                else:
+                    QwenTalkerModelRunner._reset_partial_text_chunk_wait(data)
+                    rows_in_chunk = min(chunk_size, available)
+                    data.talker_text_chunk_remaining = rows_in_chunk
+                    data.talker_text_outputs_to_drop = max(0, rows_in_chunk - 1)
+                    # Qwen3.5 keeps one feedback-token step at the external-data
+                    # boundary, drops that codec from user-visible output, then
+                    # consumes the incoming text rows on following decode steps.
+                    # Keeping the dropped boundary step preserves the talker state
+                    # seen by the next emitted codec.
+                    input_kind = "boundary_feedback"
+                    should_emit = False
+                    row = feedback
+        elif not getattr(data, "thinker_chunks_done", False):
+            if not _QWEN35_ALLOW_EMPTY_TEXT_FEEDBACK:
+                data.last_talker_decode_input_kind = None
+                data.last_talker_decode_should_emit = True
+                return None
+            countdown = int(getattr(data, "talker_text_feedback_countdown", 0) or 0)
+            if countdown <= 0:
+                if not _QWEN35_ALLOW_UNBOUNDED_EMPTY_TEXT_FEEDBACK:
+                    data.last_talker_decode_input_kind = None
+                    data.last_talker_decode_should_emit = True
+                    return None
+            else:
+                data.talker_text_feedback_countdown = countdown - 1
+            row = feedback
+        else:
+            row = feedback
+
+        QwenTalkerModelRunner._pop_left(pending_feedback_queue)
+        data.last_talker_decode_input_kind = input_kind
+        data.last_talker_decode_should_emit = should_emit
+        return QwenTalkerModelRunner._decode_row(row, device=device, dtype=dtype)
+
+    @staticmethod
     def _take_next_decode_input_embed(
         *,
         sched_req: Any,
@@ -470,17 +1049,31 @@ class QwenTalkerModelRunner(ModelRunner):
         dtype: torch.dtype,
     ) -> torch.Tensor | None:
         data = sched_req.data
+        if (
+            getattr(data, "talker_decode_input_mode", "sum")
+            == _QWEN35_EXTERNAL_DECODE_INPUT_MODE
+        ):
+            return QwenTalkerModelRunner._take_next_qwen35_external_decode_input_embed(
+                data=data,
+                device=device,
+                dtype=dtype,
+            )
+
         combined = QwenTalkerModelRunner._combine_feedback_with_next_text(
             data=data,
             device=device,
             dtype=dtype,
         )
         if combined is None:
+            data.last_talker_decode_input_kind = None
             return None
 
         QwenTalkerModelRunner._pop_left(getattr(data, "pending_feedback_queue", None))
         if getattr(data, "pending_text_queue", None):
             QwenTalkerModelRunner._pop_left(data.pending_text_queue)
+            data.last_talker_decode_input_kind = "sum_text"
+        else:
+            data.last_talker_decode_input_kind = "sum_pad"
         return combined
 
     def _forward_with_input_embeds(

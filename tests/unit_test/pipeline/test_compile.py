@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import pytest
 
-from sglang_omni.config.schema import EndpointsConfig, PipelineConfig
+from sglang_omni.config.schema import (
+    EndpointsConfig,
+    PipelineConfig,
+    PlacementConfig,
+    RelayConfig,
+)
 from sglang_omni.pipeline.mp_runner import (
     _build_stage_groups,
+    _resolve_relay_config,
     _resolve_same_process_targets,
 )
 from sglang_omni.pipeline.runtime_config import prepare_pipeline_runtime
@@ -167,6 +173,32 @@ def test_runner_specs_wire_same_process_targets_only_for_local_edges() -> None:
 
     assert specs["a"].same_process_targets == {"b"}
     assert specs["b"].same_process_targets == set()
+
+
+def test_runner_specs_wire_same_gpu_payload_targets_for_static_next_edges() -> None:
+    config = PipelineConfig(
+        model_path="model",
+        placement=PlacementConfig(require_memory_fraction_for_colocation=False),
+        stages=[
+            stage("aggregate", next=["thinker", "talker"], gpu=0, process="agg"),
+            stage("thinker", terminal=True, gpu=0, process="thinker"),
+            stage("talker", terminal=True, gpu=1, process="talker"),
+        ],
+    )
+    prep = prepare_pipeline_runtime(config)
+    groups = _build_stage_groups(
+        config,
+        ctx=FakeMpContext(),
+        stages_cfg=prep.stages_cfg,
+        name_map=prep.name_map,
+        endpoints=prep.endpoints,
+        placement_plan=prep.placement_plan,
+        process_plan=prep.process_plan,
+    )
+    specs = {spec.stage_name: spec for group in groups for spec in group.specs}
+
+    assert specs["aggregate"].same_gpu_payload_targets == {"thinker"}
+    assert specs["aggregate"].same_gpu_targets == set()
 
 
 def test_fused_stages_compile_to_same_process_local_edges() -> None:
@@ -362,3 +394,21 @@ def test_mp_runner_keeps_cpu_stage_without_gpu_identity(tmp_path) -> None:
 
     assert group.specs[0].gpu_id is None
     assert group.specs[0].relay_config["gpu_id"] is None
+
+
+def test_resolve_relay_config_preserves_explicit_relay_device() -> None:
+    stage_cfg = stage(
+        "aggregate",
+        gpu=0,
+        relay=RelayConfig(device="cuda:1"),
+        terminal=True,
+    )
+    config = PipelineConfig(
+        model_path="model",
+        relay_backend="nccl",
+        stages=[stage_cfg],
+    )
+
+    relay_config = _resolve_relay_config(stage_cfg, config, gpu_id=0)
+
+    assert relay_config["gpu_id"] == 1

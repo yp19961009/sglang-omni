@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import tempfile
@@ -15,6 +16,23 @@ from sglang_omni.config.schema import PipelineConfig, StageConfig
 from sglang_omni.config.topology import ProcessTopologyPlan, build_process_topology_plan
 
 logger = logging.getLogger(__name__)
+_RELAY_CREDITS_ENV = "SGLANG_OMNI_RELAY_CREDITS"
+_RELAY_SLOT_SIZE_MB_ENV = "SGLANG_OMNI_RELAY_SLOT_SIZE_MB"
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", name, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("Invalid %s=%r; using %s", name, raw, default)
+        return default
+    return value
 
 
 class IpcRuntimeDir:
@@ -59,6 +77,37 @@ class PipelineRuntimePrep:
     runtime_dir_created_here: bool
 
 
+_IPC_PATH_MAX = 104  # Linux sun_path usable length, kept with a safety margin.
+
+
+def _max_socket_filename_len(stages: list[StageConfig]) -> int:
+    names = ["completion.sock", "abort.sock"]
+    names.extend(f"stage_{stage.name}.sock" for stage in stages)
+    names.extend(f"stage_{stage.name}.stream.sock" for stage in stages)
+    # apply_fusion may rename stages after the IPC dir is created; pad a little
+    # so a slightly longer fused socket name still fits under the sun_path cap.
+    return max(len(name) for name in names) + 8
+
+
+def _bound_namespace_prefix(
+    prefix: str, base_root: Path, stages: list[StageConfig]
+) -> str:
+    """Trim the model-derived IPC namespace so socket paths stay bindable.
+
+    The final bind target is "{base_root}/{prefix}-XXXXXXXX/{socket}" where
+    mkdtemp appends a dash and 8 random chars. Long model paths (e.g. the
+    Qwen3.5-Omni 23B checkpoint dir) otherwise overflow the ~108 byte Unix
+    domain socket sun_path limit.
+    """
+    reserved = (
+        len(str(base_root)) + len("/-XXXXXXXX/") + _max_socket_filename_len(stages)
+    )
+    budget = _IPC_PATH_MAX - reserved
+    if budget < 1:
+        return "p"
+    return prefix[:budget].rstrip("-") or "p"
+
+
 def create_ipc_runtime_dir(config: PipelineConfig) -> IpcRuntimeDir:
     """Create a per-run IPC namespace for one pipeline instance."""
     base_root = Path(config.endpoints.base_path)
@@ -67,6 +116,9 @@ def create_ipc_runtime_dir(config: PipelineConfig) -> IpcRuntimeDir:
     namespace_prefix = re.sub(r"[^0-9a-z]+", "-", config.name.lower()).strip("-")
     if not namespace_prefix:
         namespace_prefix = "pipeline"
+    namespace_prefix = _bound_namespace_prefix(
+        namespace_prefix, base_root, config.stages
+    )
     path = Path(tempfile.mkdtemp(prefix=f"{namespace_prefix}-", dir=base_root))
     return IpcRuntimeDir(path)
 
@@ -121,8 +173,11 @@ def build_relay_config(
     if relay_cfg is not None:
         return {
             "relay_type": global_cfg.relay_backend,
-            "slot_size_mb": relay_cfg.slot_size_mb,
-            "credits": relay_cfg.credits,
+            "slot_size_mb": _env_positive_int(
+                _RELAY_SLOT_SIZE_MB_ENV,
+                relay_cfg.slot_size_mb,
+            ),
+            "credits": _env_positive_int(_RELAY_CREDITS_ENV, relay_cfg.credits),
             "rank": relay_cfg.rank,
             "world_size": relay_cfg.world_size,
             "gpu_id": parse_gpu_id(relay_cfg.device),
@@ -141,8 +196,8 @@ def build_relay_config(
 
     return {
         "relay_type": global_cfg.relay_backend,
-        "slot_size_mb": 512,
-        "credits": 2,
+        "slot_size_mb": _env_positive_int(_RELAY_SLOT_SIZE_MB_ENV, 512),
+        "credits": _env_positive_int(_RELAY_CREDITS_ENV, 2),
         "rank": None,
         "world_size": None,
         "gpu_id": gpu_id,
@@ -171,4 +226,7 @@ def allocate_endpoints(
     }
     for stage in stages:
         endpoints[f"stage_{stage.name}"] = f"ipc://{base_dir}/stage_{stage.name}.sock"
+        endpoints[f"stage_stream_{stage.name}"] = (
+            f"ipc://{base_dir}/stage_{stage.name}.stream.sock"
+        )
     return endpoints

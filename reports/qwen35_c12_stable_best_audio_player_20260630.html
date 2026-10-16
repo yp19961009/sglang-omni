@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Qwen3.5-Omni C12 Stable Best Audio</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }
+    body {
+      margin: 0;
+      background: Canvas;
+      color: CanvasText;
+    }
+    main {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    h1 {
+      font-size: 24px;
+      margin: 0 0 8px;
+    }
+    .summary {
+      margin: 0 0 20px;
+      color: color-mix(in srgb, CanvasText 72%, Canvas 28%);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+    th,
+    td {
+      border-top: 1px solid color-mix(in srgb, CanvasText 18%, Canvas 82%);
+      padding: 10px 8px;
+      vertical-align: top;
+      text-align: left;
+    }
+    th {
+      font-size: 13px;
+      color: color-mix(in srgb, CanvasText 70%, Canvas 30%);
+      font-weight: 600;
+    }
+    .sample {
+      width: 88px;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .duration {
+      width: 84px;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .player {
+      width: 300px;
+    }
+    audio {
+      width: 100%;
+      min-width: 220px;
+    }
+    .text {
+      word-break: break-word;
+    }
+    @media (max-width: 720px) {
+      main {
+        padding: 16px;
+      }
+      table,
+      thead,
+      tbody,
+      tr,
+      th,
+      td {
+        display: block;
+      }
+      thead {
+        display: none;
+      }
+      tr {
+        border-top: 1px solid color-mix(in srgb, CanvasText 18%, Canvas 82%);
+        padding: 12px 0;
+      }
+      td {
+        border: 0;
+        padding: 4px 0;
+      }
+      .sample,
+      .duration,
+      .player {
+        width: auto;
+      }
+      .sample::before {
+        content: "sample: ";
+        color: color-mix(in srgb, CanvasText 62%, Canvas 38%);
+      }
+      .duration::before {
+        content: "duration: ";
+        color: color-mix(in srgb, CanvasText 62%, Canvas 38%);
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Qwen3.5-Omni C12 Stable Best Audio</h1>
+    <p class="summary">
+      Run: <code>stable_best_sil672</code>. 12 concurrent requests, 40 chunks, 12 wav outputs.
+      Best actual elapsed: 36.188s. These files are local copies under
+      <code>reports/audio/stable_best_sil672</code>.
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th class="sample">Sample</th>
+          <th class="duration">Duration</th>
+          <th class="player">Audio</th>
+          <th>Text</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="sample">sample_00</td>
+          <td class="duration">9.68s</td>
+          <td class="player"><audio controls preload="metadata" src="audio/stable_best_sil672/sample_00/sg_c12_s000_6f074ede-2d97-4ed0-b549-f297ba24421b.wav"></audio></td>
+          <td class="text">我叫千问，是阿里巴巴集团旗下的通义实验室自主研发的多模态超大规模语言模型，有什么我可以帮助你的吗？</td>
+        </tr>
+        <tr>
+          <td class="sample">sample_01</td>
+          <td class="duration">9.04s</td>
+          <td class="player"><audio controls preload="metadata" src="audio/stable_best_sil672/sample_01/sg_c12_s001_753344fc-e4ef-482d-b0ad-5d24967f4374.wav"></audio></td>
+          <td class="text">我叫千问，是阿里巴巴集团旗下的通义实验室自主研发的多模态超大规模语言模型，有什么我可以帮助你的吗？</td>
+        </tr>
+        <tr>
+          <td class="sample">sample_02</td>
+          <td class="duration">8.80s</td>
+          <td class="player"><audio controls preload="metadata" src="audio/stable_best_sil672/sample_02/sg_c12_s002_db0ba9e2-1ae3-48d5-8163-5da756c74a54.wav"></audio></td>
+          <td class="text">千问，是阿里巴巴集团旗下的通义实验室自主研发的多模态超大规模语言模型，有什么我可以帮助你的吗？</td>
+        </tr>
+        <tr>
+          <td class="sample">sample_03</td>
+          <td class="duration">8.88s</td>
+          <td class="player"><audio controls preload="metadata" src="audio/stable_best_sil672/sample_03/sg_c12_s003_e130961f-5108-4858-9ed9-b600ad0394ea.wav"></audio></td>
+          <td class="text">我叫千问，是阿里巴巴集团旗下的通义实验室自主研发的多模态超大规模语言模型，有什么我可以帮助你的吗？</td>
+        </tr>
+        <tr>
+          <td class="sample">sample_04</td>
+          <td class="duration">9.36s</td>
+          <td class="player"><audio controls preload="metadata" src="audio/stable_best_sil672/sample_04/sg_c12_s004_cb586d43-01fd-431d-acb9-05c80e459d15.wav"></audio></td>
+          <td class="text">我叫通义千问Omni，是阿里巴巴集团旗下的通义实验室自主研发的多模态超大规模语言模型，有什么我可以帮助你的吗？</td>
+        </tr>
+        <tr>
+          <td class="sample">sample_05</td>
+          <td class="duration">10.32s</td>
+          <td class="player"><audio controls preload="metadata" src="audio/stable_best_sil672/sample_05/sg_c12_s005_0c924687-230a-416d-85e1-12d676dbda44.wav"></audio></td>
+          <td class="text">我叫千问多模态大模型，是阿里巴巴集团旗下的通义实验室自主研发的多模态超大规模语言模型，有什么我可以帮助你的吗？</td>
+        </tr>
+        <tr>
+          <td class="sample">sample_06</td>
+          <td class="duration">10.56s</td>
+          <td class="player"><audio controls preload="metadata" src="audio/stable_best_sil672/sample_06/sg_c12_s006_f4684f79-3c6c-4bd6-a212-b5047fc0ae99.wav"></audio></td>
+          <td class="text">我叫千问多模态大模型，是阿里巴巴集团旗下的通义实验室自主研发的多模态超大规模语言模型，有什么我可以帮助你的吗？</td>
+        </tr>
+        <tr>
+          <td class="sample">sample_07</td>
+          <td class="duration">8.40s</td>
+          <td class="player"><audio controls preload="metadata" src="audio/stable_best_sil672/sample_07/sg_c12_s007_4f5bfd4a-a299-42ea-af86-1bae9c7a1b58.wav"></audio></td>
+          <td class="text">我叫千问，是阿里巴巴集团旗下的通义实验室自主研发的多模态超大规模语言模型，有什么我可以帮助你的吗？</td>
+        </tr>
+        <tr>
+          <td class="sample">sample_08</td>
+          <td class="duration">9.20s</td>
+          <td class="player"><audio controls preload="metadata" src="audio/stable_best_sil672/sample_08/sg_c12_s008_2173b1a8-977f-4a6e-968b-5f278e9e8eea.wav"></audio></td>
+          <td class="text">我叫千问，是阿里巴巴集团旗下的通义实验室自主研发的多模态超大规模语言模型，有什么我可以帮助你的吗？</td>
+        </tr>
+        <tr>
+          <td class="sample">sample_09</td>
+          <td class="duration">8.32s</td>
+          <td class="player"><audio controls preload="metadata" src="audio/stable_best_sil672/sample_09/sg_c12_s009_0cae33d7-35b5-4743-bb6b-a1caf2cc9fd8.wav"></audio></td>
+          <td class="text">我叫千问，是阿里巴巴集团旗下的通义实验室自主研发的多模态超大规模语言模型，有什么我可以帮助你的吗？</td>
+        </tr>
+        <tr>
+          <td class="sample">sample_10</td>
+          <td class="duration">8.40s</td>
+          <td class="player"><audio controls preload="metadata" src="audio/stable_best_sil672/sample_10/sg_c12_s010_1735a574-31f7-4bc2-acf2-76dc9772b660.wav"></audio></td>
+          <td class="text">我叫通义千问Omni，是阿里巴巴集团旗下的通义实验室自主研发的多模态超大规模语言模型，有什么我可以帮助你的吗？</td>
+        </tr>
+        <tr>
+          <td class="sample">sample_11</td>
+          <td class="duration">6.64s</td>
+          <td class="player"><audio controls preload="metadata" src="audio/stable_best_sil672/sample_11/sg_c12_s011_d197e09b-c1e9-43b9-b993-9d4a58204f2b.wav"></audio></td>
+          <td class="text">我叫Qwen3.5，是阿里巴巴最新推出的通义千问大语言模型。有什么我可以帮助你的吗？</td>
+        </tr>
+      </tbody>
+    </table>
+  </main>
+</body>
+</html>

@@ -934,6 +934,75 @@ def test_stage_preserves_relay_order_when_target_also_receives_stream() -> None:
     asyncio.run(_run())
 
 
+def test_stage_uses_cuda_ipc_for_same_gpu_payload(monkeypatch) -> None:
+    async def _run() -> None:
+        relay = FakeRelay()
+        control_plane = RecordingStageControlPlane()
+        payload = make_stage_payload(request_id="req-ipc", data={"x": 1})
+        ipc_metadata = {"_payload_ipc": True, "payload_bytes": b"ipc"}
+        monkeypatch.setattr(
+            relay_io,
+            "should_use_cuda_ipc_payload",
+            lambda candidate: candidate is payload,
+        )
+        monkeypatch.setattr(
+            relay_io,
+            "serialize_ipc_payload",
+            lambda candidate: ipc_metadata,
+        )
+        sender = make_stage(
+            name="aggregate",
+            endpoints={"thinker": "inproc://thinker"},
+            relay=relay,
+            control_plane=control_plane,
+            same_gpu_payload_targets={"thinker"},
+        )
+
+        await sender._send_to_stage("req-ipc", "thinker", payload)
+
+        assert relay.storage == {}
+        assert len(control_plane.sent_to_stage) == 1
+        target, endpoint, msg = control_plane.sent_to_stage[0]
+        assert target == "thinker"
+        assert endpoint == "inproc://thinker"
+        assert msg.shm_metadata is ipc_metadata
+
+    asyncio.run(_run())
+
+
+def test_stage_receives_cuda_ipc_payload_without_relay(monkeypatch) -> None:
+    async def _run() -> None:
+        relay = FakeRelay()
+        scheduler = FakeScheduler()
+        payload = make_stage_payload(request_id="req-ipc", data={"x": 1})
+        monkeypatch.setattr(
+            relay_io,
+            "deserialize_ipc_payload",
+            lambda metadata: payload,
+        )
+        receiver = make_stage(
+            name="thinker",
+            relay=relay,
+            scheduler=scheduler,
+        )
+
+        await receiver._on_data_ready(
+            DataReadyMessage(
+                request_id="req-ipc",
+                from_stage="aggregate",
+                to_stage="thinker",
+                shm_metadata={"_payload_ipc": True, "payload_bytes": b"ipc"},
+            )
+        )
+
+        assert relay.storage == {}
+        queued = scheduler.inbox.get_nowait()
+        assert queued.type == "new_request"
+        assert queued.data is payload
+
+    asyncio.run(_run())
+
+
 def test_stage_local_object_requires_registered_target() -> None:
     async def _run() -> None:
         sender = make_stage(

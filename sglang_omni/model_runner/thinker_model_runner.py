@@ -6,7 +6,9 @@ visual embeddings for Qwen3-Omni's thinker stage.
 """
 from __future__ import annotations
 
+import inspect
 import logging
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -43,8 +45,8 @@ class ThinkerModelRunner(ModelRunner):
 
     def execute(self, scheduler_output: Any):
         capture_layers = getattr(self._text_model, "layers_to_capture", None)
-        if capture_layers and not self._batch_should_capture_hidden(
-            scheduler_output.requests
+        if capture_layers and not self._scheduler_output_should_capture_hidden(
+            scheduler_output
         ):
             saved_capture_layers = list(capture_layers)
             self._text_model.layers_to_capture = []
@@ -53,6 +55,26 @@ class ThinkerModelRunner(ModelRunner):
             finally:
                 self._text_model.layers_to_capture = saved_capture_layers
         return super().execute(scheduler_output)
+
+    def _scheduler_output_should_capture_hidden(self, scheduler_output: Any) -> bool:
+        if self._skip_prefill_hidden_capture_enabled():
+            batch = getattr(scheduler_output, "batch_data", None)
+            forward_mode = getattr(batch, "forward_mode", None)
+            is_prefill = bool(
+                forward_mode is not None
+                and callable(getattr(forward_mode, "is_extend", None))
+                and forward_mode.is_extend()
+            )
+            if is_prefill:
+                return False
+        return self._batch_should_capture_hidden(scheduler_output.requests)
+
+    @staticmethod
+    def _skip_prefill_hidden_capture_enabled() -> bool:
+        value = os.getenv("SGLANG_OMNI_SKIP_PREFILL_HIDDEN_CAPTURE")
+        if value is None:
+            return False
+        return value.strip().lower() in {"1", "true", "yes", "on"}
 
     def _batch_should_capture_hidden(self, requests: list[Any]) -> bool:
         if self._should_capture_hidden is None:
@@ -99,6 +121,85 @@ class ThinkerModelRunner(ModelRunner):
     # Multimodal embedding injection (~160 lines, from SGLangModelRunner)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _request_prefix_len(req: Any, forward_batch: Any, req_index: int) -> int:
+        prefix_indices = getattr(req, "prefix_indices", None)
+        if prefix_indices is not None:
+            return len(prefix_indices)
+
+        prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        if prefix_lens is not None and req_index < len(prefix_lens):
+            return int(prefix_lens[req_index])
+
+        return 0
+
+    @staticmethod
+    def _count_prefix_tokens(req: Any, match_ids: set[int], prefix_len: int) -> int:
+        if prefix_len <= 0 or not match_ids:
+            return 0
+        origin_input_ids = getattr(req, "origin_input_ids", None) or []
+        return sum(
+            1
+            for token_id in origin_input_ids[:prefix_len]
+            if int(token_id) in match_ids
+        )
+
+    @staticmethod
+    def _iter_deepstack_input_layers(value: Any):
+        if value is None:
+            return
+        if isinstance(value, dict):
+            for key, tensor in value.items():
+                if isinstance(tensor, torch.Tensor):
+                    yield key, tensor
+            return
+        if isinstance(value, (list, tuple)):
+            for idx, tensor in enumerate(value):
+                if isinstance(tensor, torch.Tensor):
+                    yield f"deepstack_input_embeds_{idx}", tensor
+            return
+        if isinstance(value, torch.Tensor):
+            if value.ndim >= 3:
+                for idx in range(int(value.shape[0])):
+                    yield f"deepstack_input_embeds_{idx}", value[idx]
+            else:
+                yield "deepstack_input_embeds_0", value
+
+    def _initial_omni_consumed(
+        self,
+        req: Any,
+        omni_inputs: dict[str, Any],
+        pad_values: dict[str, Any],
+        prefix_len: int,
+    ) -> dict[str, int]:
+        consumed: dict[str, int] = {}
+
+        for modality, token_id in [
+            ("image", self._image_token_id),
+            ("video", self._video_token_id),
+            ("audio", self._audio_token_id),
+        ]:
+            if omni_inputs.get(f"{modality}_embeds") is None:
+                continue
+            match_id = int(pad_values.get(modality, token_id))
+            prefix_count = self._count_prefix_tokens(req, {match_id}, prefix_len)
+            if prefix_count:
+                consumed[modality] = prefix_count
+
+        has_flat_deepstack = omni_inputs.get("deepstack_visual_embeds") is not None
+        if has_flat_deepstack:
+            visual_ids = {
+                int(pad_values.get("image", self._image_token_id)),
+                int(pad_values.get("video", self._video_token_id)),
+            }
+            visual_prefix_count = self._count_prefix_tokens(
+                req, visual_ids, prefix_len
+            )
+            if visual_prefix_count:
+                consumed["_visual"] = visual_prefix_count
+
+        return consumed
+
     def _inject_multimodal_embeds(
         self, forward_batch: Any, schedule_batch: Any
     ) -> tuple[torch.Tensor | None, list | None, torch.Tensor | None] | None:
@@ -124,6 +225,7 @@ class ThinkerModelRunner(ModelRunner):
 
         deepstack_visual_embeds_list = []
         visual_pos_masks_list = []
+        deepstack_input_entries: dict[Any, list[tuple[int, int, torch.Tensor]]] = {}
         has_deepstack = False
 
         for i, req in enumerate(schedule_batch.reqs):
@@ -134,9 +236,16 @@ class ThinkerModelRunner(ModelRunner):
             start = offsets[i]
             end = start + extend_lens[i]
             req_input_ids = forward_batch.input_ids[start:end]
-            consumed = req._omni_consumed or {}
             chunk_offsets: dict[str, tuple[int, int]] = {}
             pad_values = omni_inputs.get("pad_values", {})
+            prefix_len: int | None = None
+            if req._omni_consumed is None:
+                prefix_len = self._request_prefix_len(req, forward_batch, i)
+                consumed = self._initial_omni_consumed(
+                    req, omni_inputs, pad_values, prefix_len
+                )
+            else:
+                consumed = dict(req._omni_consumed)
 
             for modality, token_id in [
                 ("image", image_token_id),
@@ -160,6 +269,31 @@ class ThinkerModelRunner(ModelRunner):
                 consumed[modality] = offset + n_tokens
 
             req._omni_consumed = consumed
+
+            deepstack_input_embeds = omni_inputs.get("deepstack_input_embeds")
+            if deepstack_input_embeds is not None:
+                token_offset = getattr(req, "_omni_deepstack_consumed", None)
+                if token_offset is None:
+                    if prefix_len is None:
+                        prefix_len = self._request_prefix_len(req, forward_batch, i)
+                    token_offset = int(prefix_len)
+                token_count = int(end - start)
+                token_end = int(token_offset) + token_count
+                for key, layer in self._iter_deepstack_input_layers(
+                    deepstack_input_embeds
+                ):
+                    layer = layer.reshape(-1, layer.shape[-1])
+                    chunk = layer[int(token_offset) : token_end]
+                    if int(chunk.shape[0]) != token_count:
+                        raise ValueError(
+                            "Qwen thinker deepstack_input_embeds slice mismatch: "
+                            f"key={key!r} offset={int(token_offset)} "
+                            f"tokens={token_count} available={int(layer.shape[0])}"
+                        )
+                    deepstack_input_entries.setdefault(key, []).append(
+                        (start, end, chunk)
+                    )
+                req._omni_deepstack_consumed = token_end
 
             ds_embeds = omni_inputs.get("deepstack_visual_embeds")
             image_ds = omni_inputs.get("image_deepstack_visual_embeds")
@@ -232,6 +366,7 @@ class ThinkerModelRunner(ModelRunner):
             if req.is_chunked == 0:
                 req.omni_model_inputs = None
                 req._omni_consumed = None
+                req._omni_deepstack_consumed = None
 
         ds_embeds_out = None
         visual_masks_out = None
@@ -256,12 +391,38 @@ class ThinkerModelRunner(ModelRunner):
                 ds_embeds_out = merged_ds
                 visual_masks_out = combined_mask
 
-        return input_embeds, ds_embeds_out, visual_masks_out
+        deepstack_input_embeds_out = None
+        if deepstack_input_entries:
+            total_tokens = int(forward_batch.input_ids.shape[0])
+            deepstack_input_embeds_out = {}
+            for key, entries in deepstack_input_entries.items():
+                template = entries[0][2]
+                full = torch.zeros(
+                    (total_tokens, int(template.shape[-1])),
+                    device=device,
+                    dtype=input_embeds.dtype,
+                )
+                for entry_start, entry_end, chunk in entries:
+                    full[entry_start:entry_end] = chunk.to(
+                        device=device,
+                        dtype=input_embeds.dtype,
+                    )
+                deepstack_input_embeds_out[key] = full
+
+        return (
+            input_embeds,
+            (
+                deepstack_input_embeds_out
+                if deepstack_input_embeds_out is not None
+                else ds_embeds_out
+            ),
+            visual_masks_out,
+        )
 
     # ------------------------------------------------------------------
     # Custom forward with multimodal embeddings + deepstack
     # ------------------------------------------------------------------
-
+    @torch.no_grad()
     def _forward_with_omni_embeds(
         self,
         forward_batch,
@@ -279,7 +440,9 @@ class ThinkerModelRunner(ModelRunner):
             positions = forward_batch.mrope_positions
 
         ds_input = None
-        if deepstack_visual_embeds is not None and visual_pos_masks is not None:
+        if deepstack_visual_embeds is not None and visual_pos_masks is None:
+            ds_input = deepstack_visual_embeds
+        elif deepstack_visual_embeds is not None and visual_pos_masks is not None:
             device = input_embeds.device
             dtype = input_embeds.dtype
             layer_tensors = [
@@ -292,18 +455,35 @@ class ThinkerModelRunner(ModelRunner):
             full_ds[visual_pos_masks] = ds_input
             ds_input = full_ds
 
-        hidden_states = outer.model(
-            input_ids=None,
-            positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=input_embeds,
-            input_deepstack_embeds=ds_input,
+        forward_params = inspect.signature(outer.model.forward).parameters
+        accepts_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in forward_params.values()
         )
+        model_kwargs = {
+            "input_ids": None,
+            "positions": positions,
+            "forward_batch": forward_batch,
+        }
+        if "inputs_embeds" in forward_params or accepts_kwargs:
+            model_kwargs["inputs_embeds"] = input_embeds
+        else:
+            model_kwargs["input_embeds"] = input_embeds
+        if ds_input is not None:
+            if "deepstack_input_embeds" in forward_params or accepts_kwargs:
+                model_kwargs["deepstack_input_embeds"] = ds_input
+            elif "input_deepstack_embeds" in forward_params:
+                model_kwargs["input_deepstack_embeds"] = ds_input
 
-        logits_output = outer.logits_processor(
+        hidden_states = outer.model(**model_kwargs)
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+
+        logits_model = getattr(outer, "language_model", outer)
+        logits_output = logits_model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
-            outer.lm_head,
+            logits_model.lm_head,
             forward_batch,
         )
 

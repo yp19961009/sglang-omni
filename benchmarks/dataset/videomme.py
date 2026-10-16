@@ -168,11 +168,21 @@ def _build_sample_kwargs(row, *, question_id: str, video_path: str) -> dict:
     }
 
 
-def _dataset_to_samples(dataset, *, max_samples: int | None, build_sample):
+def _dataset_to_samples(
+    dataset,
+    *,
+    max_samples: int | None,
+    sample_offset: int = 0,
+    build_sample,
+):
     samples: list[VideoMMESample] = []
+    skipped_valid = 0
     for row_index, row in enumerate(dataset):
         sample = build_sample(row_index, row)
         if sample is None:
+            continue
+        if skipped_valid < sample_offset:
+            skipped_valid += 1
             continue
         samples.append(sample)
         if max_samples is not None and len(samples) >= max_samples:
@@ -206,6 +216,7 @@ def load_videomme_samples(
     *,
     repo_id: str | None = None,
     split: str = "test",
+    sample_offset: int = 0,
 ) -> list[VideoMMESample]:
     resolved_repo_id = repo_id or DEFAULT_REPO_ID
     snapshot_dir = Path(
@@ -233,6 +244,7 @@ def load_videomme_samples(
     samples = _dataset_to_samples(
         dataset,
         max_samples=max_samples,
+        sample_offset=sample_offset,
         build_sample=build_sample,
     )
     logger.info(f"Loaded {len(samples)} Video-MME samples")
@@ -244,6 +256,7 @@ def load_videoamme_samples(
     *,
     repo_id: str | None = None,
     split: str = "test",
+    sample_offset: int = 0,
 ) -> list[VideoAMMESample]:
     resolved_repo_id = repo_id or DEFAULT_VIDEOAMME_REPO_ID
     snapshot_dir = _snapshot_dir(resolved_repo_id)
@@ -269,6 +282,7 @@ def load_videoamme_samples(
     samples = _dataset_to_samples(
         dataset,
         max_samples=max_samples,
+        sample_offset=sample_offset,
         build_sample=build_sample,
     )
     logger.info("Loaded %d Video-AMME samples", len(samples))

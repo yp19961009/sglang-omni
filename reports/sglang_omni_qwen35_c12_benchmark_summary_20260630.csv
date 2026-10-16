@@ -1,0 +1,19 @@
+run,status,selected,completed,failed,actual_elapsed_s,ttft_avg_ms,ttft_p99_ms,ttfa_avg_ms,ttfa_p99_ms,last_audio_avg_ms,last_audio_p99_ms,e2e_avg_ms,e2e_p99_ms,audio_duration_avg_s,bang_count,note
+sg_mem080_c2w4_best_run12,valid,yes,12,0,36.188,7808.845,12813.277,10013.029,10067.803,24275.350,27465.785,33794.737,36180.092,8.967,0,current overall best
+sg_mem080_c2w4_profile,valid,no,12,0,36.637,7700.349,16892.954,10007.168,10058.165,28353.527,32864.698,34465.752,36625.400,9.300,0,profile run for stage analysis
+sg_mem080_c2w4_trimpartial_sil712,valid,no,12,0,36.639,9559.216,11654.261,12005.846,12472.420,27338.002,31411.020,34503.004,36629.714,9.047,0,post-fix validation
+sg_mem080_c2w4_trimpartial_sil724,valid,no,12,0,37.314,10573.433,17901.535,10791.364,12761.604,28875.111,33975.936,33421.284,37302.095,8.700,0,independent offset validation
+sg_mem080_c2w4_post_commit_sil672,valid,no,12,0,38.776,9961.157,16504.078,11899.373,13906.542,25306.965,30541.845,31685.279,38764.072,8.873,0,clean restart validation at commit 6115ffd
+sg_mem080_c2w4_warmed_sil672_same_offset,cache_warmed_upper_bound,no,12,0,29.848,7226.803,11231.070,7438.401,10471.216,15308.464,18952.963,21092.356,29836.452,9.173,0,same-offset warmed upper bound; not selected as stable because independent sil680 failed
+sg_mem080_c2w4_sil680_independent_failed,failed,no,0,12,12.733,,,,,,,,,,0,different offset after warmed sil672 failed with payload incomplete and GPU0 OOM
+sg_mem080_c2w4_trimpartial_sil732,valid,no,12,0,36.782,8454.135,13943.093,9377.062,12431.207,26639.250,32686.237,31025.279,36769.404,8.907,0,same-offset baseline for wait20
+prefillwait20_sil732,valid_not_selected,no,12,0,36.698,10410.800,14946.814,11498.963,13969.273,25217.779,31078.151,30537.915,36685.809,9.173,0,tail slightly better but TTFT/TTFA worse
+prefillwait20_sil672,failed,no,0,12,13.451,,,,,,,,,,0,thinker scheduler crash committed KV cache already freed
+sg_mem080_c2w2_ttfa,valid_ttfa_variant,no,12,0,37.752,,,8767.781,,26802.252,,34110.671,,,0,TTFA better but tail and actual worse
+sg_mem084_c2w4,valid_not_selected,no,12,0,36.829,7262.232,,10283.129,,27262.971,,34508.305,,,0,TTFT improves but tail worse and less memory headroom
+sg_partial_text,negative,no,12,0,38.980,,,11665.092,,30620.868,,36931.138,,,0,partial text handoff negative
+mem084_c2w2,failed,no,,,,,,,,,,,,,,prerun OOM
+code2wav_dynamic_chunk,invalid,no,,,,,,,,,,,,,,actual stalled with torch inductor compile workers
+vllm_rtc_trunk40_c12_rerun_fa3off_20260624_214308,reference,no,,,,1911.015,2674.077,2511.764,3406.268,,,,,,,vLLM reference
+vllm_rtc_trunk40_c12_mt64_compile_fa3off_20260624_114111,reference,no,,,,1565.571,2785.816,3168.279,5665.678,,,,,,,vLLM reference
+vllm_rtc_trunk40_c12_current_fa3off_20260626_211730,reference,no,,,,1990.025,3131.819,2616.778,3647.978,,,,,,,vLLM reference

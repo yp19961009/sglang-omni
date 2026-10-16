@@ -40,6 +40,7 @@ class SimpleScheduler:
         request_cost_fn: Callable[[Any], int] | None = None,
         max_batch_cost: int | None = None,
         max_concurrency: int = 1,
+        priority_fn: Callable[[IncomingMessage], bool] | None = None,
         abort_callback: Callable[[str], None] | None = None,
     ):
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
@@ -53,6 +54,7 @@ class SimpleScheduler:
         self._max_batch_cost = (
             max(int(max_batch_cost), 0) if max_batch_cost is not None else None
         )
+        self._priority_fn = priority_fn
         # Note (Chenchen, Chenyang):
         # max_concurrency > 1 spawns N worker coroutines that dispatch compute_fn
         # via asyncio.to_thread so synchronous chunks do not pin the event loop.
@@ -68,6 +70,30 @@ class SimpleScheduler:
         self._abort_lock = threading.Lock()
         self._running = False
         self._pending_messages: collections.deque[IncomingMessage] = collections.deque()
+
+    def _is_priority_message(self, msg: IncomingMessage) -> bool:
+        if self._priority_fn is None:
+            return False
+        try:
+            return bool(self._priority_fn(msg))
+        except Exception:
+            logger.exception("SimpleScheduler: priority_fn failed for %s", msg.request_id)
+            return False
+
+    def _pop_pending_priority(self) -> IncomingMessage | None:
+        if self._priority_fn is None:
+            return None
+        kept: collections.deque[IncomingMessage] = collections.deque()
+        priority_msg: IncomingMessage | None = None
+        while self._pending_messages:
+            msg = self._pending_messages.popleft()
+            if self._is_priority_message(msg):
+                priority_msg = msg
+                break
+            kept.append(msg)
+        kept.extend(self._pending_messages)
+        self._pending_messages = kept
+        return priority_msg
 
     def _cleanup_aborted_request(self, request_id: str) -> None:
         if self._abort_callback is None:
@@ -91,42 +117,88 @@ class SimpleScheduler:
         return max(int(self._request_cost_fn(msg.data)), 0)
 
     def _next_message(self) -> IncomingMessage | None:
+        priority_msg = self._pop_pending_priority()
+        if priority_msg is not None:
+            return priority_msg
+
         if self._pending_messages:
-            return self._pending_messages.popleft()
-        try:
-            return self.inbox.get(timeout=0.1)
-        except _queue_mod.Empty:
-            return None
+            msg = self._pending_messages.popleft()
+        else:
+            try:
+                msg = self.inbox.get(timeout=0.1)
+            except _queue_mod.Empty:
+                return None
+
+        if self._priority_fn is None or self._is_priority_message(msg):
+            return msg
+
+        promoted: IncomingMessage | None = None
+        while True:
+            try:
+                queued = self.inbox.get_nowait()
+            except _queue_mod.Empty:
+                break
+            if promoted is None and self._is_priority_message(queued):
+                promoted = queued
+            else:
+                self._pending_messages.append(queued)
+
+        if promoted is not None:
+            self._pending_messages.appendleft(msg)
+            return promoted
+        return msg
 
     def _collect_batch(self, first_msg: IncomingMessage) -> list[IncomingMessage]:
         batch = [first_msg]
         if self._batch_fn is None or self._max_batch_size <= 1:
             return batch
 
+        priority_batch = self._is_priority_message(first_msg)
         batch_cost = self._message_cost(first_msg)
         deadline = time.monotonic() + self._max_batch_wait_s
         while len(batch) < self._max_batch_size:
-            try:
-                msg = self.inbox.get_nowait()
-            except _queue_mod.Empty:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
+            msg = self._pop_pending_priority() if priority_batch else None
+            if msg is not None:
+                pass
+            elif not priority_batch and self._pending_messages:
+                msg = self._pending_messages.popleft()
+            else:
+                msg = None
+
+            if msg is None:
                 try:
-                    msg = self.inbox.get(timeout=remaining)
+                    msg = self.inbox.get_nowait()
                 except _queue_mod.Empty:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        msg = self.inbox.get(timeout=remaining)
+                    except _queue_mod.Empty:
+                        break
+
+            try:
+                msg_priority = self._is_priority_message(msg)
+                if priority_batch and not msg_priority:
+                    self._pending_messages.append(msg)
+                    continue
+                if not priority_batch and msg_priority:
+                    self._pending_messages.appendleft(msg)
                     break
 
-            if msg.type == "new_request":
-                if self._max_batch_cost is not None:
-                    msg_cost = self._message_cost(msg)
-                    if batch and batch_cost + msg_cost > self._max_batch_cost:
-                        self._pending_messages.appendleft(msg)
-                        break
-                    batch_cost += msg_cost
-                batch.append(msg)
-            else:
+                if msg.type == "new_request":
+                    if self._max_batch_cost is not None:
+                        msg_cost = self._message_cost(msg)
+                        if batch and batch_cost + msg_cost > self._max_batch_cost:
+                            self._pending_messages.appendleft(msg)
+                            break
+                        batch_cost += msg_cost
+                    batch.append(msg)
+                else:
+                    self._pending_messages.append(msg)
+            except Exception:
                 self._pending_messages.append(msg)
+                raise
         return batch
 
     @staticmethod
@@ -253,11 +325,8 @@ class SimpleScheduler:
 
         async def bridge_inbox() -> None:
             while self._running:
-                try:
-                    msg = await loop.run_in_executor(
-                        None, lambda: self.inbox.get(timeout=0.05)
-                    )
-                except _queue_mod.Empty:
+                msg = await loop.run_in_executor(None, self._next_message)
+                if msg is None:
                     continue
                 await async_inbox.put(msg)
 

@@ -77,11 +77,226 @@ def _is_bad_request_error(exc: Exception) -> bool:
     return any(marker in message for marker in _BAD_REQUEST_MARKERS)
 
 
+def _default_generation_value(
+    default_generation_params: dict[str, Any] | None,
+    key: str,
+) -> Any:
+    if not default_generation_params:
+        return None
+    return default_generation_params.get(key)
+
+
+def _request_or_default_generation_value(
+    req: Any,
+    key: str,
+    default_generation_params: dict[str, Any] | None = None,
+) -> Any:
+    value = getattr(req, key, None)
+    if value is not None:
+        return value
+    return _default_generation_value(default_generation_params, key)
+
+
+def _chat_effective_max_tokens(
+    req: ChatCompletionRequest,
+    default_generation_params: dict[str, Any] | None = None,
+) -> Any:
+    if req.max_completion_tokens is not None:
+        return req.max_completion_tokens
+    if req.max_tokens is not None:
+        return req.max_tokens
+    default_max_completion_tokens = _default_generation_value(
+        default_generation_params,
+        "max_completion_tokens",
+    )
+    if default_max_completion_tokens is not None:
+        return default_max_completion_tokens
+    return _default_generation_value(default_generation_params, "max_tokens")
+
+
+def _stage_sampling_overrides(raw: Any) -> dict[str, SamplingParams] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("stage_sampling must be a mapping of stage name to params")
+
+    stage_sampling: dict[str, SamplingParams] = {}
+    for stage_name, params_dict in raw.items():
+        if isinstance(params_dict, SamplingParams):
+            stage_sampling[str(stage_name)] = params_dict
+            continue
+        if not isinstance(params_dict, dict):
+            raise ValueError(
+                "stage_sampling values must be SamplingParams or mappings"
+            )
+        stage_sampling[str(stage_name)] = SamplingParams(**params_dict)
+    return stage_sampling or None
+
+
+def _stage_param_overrides(raw: Any) -> dict[str, dict[str, Any]] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("stage_params must be a mapping of stage name to params")
+
+    stage_params: dict[str, dict[str, Any]] = {}
+    for stage_name, params in raw.items():
+        if not isinstance(params, dict):
+            raise ValueError("stage_params values must be mappings")
+        stage_params[str(stage_name)] = dict(params)
+    return stage_params or None
+
+
+def _chat_audio_config(req: ChatCompletionRequest) -> dict[str, Any] | None:
+    if isinstance(req.audio, dict):
+        return req.audio
+    return None
+
+
+def _request_metadata(req: ChatCompletionRequest) -> dict[str, Any]:
+    metadata = req.metadata if isinstance(req.metadata, dict) else None
+    metadata = dict(metadata or {})
+    for key in ("request_id", "user"):
+        value = getattr(req, key, None)
+        if value is not None:
+            metadata[key] = value
+    return metadata
+
+
+def _legacy_functions_as_tools(value: Any) -> list[dict[str, Any]] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return None
+    tools: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        if item.get("type") == "function" and isinstance(item.get("function"), dict):
+            tools.append(dict(item))
+        else:
+            tools.append({"type": "function", "function": dict(item)})
+    return tools
+
+
+def _requested_modalities(req: ChatCompletionRequest) -> list[str]:
+    return list(req.modalities) if req.modalities else ["text"]
+
+
+def _stream_include_usage(req: ChatCompletionRequest) -> bool:
+    stream_options = req.stream_options
+    if not isinstance(stream_options, dict):
+        return False
+    return bool(stream_options.get("include_usage"))
+
+
+def _default_talker_extra_params(
+    default_talker_params: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not default_talker_params:
+        return {}
+    return {
+        key: value for key, value in default_talker_params.items() if value is not None
+    }
+
+
+def _chat_default_talker_extra_params(
+    req: ChatCompletionRequest,
+    default_talker_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    params = _default_talker_extra_params(default_talker_params)
+    audio_config = _chat_audio_config(req)
+    if not isinstance(audio_config, dict):
+        return params
+
+    override_groups = (
+        (("voice_type", "voice", "speaker"), ("voice_type", "voice", "speaker")),
+        (
+            (
+                "language",
+                "lang",
+                "language_id",
+                "language_type",
+                "target_language",
+                "target_lang",
+            ),
+            (
+                "language",
+                "lang",
+                "language_id",
+                "language_type",
+                "target_language",
+                "target_lang",
+            ),
+        ),
+        (("voice_style", "style"), ("voice_style", "style")),
+        (
+            (
+                "instruction",
+                "talker_instruction",
+                "assistant_instruct_ids",
+                "talker_assistant_prompt_ids",
+                "voice_style_ids",
+                "instruct_ids",
+            ),
+            ("instruction", "talker_instruction"),
+        ),
+        (
+            (
+                "xvector_info",
+                "voice_clone_info",
+                "xvector_info_path",
+                "voice_clone_path",
+                "voice_clone",
+            ),
+            (
+                "xvector_info",
+                "voice_clone_info",
+                "xvector_info_path",
+                "voice_clone_path",
+                "voice_clone",
+            ),
+        ),
+    )
+    for default_keys, audio_keys in override_groups:
+        if any(audio_config.get(key) is not None for key in audio_keys):
+            for key in default_keys:
+                params.pop(key, None)
+    return params
+
+
+def _speech_effective_max_new_tokens(
+    req: CreateSpeechRequest,
+    default_generation_params: dict[str, Any] | None = None,
+) -> Any:
+    if req.max_new_tokens is not None:
+        return req.max_new_tokens
+    if req.max_completion_tokens is not None:
+        return req.max_completion_tokens
+    if req.max_tokens is not None:
+        return req.max_tokens
+    default_max_new_tokens = _default_generation_value(
+        default_generation_params,
+        "max_new_tokens",
+    )
+    if default_max_new_tokens is not None:
+        return default_max_new_tokens
+    default_max_completion_tokens = _default_generation_value(
+        default_generation_params,
+        "max_completion_tokens",
+    )
+    if default_max_completion_tokens is not None:
+        return default_max_completion_tokens
+    return _default_generation_value(default_generation_params, "max_tokens")
+
+
 def create_app(
     client: Client,
     *,
     model_name: str | None = None,
     enable_realtime: bool = False,
+    default_talker_params: dict[str, Any] | None = None,
+    default_generation_params: dict[str, Any] | None = None,
 ) -> FastAPI:
     """Create a FastAPI application with OpenAI-compatible endpoints.
 
@@ -90,6 +305,9 @@ def create_app(
         model_name: Default model name to report in responses and /v1/models.
         enable_realtime: If True, mount the WebSocket ``/v1/realtime``
             endpoint (OpenAI Realtime API).
+        default_talker_params: Service-level defaults merged into
+            ``GenerateRequest.extra_params`` for audio-output requests.
+        default_generation_params: Service-level sampling/max-token defaults.
 
     Returns:
         Configured FastAPI application.
@@ -108,6 +326,8 @@ def create_app(
     app.state.client = client
     app.state.model_name = model_name or "sglang-omni"
     app.state.realtime_enabled = enable_realtime
+    app.state.default_talker_params = dict(default_talker_params or {})
+    app.state.default_generation_params = dict(default_generation_params or {})
 
     # Register all routes
     register_favicon(app)
@@ -161,18 +381,28 @@ def _register_chat_completions(app: FastAPI) -> None:
     async def chat_completions(req: ChatCompletionRequest) -> Response:
         client: Client = app.state.client
         default_model: str = app.state.model_name
+        default_talker_params: dict[str, Any] = app.state.default_talker_params
+        default_generation_params: dict[str, Any] = (
+            app.state.default_generation_params
+        )
 
         request_id = req.request_id or str(uuid.uuid4())
         response_id = f"chatcmpl-{request_id}"
         created = int(time.time())
         model = req.model or default_model
 
-        gen_req = _build_chat_generate_request(req)
+        gen_req = _build_chat_generate_request(
+            req,
+            default_model=default_model,
+            default_talker_params=default_talker_params,
+            default_generation_params=default_generation_params,
+        )
 
         # Determine audio format from request
         audio_format = "wav"
-        if req.audio and isinstance(req.audio, dict):
-            audio_format = req.audio.get("format", "wav")
+        audio_config = _chat_audio_config(req)
+        if audio_config is not None:
+            audio_format = audio_config.get("format", "wav")
 
         if req.stream:
             return StreamingResponse(
@@ -228,7 +458,7 @@ async def _chat_non_stream(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    requested_modalities = req.modalities or ["text"]
+    requested_modalities = _requested_modalities(req)
 
     # Build message content
     message: dict[str, Any] = {"role": "assistant"}
@@ -240,8 +470,14 @@ async def _chat_non_stream(
         message["audio"] = {
             "id": result.audio.id,
             "data": result.audio.data,
+            "format": result.audio.format or audio_format,
             "transcript": result.audio.transcript,
         }
+        if result.audio.sample_rate is not None:
+            # When code2wav returns the real sample_rate, expose it in
+            # non-streaming chat responses as well. Preserve response
+            # compatibility when older paths do not provide the field.
+            message["audio"]["sample_rate"] = result.audio.sample_rate
 
     if "content" not in message and "audio" not in message:
         message["content"] = result.text
@@ -263,7 +499,7 @@ async def _chat_non_stream(
             ChatCompletionChoice(
                 index=0,
                 message=message,
-                finish_reason=result.finish_reason,
+                finish_reason=result.finish_reason or "stop",
             )
         ],
         usage=usage,
@@ -284,7 +520,8 @@ async def _chat_stream(
 ):
     """Streaming chat completion generator (yields SSE events)."""
     role_sent = False
-    requested_modalities = req.modalities or ["text"]
+    requested_modalities = _requested_modalities(req)
+    include_usage_chunk = _stream_include_usage(req)
     finish_reason: str | None = None
     final_usage: UsageResponse | None = None
 
@@ -339,6 +576,8 @@ async def _chat_stream(
             delta.audio = ChatCompletionAudio(
                 id=f"audio-{request_id}",
                 data=chunk.audio_b64,
+                format=chunk.audio_format or audio_format,
+                sample_rate=chunk.sample_rate,
             )
             emit = True
 
@@ -375,106 +614,201 @@ async def _chat_stream(
                 finish_reason=finish_reason or "stop",
             )
         ],
-        usage=final_usage,
+        usage=None if include_usage_chunk else final_usage,
     )
     data = finish_resp.model_dump(exclude_none=True)
     for choice in data.get("choices", []):
         choice.setdefault("finish_reason", None)
     yield f"data: {json.dumps(data)}\n\n"
 
+    if include_usage_chunk and final_usage is not None:
+        usage_resp = ChatCompletionStreamResponse(
+            id=response_id,
+            created=created,
+            model=model,
+            choices=[],
+            usage=final_usage,
+        )
+        yield f"data: {json.dumps(usage_resp.model_dump(exclude_none=True))}\n\n"
+
     yield f"data: {STREAM_DONE_SENTINEL}\n\n"
 
 
-def _build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
+def _build_chat_generate_request(
+    req: ChatCompletionRequest,
+    *,
+    default_model: str | None = None,
+    default_talker_params: dict[str, Any] | None = None,
+    default_generation_params: dict[str, Any] | None = None,
+) -> GenerateRequest:
     """Convert a ChatCompletionRequest into a client GenerateRequest."""
     # Parse stop sequences
     stop: list[str] = []
-    if isinstance(req.stop, str):
-        stop = [req.stop]
-    elif isinstance(req.stop, list):
-        stop = list(req.stop)
+    stop_value = _request_or_default_generation_value(
+        req,
+        "stop",
+        default_generation_params,
+    )
+    if isinstance(stop_value, str):
+        stop = [stop_value]
+    elif isinstance(stop_value, list):
+        stop = list(stop_value)
+
+    temperature = _request_or_default_generation_value(
+        req,
+        "temperature",
+        default_generation_params,
+    )
+    top_p = _request_or_default_generation_value(
+        req,
+        "top_p",
+        default_generation_params,
+    )
+    top_k = _request_or_default_generation_value(
+        req,
+        "top_k",
+        default_generation_params,
+    )
+    min_p = _request_or_default_generation_value(
+        req,
+        "min_p",
+        default_generation_params,
+    )
+    repetition_penalty = _request_or_default_generation_value(
+        req,
+        "repetition_penalty",
+        default_generation_params,
+    )
+    frequency_penalty = _request_or_default_generation_value(
+        req,
+        "frequency_penalty",
+        default_generation_params,
+    )
+    presence_penalty = _request_or_default_generation_value(
+        req,
+        "presence_penalty",
+        default_generation_params,
+    )
+    seed = _request_or_default_generation_value(
+        req,
+        "seed",
+        default_generation_params,
+    )
+    max_tokens = _chat_effective_max_tokens(req, default_generation_params)
 
     # Build sampling params
     sampling = SamplingParams(
-        temperature=req.temperature if req.temperature is not None else 1.0,
-        top_p=req.top_p if req.top_p is not None else 1.0,
-        top_k=req.top_k if req.top_k is not None else -1,
-        min_p=req.min_p if req.min_p is not None else 0.0,
+        temperature=temperature if temperature is not None else 1.0,
+        top_p=top_p if top_p is not None else 1.0,
+        top_k=top_k if top_k is not None else -1,
+        min_p=min_p if min_p is not None else 0.0,
         repetition_penalty=(
-            req.repetition_penalty if req.repetition_penalty is not None else 1.0
+            repetition_penalty if repetition_penalty is not None else 1.0
+        ),
+        frequency_penalty=(
+            frequency_penalty if frequency_penalty is not None else 0.0
+        ),
+        presence_penalty=(
+            presence_penalty if presence_penalty is not None else 0.0
         ),
         stop=stop,
-        seed=req.seed,
-        max_new_tokens=req.effective_max_tokens,
+        seed=seed,
+        max_new_tokens=max_tokens,
     )
 
-    # Convert messages
-    messages = [Message(role=m.role, content=m.content) for m in req.messages]
+    # Convert messages. Keep OpenAI tool-call metadata for chat templates that
+    # render multi-turn function-call or MCP conversations.
+    messages = [
+        Message(
+            role=m.role,
+            content=m.content,
+            name=m.name,
+            tool_calls=m.tool_calls,
+            tool_call_id=m.tool_call_id,
+            function_call=m.function_call,
+        )
+        for m in req.messages
+    ]
 
     # Determine output modalities
-    output_modalities = req.modalities or ["text"]  # e.g. ["text", "audio"]
+    output_modalities = _requested_modalities(req)  # e.g. ["text", "audio"]
 
-    # Build per-stage sampling overrides
-    stage_sampling: dict[str, SamplingParams] | None = None
-    if req.stage_sampling:
-        stage_sampling = {}
-        for stage_name, params_dict in req.stage_sampling.items():
-            stage_sampling[stage_name] = SamplingParams(**params_dict)
+    stage_sampling = _stage_sampling_overrides(req.stage_sampling)
+    stage_params = _stage_param_overrides(req.stage_params)
 
     # Extract audios, images, and videos from request
-    audios: list[str] | None = None
-    if req.audios:
-        audios = req.audios
+    audios = list(req.audios) if req.audios else None
+    images = list(req.images) if req.images else None
+    videos = list(req.videos) if req.videos else None
 
-    images: list[str] | None = None
-    if req.images:
-        images = req.images
-
-    videos: list[str] | None = None
-    if req.videos:
-        videos = req.videos
-
-    # Merge audio config, audios, images, and videos into metadata
-    metadata: dict[str, Any] = {}
-    if req.audio:
-        metadata["audio_config"] = req.audio
+    # Merge audio config, audios, images, and videos into metadata.
+    metadata: dict[str, Any] = _request_metadata(req)
+    audio_config = _chat_audio_config(req)
+    if audio_config is not None:
+        metadata["audio_config"] = audio_config
+    tools = req.tools
+    if tools is None:
+        tools = _legacy_functions_as_tools(req.functions)
+    if tools is not None:
+        # Tools are only rendered into the chat template; the server does not
+        # execute them.
+        metadata["tools"] = tools
+    for key in ("tool_choice", "parallel_tool_calls", "function_call"):
+        value = getattr(req, key, None)
+        if value is not None:
+            metadata[key] = value
     if audios:
         metadata["audios"] = audios
     if images:
         metadata["images"] = images
     if videos:
         metadata["videos"] = videos
-    if req.video_fps is not None:
-        metadata["video_fps"] = req.video_fps
-    if req.video_max_frames is not None:
-        metadata["video_max_frames"] = req.video_max_frames
-    if req.video_min_pixels is not None:
-        metadata["video_min_pixels"] = req.video_min_pixels
-    if req.video_max_pixels is not None:
-        metadata["video_max_pixels"] = req.video_max_pixels
-    if req.video_total_pixels is not None:
-        metadata["video_total_pixels"] = req.video_total_pixels
-
-    extra_params: dict[str, Any] = {}
-    for field_name, value in (
-        ("talker_temperature", req.talker_temperature),
-        ("talker_top_p", req.talker_top_p),
-        ("talker_top_k", req.talker_top_k),
-        ("talker_repetition_penalty", req.talker_repetition_penalty),
-        ("talker_max_new_tokens", req.talker_max_new_tokens),
+    for key in (
+        "image_min_pixels",
+        "image_max_pixels",
+        "video_fps",
+        "video_min_frames",
+        "video_max_frames",
+        "video_min_pixels",
+        "video_max_pixels",
+        "video_total_pixels",
+        "use_audio_in_video",
+        "dependent_audio",
+        "video_dependent_audio",
+        "video_seconds_per_chunk",
+        "video_position_id_per_seconds",
+        "return_video_metadata",
+        "video_metadata",
+        "audio_target_sr",
+        "audio_timestamp_interval",
+        "audio_downsample_times",
+        "audio_downsample_chunk_size",
     ):
+        value = getattr(req, key, None)
+        if value is not None:
+            metadata[key] = value
+
+    extra_params = _chat_default_talker_extra_params(req, default_talker_params)
+    for field_name in (
+        "talker_temperature",
+        "talker_top_p",
+        "talker_top_k",
+        "talker_repetition_penalty",
+        "talker_max_new_tokens",
+    ):
+        value = getattr(req, field_name, None)
         if value is not None:
             extra_params[field_name] = value
 
     return GenerateRequest(
-        model=req.model,
+        model=req.model or default_model,
         messages=messages,
         sampling=sampling,
         stage_sampling=stage_sampling,
-        stage_params=req.stage_params,
+        stage_params=stage_params,
         extra_params=extra_params,
         stream=req.stream,
-        max_tokens=req.effective_max_tokens,
+        max_tokens=max_tokens,
         output_modalities=output_modalities,
         metadata=metadata,
     )
@@ -504,10 +838,19 @@ def _register_speech(app: FastAPI) -> None:
     async def create_speech(req: CreateSpeechRequest) -> Response:
         client: Client = app.state.client
         default_model: str = app.state.model_name
+        default_talker_params: dict[str, Any] = app.state.default_talker_params
+        default_generation_params: dict[str, Any] = (
+            app.state.default_generation_params
+        )
 
         request_id = f"speech-{uuid.uuid4()}"
 
-        gen_req = build_speech_generate_request(req, default_model)
+        gen_req = build_speech_generate_request(
+            req,
+            default_model,
+            default_talker_params=default_talker_params,
+            default_generation_params=default_generation_params,
+        )
         if req.stream:
             if req.stream_format == "audio":
                 try:
@@ -740,19 +1083,30 @@ def _select_speech_audio_delta(
 def build_speech_generate_request(
     req: CreateSpeechRequest,
     default_model: str,
+    *,
+    default_talker_params: dict[str, Any] | None = None,
+    default_generation_params: dict[str, Any] | None = None,
 ) -> GenerateRequest:
     """Convert a CreateSpeechRequest into a client GenerateRequest."""
 
     generation_fields = (
+        "max_tokens",
+        "max_completion_tokens",
         "max_new_tokens",
         "temperature",
         "top_p",
         "top_k",
+        "min_p",
         "repetition_penalty",
+        "frequency_penalty",
+        "presence_penalty",
+        "stop",
         "seed",
     )
     explicit_generation_params = sorted(
-        field for field in generation_fields if field in req.model_fields_set
+        field
+        for field in generation_fields
+        if getattr(req, field, None) is not None
     )
     initial_codec_chunk_frames = req.initial_codec_chunk_frames
     if (
@@ -784,28 +1138,87 @@ def build_speech_generate_request(
         tts_params["token_count"] = req.token_count
     if req.duration_tokens is not None:
         tts_params["duration_tokens"] = req.duration_tokens
-    if req.seed is not None:
-        tts_params["seed"] = req.seed
     extra_params: dict[str, Any] = {}
     if initial_codec_chunk_frames is not None:
         extra_params[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = initial_codec_chunk_frames
+    seed = _request_or_default_generation_value(
+        req,
+        "seed",
+        default_generation_params,
+    )
+    if seed is not None:
+        tts_params["seed"] = seed
 
     # Sampling params — use S2-Pro-tuned defaults
     sampling = SamplingParams(
         temperature=0.8, top_p=0.8, top_k=30, repetition_penalty=1.1
     )
-    if req.max_new_tokens is not None:
-        sampling.max_new_tokens = req.max_new_tokens
-    if req.temperature is not None:
-        sampling.temperature = req.temperature
-    if req.top_p is not None:
-        sampling.top_p = req.top_p
-    if req.top_k is not None:
-        sampling.top_k = req.top_k
-    if req.repetition_penalty is not None:
-        sampling.repetition_penalty = req.repetition_penalty
-    if req.seed is not None:
-        sampling.seed = req.seed
+    max_new_tokens = _speech_effective_max_new_tokens(
+        req,
+        default_generation_params,
+    )
+    if max_new_tokens is not None:
+        sampling.max_new_tokens = max_new_tokens
+    temperature = _request_or_default_generation_value(
+        req,
+        "temperature",
+        default_generation_params,
+    )
+    if temperature is not None:
+        sampling.temperature = temperature
+    top_p = _request_or_default_generation_value(
+        req,
+        "top_p",
+        default_generation_params,
+    )
+    if top_p is not None:
+        sampling.top_p = top_p
+    top_k = _request_or_default_generation_value(
+        req,
+        "top_k",
+        default_generation_params,
+    )
+    if top_k is not None:
+        sampling.top_k = top_k
+    min_p = _request_or_default_generation_value(
+        req,
+        "min_p",
+        default_generation_params,
+    )
+    if min_p is not None:
+        sampling.min_p = min_p
+    repetition_penalty = _request_or_default_generation_value(
+        req,
+        "repetition_penalty",
+        default_generation_params,
+    )
+    if repetition_penalty is not None:
+        sampling.repetition_penalty = repetition_penalty
+    frequency_penalty = _request_or_default_generation_value(
+        req,
+        "frequency_penalty",
+        default_generation_params,
+    )
+    if frequency_penalty is not None:
+        sampling.frequency_penalty = frequency_penalty
+    presence_penalty = _request_or_default_generation_value(
+        req,
+        "presence_penalty",
+        default_generation_params,
+    )
+    if presence_penalty is not None:
+        sampling.presence_penalty = presence_penalty
+    stop = _request_or_default_generation_value(
+        req,
+        "stop",
+        default_generation_params,
+    )
+    if isinstance(stop, str):
+        sampling.stop = [stop]
+    elif isinstance(stop, list):
+        sampling.stop = list(stop)
+    if seed is not None:
+        sampling.seed = seed
 
     # Build prompt: plain string if no references, dict otherwise
     prompt: Any = req.input
@@ -825,11 +1238,14 @@ def build_speech_generate_request(
     if references:
         prompt = {"text": req.input, "references": references}
 
+    extra_params.update(_default_talker_extra_params(default_talker_params))
+
     return GenerateRequest(
         model=req.model or default_model,
         prompt=prompt,
         sampling=sampling,
-        stage_params=req.stage_params,
+        stage_sampling=_stage_sampling_overrides(req.stage_sampling),
+        stage_params=_stage_param_overrides(req.stage_params),
         extra_params=extra_params,
         stream=req.stream,
         output_modalities=["audio"],

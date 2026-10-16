@@ -317,6 +317,113 @@ def test_stage_breakdown_covers_preprocess_encoder_and_prefill(
     assert by_key[talker_ttfcc_key].total_ms == 4.0
 
 
+def test_stage_breakdown_covers_fine_grained_qwen35_intervals(
+    tmp_path: Path,
+) -> None:
+    events = [
+        _ev("r1", "preprocessing", "preprocess_normalize_start", 0),
+        _ev("r1", "preprocessing", "preprocess_normalize_end", 100_000),
+        _ev("r1", "preprocessing", "preprocess_media_load_start", 200_000),
+        _ev("r1", "preprocessing", "preprocess_image_load_start", 300_000),
+        _ev("r1", "preprocessing", "preprocess_image_load_end", 500_000),
+        _ev("r1", "preprocessing", "preprocess_video_load_start", 300_000),
+        _ev("r1", "preprocessing", "preprocess_video_load_end", 1_300_000),
+        _ev("r1", "preprocessing", "preprocess_audio_load_start", 300_000),
+        _ev("r1", "preprocessing", "preprocess_audio_load_end", 400_000),
+        _ev("r1", "preprocessing", "preprocess_media_load_end", 1_400_000),
+        _ev("r1", "preprocessing", "preprocess_prompt_start", 1_500_000),
+        _ev("r1", "preprocessing", "preprocess_prompt_end", 1_700_000),
+        _ev("r1", "preprocessing", "preprocess_hf_processor_start", 1_800_000),
+        _ev("r1", "preprocessing", "preprocess_hf_processor_end", 3_300_000),
+        _ev("r1", "preprocessing", "preprocess_output_build_start", 3_400_000),
+        _ev("r1", "preprocessing", "preprocess_output_build_end", 3_800_000),
+        _ev("r1", "talker_ar", "talker_feedback_prepare_start", 4_000_000),
+        _ev("r1", "talker_ar", "talker_feedback_prepare_end", 4_200_000),
+        _ev("r1", "talker_ar", "talker_code_predictor_start", 4_300_000),
+        _ev("r1", "talker_ar", "talker_code_predictor_end", 5_300_000),
+        _ev("r1", "talker_ar", "talker_emit_chunk_start", 5_400_000),
+        _ev("r1", "talker_ar", "talker_emit_chunk_end", 5_600_000),
+        _ev("r1", "code2wav", "code2wav_window_collect_start", 5_700_000),
+        _ev("r1", "code2wav", "code2wav_window_collect_end", 7_700_000),
+        _ev("r1", "code2wav", "code2wav_decode_start", 7_800_000),
+        _ev("r1", "code2wav", "code2wav_decode_end", 8_100_000),
+        _ev("r1", "code2wav", "code2wav_finalize_start", 8_200_000),
+        _ev("r1", "code2wav", "code2wav_finalize_end", 8_300_000),
+    ]
+    _write_events(tmp_path / "events_x.jsonl", events)
+    rows = stage_breakdown(source=tmp_path)
+    by_key = {(r.stage, r.interval_name): r for r in rows}
+
+    media_load_key = (
+        "preprocessing",
+        "preprocess_media_load_start->preprocess_media_load_end",
+    )
+    image_load_key = (
+        "preprocessing",
+        "preprocess_image_load_start->preprocess_image_load_end",
+    )
+    video_load_key = (
+        "preprocessing",
+        "preprocess_video_load_start->preprocess_video_load_end",
+    )
+    audio_load_key = (
+        "preprocessing",
+        "preprocess_audio_load_start->preprocess_audio_load_end",
+    )
+    feedback_prepare_key = (
+        "talker_ar",
+        "talker_feedback_prepare_start->talker_feedback_prepare_end",
+    )
+    code_predictor_key = (
+        "talker_ar",
+        "talker_code_predictor_start->talker_code_predictor_end",
+    )
+    emit_chunk_key = (
+        "talker_ar",
+        "talker_emit_chunk_start->talker_emit_chunk_end",
+    )
+    code2wav_collect_key = (
+        "code2wav",
+        "code2wav_window_collect_start->code2wav_window_collect_end",
+    )
+    code2wav_decode_key = (
+        "code2wav",
+        "code2wav_decode_start->code2wav_decode_end",
+    )
+    code2wav_finalize_key = (
+        "code2wav",
+        "code2wav_finalize_start->code2wav_finalize_end",
+    )
+    expected_ms = {
+        (
+            "preprocessing",
+            "preprocess_normalize_start->preprocess_normalize_end",
+        ): 0.1,
+        media_load_key: 1.2,
+        image_load_key: 0.2,
+        video_load_key: 1.0,
+        audio_load_key: 0.1,
+        ("preprocessing", "preprocess_prompt_start->preprocess_prompt_end"): 0.2,
+        (
+            "preprocessing",
+            "preprocess_hf_processor_start->preprocess_hf_processor_end",
+        ): 1.5,
+        (
+            "preprocessing",
+            "preprocess_output_build_start->preprocess_output_build_end",
+        ): 0.4,
+        feedback_prepare_key: 0.2,
+        code_predictor_key: 1.0,
+        emit_chunk_key: 0.2,
+        code2wav_collect_key: 2.0,
+        code2wav_decode_key: 0.3,
+        code2wav_finalize_key: 0.1,
+    }
+    for key, total_ms in expected_ms.items():
+        assert key in by_key
+        assert abs(by_key[key].total_ms - total_ms) < 1e-9
+
+
 def test_stage_breakdown_emits_both_intervals_sharing_opener(
     tmp_path: Path,
 ) -> None:

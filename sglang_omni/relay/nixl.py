@@ -5,6 +5,7 @@ import asyncio
 import logging
 import time
 import uuid
+from collections import Counter
 from typing import Any, Callable, Dict
 
 import numpy as np
@@ -33,6 +34,8 @@ class Connection:
         config = nixl_agent_config(num_threads=num_threads)
         self._nixl = NixlAgent(str(uuid.uuid4()), config)
         self._remote_agents: Dict[str, str] = {}
+        self._notification_lock = asyncio.Lock()
+        self._pending_notifications: Counter[bytes] = Counter()
 
     def get_agent_metadata(self) -> bytes:
         return self._nixl.get_agent_metadata()
@@ -44,6 +47,61 @@ class Connection:
             agent_name = self._nixl.add_remote_agent(remote_meta_bytes)
             self._remote_agents[remote_engine_id] = agent_name
         return self._remote_agents[remote_engine_id]
+
+    async def wait_for_notification(
+        self,
+        expected_notification: bytes,
+        *,
+        timeout: float = 30.0,
+    ) -> None:
+        """Wait for one NIXL notification without losing notifications.
+
+        ``get_new_notifs()`` drains notifications from the NIXL agent. Multiple
+        concurrent PutOperation waiters must therefore share a small cache;
+        otherwise one waiter can drain another waiter's completion and leak the
+        sender credit until timeout.
+        """
+
+        start = time.monotonic()
+        while True:
+            if self._consume_notification(expected_notification):
+                return
+
+            async with self._notification_lock:
+                if self._consume_notification(expected_notification):
+                    return
+                notifs = self._nixl.get_new_notifs()
+                for msgs in notifs.values():
+                    for msg in msgs:
+                        self._pending_notifications[_notification_key(msg)] += 1
+                if self._consume_notification(expected_notification):
+                    return
+
+            if time.monotonic() - start > timeout:
+                raise TimeoutError(
+                    f"PutOperation timed out waiting for {expected_notification}"
+                )
+            await asyncio.sleep(0.0001)
+
+    def _consume_notification(self, expected_notification: bytes) -> bool:
+        count = self._pending_notifications.get(expected_notification, 0)
+        if count <= 0:
+            return False
+        if count == 1:
+            del self._pending_notifications[expected_notification]
+        else:
+            self._pending_notifications[expected_notification] = count - 1
+        return True
+
+
+def _notification_key(msg: Any) -> bytes:
+    if isinstance(msg, bytes):
+        return msg
+    if isinstance(msg, bytearray):
+        return bytes(msg)
+    if isinstance(msg, str):
+        return msg.encode()
+    return bytes(msg)
 
 
 class NixlOperation(RelayOperation):
@@ -81,26 +139,11 @@ class PutOperation(NixlOperation):
         if self._completed:
             return
 
-        start = time.time()
         try:
-            while True:
-                notifs = self._conn._nixl.get_new_notifs()
-                found = False
-                for msgs in notifs.values():
-                    if self._expected_notification in msgs:
-                        found = True
-                        break
-
-                if found:
-                    break
-
-                if time.time() - start > timeout:
-                    raise TimeoutError(
-                        f"PutOperation timed out waiting for {self._expected_notification}"
-                    )
-
-                # Non-blocking wait
-                await asyncio.sleep(0.0001)
+            await self._conn.wait_for_notification(
+                self._expected_notification,
+                timeout=timeout,
+            )
         finally:
             # Regardless of success or timeout, we mark complete.
             # In a real system, you might want distinct handling for timeout vs success.
@@ -237,10 +280,12 @@ class NixlRelay(Relay):
 
             # 3. Prepare Metadata
             mem_type = "VRAM" if "cuda" in self.device else "DRAM"
+            notif_msg = f"done:{uuid.uuid4().hex}"
             payload = {
                 "engine_id": self.engine_id,
                 "agent_meta": self.connection.get_agent_metadata(),
                 "mem_type": mem_type,
+                "notif_msg": notif_msg,
                 "transfer_info": {
                     "offset": offset,
                     "size": size_bytes,
@@ -254,7 +299,7 @@ class NixlRelay(Relay):
             return PutOperation(
                 connection=self.connection,
                 metadata=payload,
-                expected_notification=b"done",
+                expected_notification=notif_msg.encode(),
                 on_completion_cb=lambda: self.allocator.release(offset),
             )
 
@@ -312,13 +357,16 @@ class NixlRelay(Relay):
 
             # 3. Trigger Transfer
             indices = np.arange(1, dtype=np.int64)
+            notif_msg = metadata.get("notif_msg", "done")
+            if isinstance(notif_msg, str):
+                notif_msg = notif_msg.encode()
             xfer_handle = self.connection._nixl.make_prepped_xfer(
                 "READ",
                 local_handle,
                 indices,
                 remote_handle,
                 indices,
-                notif_msg=f"done".encode(),
+                notif_msg=notif_msg,
             )
             self.connection._nixl.transfer(xfer_handle)
 

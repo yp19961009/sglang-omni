@@ -1,0 +1,13 @@
+sample,valid_wav,error,channels,sample_rate,sample_width_bytes,frames,duration_s_wave,duration_s_result,duration_delta_ms,wav_path
+sample_00,True,,1,24000,2,232320,9.680,9.680,0.0,/Users/gangouyu/Documents/gangouyu-ecs-ssh/reports/audio/stable_best_sil672/sample_00/sg_c12_s000_6f074ede-2d97-4ed0-b549-f297ba24421b.wav
+sample_01,True,,1,24000,2,216960,9.040,9.040,0.0,/Users/gangouyu/Documents/gangouyu-ecs-ssh/reports/audio/stable_best_sil672/sample_01/sg_c12_s001_753344fc-e4ef-482d-b0ad-5d24967f4374.wav
+sample_02,True,,1,24000,2,211200,8.800,8.800,0.0,/Users/gangouyu/Documents/gangouyu-ecs-ssh/reports/audio/stable_best_sil672/sample_02/sg_c12_s002_db0ba9e2-1ae3-48d5-8163-5da756c74a54.wav
+sample_03,True,,1,24000,2,213120,8.880,8.880,0.0,/Users/gangouyu/Documents/gangouyu-ecs-ssh/reports/audio/stable_best_sil672/sample_03/sg_c12_s003_e130961f-5108-4858-9ed9-b600ad0394ea.wav
+sample_04,True,,1,24000,2,224640,9.360,9.360,0.0,/Users/gangouyu/Documents/gangouyu-ecs-ssh/reports/audio/stable_best_sil672/sample_04/sg_c12_s004_cb586d43-01fd-431d-acb9-05c80e459d15.wav
+sample_05,True,,1,24000,2,247680,10.320,10.320,0.0,/Users/gangouyu/Documents/gangouyu-ecs-ssh/reports/audio/stable_best_sil672/sample_05/sg_c12_s005_0c924687-230a-416d-85e1-12d676dbda44.wav
+sample_06,True,,1,24000,2,253440,10.560,10.560,0.0,/Users/gangouyu/Documents/gangouyu-ecs-ssh/reports/audio/stable_best_sil672/sample_06/sg_c12_s006_f4684f79-3c6c-4bd6-a212-b5047fc0ae99.wav
+sample_07,True,,1,24000,2,201600,8.400,8.400,0.0,/Users/gangouyu/Documents/gangouyu-ecs-ssh/reports/audio/stable_best_sil672/sample_07/sg_c12_s007_4f5bfd4a-a299-42ea-af86-1bae9c7a1b58.wav
+sample_08,True,,1,24000,2,220800,9.200,9.200,0.0,/Users/gangouyu/Documents/gangouyu-ecs-ssh/reports/audio/stable_best_sil672/sample_08/sg_c12_s008_2173b1a8-977f-4a6e-968b-5f278e9e8eea.wav
+sample_09,True,,1,24000,2,199680,8.320,8.320,0.0,/Users/gangouyu/Documents/gangouyu-ecs-ssh/reports/audio/stable_best_sil672/sample_09/sg_c12_s009_0cae33d7-35b5-4743-bb6b-a1caf2cc9fd8.wav
+sample_10,True,,1,24000,2,201600,8.400,8.400,0.0,/Users/gangouyu/Documents/gangouyu-ecs-ssh/reports/audio/stable_best_sil672/sample_10/sg_c12_s010_1735a574-31f7-4bc2-acf2-76dc9772b660.wav
+sample_11,True,,1,24000,2,159360,6.640,6.640,0.0,/Users/gangouyu/Documents/gangouyu-ecs-ssh/reports/audio/stable_best_sil672/sample_11/sg_c12_s011_d197e09b-c1e9-43b9-b993-9d4a58204f2b.wav
