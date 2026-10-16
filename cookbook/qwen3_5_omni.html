@@ -1,0 +1,868 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Qwen3.5-Omni：架构、实现与延迟对比 &#8212; SGLang</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=03e43079" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/sphinx-book-theme.css?v=4418a689" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/css/custom_log.css?v=a64801f4" />
+    <link rel="stylesheet" type="text/css" href="../_static/css/custom_log.css?v=a64801f4" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+
+    <script src="../_static/documentation_options.js?v=a1637f0b"></script>
+    <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=ccdb6887"></script>
+    <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
+    <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'cookbook/qwen3_5_omni';</script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+    <script src="../_static/js/qwen3_omni_server_generator.js?v=621ec60e"></script>
+    <link rel="icon" href="../_static/logo.ico"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="LLaDA2.0-Uni" href="llada2_uni.html" />
+    <link rel="prev" title="Qwen3-Omni" href="qwen3_omni.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.1.0" />
+    <meta name="docbuild:last-update" content="Oct 16, 2026"/>
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+  
+  </head>
+  <body data-default-mode="">
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/sgl-omni-logo.svg" class="logo__image only-light" alt="SGLang - Home"/>
+    <img src="../_static/sgl-omni-logo.svg" class="logo__image only-dark pst-js-only" alt="SGLang - Home"/>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">🚀 Installation</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Cookbook</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="higgs_tts.html">Higgs TTS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="voxtral_tts.html">Voxtral TTS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="qwen3_tts.html">Qwen3 TTS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="moss_tts.html">MOSS-TTS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="qwen3_omni.html">Qwen3-Omni</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Qwen3.5-Omni：架构、实现与延迟对比</a></li>
+<li class="toctree-l1"><a class="reference internal" href="llada2_uni.html">LLaDA2.0-Uni</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/qwen3_omni.html">Omni Model Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/tts.html">TTS Model Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/omni_router.html">Omni Router Usage</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../benchmarks/relay.html">Benchmark Relay</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/main.html">Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/apiserver_design.html">API Server Design</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/pipeline.html">Pipeline Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/config.html">Config</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/communication.html">Communication</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/profiler.html">Request-level profiler</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sglang-omni" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sglang-omni/blob/main/docs/cookbook/qwen3_5_omni.md?plain=1" target="_blank"
+   class="btn btn-sm btn-source-file-button dropdown-item"
+   title="Show source"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-code"></i>
+  </span>
+<span class="btn__text-container">Show source</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sglang-omni/edit/main/docs/cookbook/qwen3_5_omni.md" target="_blank"
+   class="btn btn-sm btn-source-edit-button dropdown-item"
+   title="Suggest edit"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-pencil-alt"></i>
+  </span>
+<span class="btn__text-container">Suggest edit</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/sglang-omni/issues/new?title=Issue%20on%20page%20%2Fcookbook/qwen3_5_omni.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="../_sources/cookbook/qwen3_5_omni.md" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.md</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button pst-navbar-icon"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+<button class="sidebar-toggle secondary-toggle btn btn-sm pst-navbar-icon" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Qwen3.5-Omni：架构、实现与延迟对比</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">Qwen3.5-Omni 的组件</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">框架的工程扩展方式</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id3">Qwen3.5-Omni 的实现与优化</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id4">历史性能测量</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id5">测量配置与版本</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#thinker-only">Thinker-only：原始基线</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#thinker-talker">Thinker + Talker：原始基线</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#thinker-talker-pai-vllm">Thinker + Talker：PAI-vLLM 修复跨进程拷贝后</a></li>
+</ul>
+</li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="qwen3-5-omni">
+<h1>Qwen3.5-Omni：架构、实现与延迟对比<a class="headerlink" href="#qwen3-5-omni" title="Link to this heading">#</a></h1>
+<p>本文整理自<a class="reference external" href="https://alidocs.dingtalk.com/i/nodes/2Amq4vjg89jyZdNnCmvmkE3wW3kdP0wQ">《sglang-omni 支持 qwen35-omni》</a>，记录 Qwen3.5-Omni 的组件划分、框架接入方式和历史单请求性能测量。</p>
+<p>性能数据对应下文列出的版本，不代表本仓库当前 HEAD 的测试结果；本文整理时没有重新运行这些测量。PAI-vLLM 修复跨进程拷贝前后的数据分别保留，比较时应区分两个基线。</p>
+<section id="id1">
+<h2>Qwen3.5-Omni 的组件<a class="headerlink" href="#id1" title="Link to this heading">#</a></h2>
+<p>Qwen3.5-Omni 的在线推理包含以下组件，而非单个 LLM 推理过程。</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>组件</p></th>
+<th class="head"><p>输入</p></th>
+<th class="head"><p>输出</p></th>
+<th class="head"><p>主要计算特征</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Processor</p></td>
+<td><p>文本、视频帧、音频 waveform</p></td>
+<td><p>token、pixel values、audio features</p></td>
+<td><p>CPU 密集，包含 token replacement 和特征处理</p></td>
+</tr>
+<tr class="row-odd"><td><p>Vision Encoder</p></td>
+<td><p>视频/图像 tensor</p></td>
+<td><p>视觉 embedding</p></td>
+<td><p>GPU 计算密集，输入 payload 大</p></td>
+</tr>
+<tr class="row-even"><td><p>Audio Encoder</p></td>
+<td><p>音频 feature</p></td>
+<td><p>音频 embedding</p></td>
+<td><p>GPU 计算密集</p></td>
+</tr>
+<tr class="row-odd"><td><p>Thinker</p></td>
+<td><p>token 和多模态 embedding</p></td>
+<td><p>文本 token、hidden state</p></td>
+<td><p>长 prompt prefill + AR decode</p></td>
+</tr>
+<tr class="row-even"><td><p>Talker</p></td>
+<td><p>Thinker 文本/hidden state、codec feedback</p></td>
+<td><p>16 组 codec code</p></td>
+<td><p>带外部文本输入的反馈式 AR</p></td>
+</tr>
+<tr class="row-odd"><td><p>Code2Wav</p></td>
+<td><p>codec code stream</p></td>
+<td><p>24 kHz waveform</p></td>
+<td><p>流式窗口解码</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="id2">
+<h2>框架的工程扩展方式<a class="headerlink" href="#id2" title="Link to this heading">#</a></h2>
+<p>原文比较版本中的 PAI-vLLM 可复用 vLLM EngineCore、KV cache 和 continuous batching，适合固定拓扑下接入模型。这里关注的是继续增加组件和部署形态时的扩展成本。</p>
+<p>PAI-vLLM 的主要扩展单元是定制 Engine；SGLang-Omni 的主要扩展单元是 Stage 和数据流拓扑。</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>维度</p></th>
+<th class="head"><p>PAI-vLLM（原文比较版本）</p></th>
+<th class="head"><p>SGLang-Omni</p></th>
+<th class="head"><p>主要影响</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>拓扑与编排</p></td>
+<td><p>在 <code class="docutils literal notranslate"><span class="pre">OmniLLMEngine</span></code> 中命令式连接各组件</p></td>
+<td><p>用 <code class="docutils literal notranslate"><span class="pre">StageConfig</span></code> 声明路由、fan-in 和 stream</p></td>
+<td><p>新增分支时，前者修改中心 Engine，后者主要调整 Stage 配置与路由函数</p></td>
+</tr>
+<tr class="row-odd"><td><p>调度与放置</p></td>
+<td><p>Thinker/Talker 使用独立 Engine，但 MM Encoder 与 Thinker 共享调度</p></td>
+<td><p>每个 Stage 可拥有独立 Scheduler，并声明进程和 GPU</p></td>
+<td><p>各组件可以分别 batching、放置和调优</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>因此，SGLang-Omni 接入新模型时主要实现模型组件、Stage 拓扑和 Stage 间输入输出约定，通用请求生命周期、通信与编排能力由框架复用。</p>
+</section>
+<section id="id3">
+<h2>Qwen3.5-Omni 的实现与优化<a class="headerlink" href="#id3" title="Link to this heading">#</a></h2>
+<p><a class="reference internal" href="#../../sglang_omni/models/qwen3_5_omni/"><span class="xref myst">模型实现代码</span></a>按以下流程拆分：</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>Processor → Encoder → Thinker → Talker → Code2Wav
+</pre></div>
+</div>
+<p>Processor、Encoder 和 Code2Wav 补齐模型专用逻辑；Thinker/Talker 注册为 SGLang 原生模型，并通过 ModelRunner/Scheduler 接入 forward。由此复用 SGLang 的 KV cache、continuous batching、sampling、CUDA graph/compile，以及 SGLang-Omni 的 Stage 编排、流式传输和请求生命周期管理。</p>
+</section>
+<section id="id4">
+<h2>历史性能测量<a class="headerlink" href="#id4" title="Link to this heading">#</a></h2>
+<section id="id5">
+<h3>测量配置与版本<a class="headerlink" href="#id5" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>模型：23B，BF16。</p></li>
+<li><p>Thinker-only：单卡 H20。</p></li>
+<li><p>Thinker + Talker：Thinker 使用一张 H20，Talker + Code2Wav 使用另一张 H20，共两张。</p></li>
+<li><p>PAI-vLLM 原始基线：<code class="docutils literal notranslate"><span class="pre">origin/dev/qwenc_perf_v2</span></code>，commit <code class="docutils literal notranslate"><span class="pre">35d35d51bfd195436379275638aac122eea28f2e</span></code>。</p></li>
+<li><p>SGLang-Omni：<code class="docutils literal notranslate"><span class="pre">origin/develop</span></code>，commit <code class="docutils literal notranslate"><span class="pre">85eda8194a3be5fe846fb060052faafca9ad1691</span></code>。</p></li>
+<li><p>PAI-vLLM 更新后的基线：<code class="docutils literal notranslate"><span class="pre">dev/qwenc_perf_v2</span></code>，commit <code class="docutils literal notranslate"><span class="pre">7f8cf8cc0557ba7bf6f01d0de31065063c7388e0</span></code>，修复了跨进程拷贝问题。</p></li>
+</ul>
+<p>以下均为单请求测量，延迟单位为毫秒（ms），token 数另行标注。“SGLang 变化”沿用原记录，以对应 PAI-vLLM 基线为参照，负值表示 SGLang-Omni 延迟更低。原表的差值和百分比可能因四舍五入与展示值直接计算的结果略有不同。</p>
+</section>
+<section id="thinker-only">
+<h3>Thinker-only：原始基线<a class="headerlink" href="#thinker-only" title="Link to this heading">#</a></h3>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>区间</p></th>
+<th class="head text-right"><p>SGLang-Omni</p></th>
+<th class="head text-right"><p>PAI-vLLM</p></th>
+<th class="head"><p>SGLang 变化</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>HF Processor</p></td>
+<td class="text-right"><p>119.442</p></td>
+<td class="text-right"><p>138.794</p></td>
+<td><p>-13.9%</p></td>
+</tr>
+<tr class="row-odd"><td><p>HF end → critical Encoder start</p></td>
+<td class="text-right"><p>57.859</p></td>
+<td class="text-right"><p>292.000</p></td>
+<td><p>-80.2%</p></td>
+</tr>
+<tr class="row-even"><td><p>Critical/combined Encoder</p></td>
+<td class="text-right"><p>346.574</p></td>
+<td class="text-right"><p>328.354</p></td>
+<td><p>+5.5%</p></td>
+</tr>
+<tr class="row-odd"><td><p>Encoder end → first token</p></td>
+<td class="text-right"><p>375.996</p></td>
+<td class="text-right"><p>339.667</p></td>
+<td><p>+10.7%</p></td>
+</tr>
+<tr class="row-even"><td><p>Post-media/HF start → first token</p></td>
+<td class="text-right"><p>899.871</p></td>
+<td class="text-right"><p>1098.251</p></td>
+<td><p>-18.1%</p></td>
+</tr>
+<tr class="row-odd"><td><p>Prompt / completion tokens</p></td>
+<td class="text-right"><p>8698 / 6</p></td>
+<td class="text-right"><p>8698 / 4</p></td>
+<td><p>原记录称文本输出相同</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>原记录将约 200 ms 的差距主要归因于 PAI-vLLM 前处理结果到 Encoder 之间的跨进程数据传输。这里的 <code class="docutils literal notranslate"><span class="pre">Post-media/HF</span> <span class="pre">start</span> <span class="pre">→</span> <span class="pre">first</span> <span class="pre">token</span></code> 从媒体处理之后的 HF 处理起点计时，不能直接当作完整请求的端到端 TTFT。两边 completion token 数不同，原记录的“文本输出相同”也不能作为相同生成 token 数的证明。</p>
+</section>
+<section id="thinker-talker">
+<h3>Thinker + Talker：原始基线<a class="headerlink" href="#thinker-talker" title="Link to this heading">#</a></h3>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>区间</p></th>
+<th class="head text-right"><p>SGLang-Omni</p></th>
+<th class="head text-right"><p>PAI-vLLM</p></th>
+<th class="head"><p>SGLang 变化</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>HF Processor</p></td>
+<td class="text-right"><p>103.5</p></td>
+<td class="text-right"><p>139.4</p></td>
+<td><p>-35.9 ms</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request → first text token</p></td>
+<td class="text-right"><p>926.7</p></td>
+<td class="text-right"><p>1169.1</p></td>
+<td><p>-242.3 ms（-20.7%）</p></td>
+</tr>
+<tr class="row-even"><td><p>First text → Talker prefill start</p></td>
+<td class="text-right"><p>17.8</p></td>
+<td class="text-right"><p>20.9*</p></td>
+<td><p>-3.1 ms</p></td>
+</tr>
+<tr class="row-odd"><td><p>Talker prefill start → first codec</p></td>
+<td class="text-right"><p>36.1</p></td>
+<td class="text-right"><p>64.5</p></td>
+<td><p>-28.4 ms</p></td>
+</tr>
+<tr class="row-even"><td><p>First codec → fourth codec</p></td>
+<td class="text-right"><p>38.3</p></td>
+<td class="text-right"><p>35.2</p></td>
+<td><p>+3.1 ms</p></td>
+</tr>
+<tr class="row-odd"><td><p>Fourth codec → first audio</p></td>
+<td class="text-right"><p>37.3</p></td>
+<td class="text-right"><p>23.6</p></td>
+<td><p>+13.7 ms</p></td>
+</tr>
+<tr class="row-even"><td><p>First text → first audio</p></td>
+<td class="text-right"><p>129.5</p></td>
+<td class="text-right"><p>144.1</p></td>
+<td><p>-14.6 ms（-10.2%）</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request → first audio</p></td>
+<td class="text-right"><p>1056.2</p></td>
+<td class="text-right"><p>1313.1</p></td>
+<td><p>-256.9 ms（-19.6%）</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>原记录将首音频延迟（TTFA）的差距也主要归因于首文本 token 之前、前处理到 Encoder 之间的跨进程数据传输。</p>
+</section>
+<section id="thinker-talker-pai-vllm">
+<h3>Thinker + Talker：PAI-vLLM 修复跨进程拷贝后<a class="headerlink" href="#thinker-talker-pai-vllm" title="Link to this heading">#</a></h3>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>区间</p></th>
+<th class="head text-right"><p>SGLang-Omni</p></th>
+<th class="head text-right"><p>PAI-vLLM 更新后</p></th>
+<th class="head"><p>SGLang 变化</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>HF Processor</p></td>
+<td class="text-right"><p>103.5</p></td>
+<td class="text-right"><p>189.5</p></td>
+<td><p>-86.0 ms</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request → first text token</p></td>
+<td class="text-right"><p>926.7</p></td>
+<td class="text-right"><p>871.4</p></td>
+<td><p>+55.3 ms（+6.3%）</p></td>
+</tr>
+<tr class="row-even"><td><p>First text → Talker prefill start</p></td>
+<td class="text-right"><p>17.8</p></td>
+<td class="text-right"><p>21.1*</p></td>
+<td><p>-3.3 ms</p></td>
+</tr>
+<tr class="row-odd"><td><p>Talker prefill start → first codec</p></td>
+<td class="text-right"><p>36.1</p></td>
+<td class="text-right"><p>63.4</p></td>
+<td><p>-27.3 ms</p></td>
+</tr>
+<tr class="row-even"><td><p>First codec → fourth codec</p></td>
+<td class="text-right"><p>38.3</p></td>
+<td class="text-right"><p>34.6</p></td>
+<td><p>+3.7 ms</p></td>
+</tr>
+<tr class="row-odd"><td><p>Fourth codec → first audio</p></td>
+<td class="text-right"><p>37.3</p></td>
+<td class="text-right"><p>23.6</p></td>
+<td><p>+13.7 ms</p></td>
+</tr>
+<tr class="row-even"><td><p>First text → first audio</p></td>
+<td class="text-right"><p>129.5</p></td>
+<td class="text-right"><p>142.8</p></td>
+<td><p>-13.3 ms（-9.3%）</p></td>
+</tr>
+<tr class="row-odd"><td><p>Request → first audio</p></td>
+<td class="text-right"><p>1056.2</p></td>
+<td class="text-right"><p>1014.2</p></td>
+<td><p>+42.0 ms（+4.1%）</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>更新后的比较中，SGLang-Omni 的 TTFA 为 1056.2 ms，PAI-vLLM 为 1014.2 ms，即 SGLang-Omni 高 42.0 ms（约 4.1%）。首文本之后到首音频的阶段，SGLang-Omni 仍低 13.3 ms。不能用更新前的约 19.6% TTFA 优势概括更新后的结果。</p>
+<p>* 原文对 <code class="docutils literal notranslate"><span class="pre">20.9</span></code> 和 <code class="docutils literal notranslate"><span class="pre">21.1</span></code> 标有星号，但未给出对应注释，此处保留标记。</p>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="qwen3_omni.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Qwen3-Omni</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="llada2_uni.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">LLaDA2.0-Uni</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item"><div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">Qwen3.5-Omni 的组件</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">框架的工程扩展方式</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id3">Qwen3.5-Omni 的实现与优化</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id4">历史性能测量</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id5">测量配置与版本</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#thinker-only">Thinker-only：原始基线</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#thinker-talker">Thinker + Talker：原始基线</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#thinker-talker-pai-vllm">Thinker + Talker：PAI-vLLM 修复跨进程拷贝后</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By SGLang-Omni Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, SGLang-Omni.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Oct 16, 2026.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>
